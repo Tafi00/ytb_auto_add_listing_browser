@@ -9,6 +9,7 @@ function RemoteBrowser() {
   const [navUrl, setNavUrl] = useState('');
   const [typeText, setTypeText] = useState('');
   const [loading, setLoading] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const [autoRefresh, setAutoRefresh] = useState(false);
   const [error, setError] = useState('');
   const [viewport, setViewport] = useState({ width: 1920, height: 1080 });
@@ -19,6 +20,7 @@ function RemoteBrowser() {
   const fetchScreenshot = useCallback(async () => {
     try {
       setError('');
+      setRefreshing(true);
       const res = await api.fetch('/api/browser/screenshot');
       const data = await res.json();
       if (!res.ok) { setError(data.error || 'Failed'); return; }
@@ -31,6 +33,7 @@ function RemoteBrowser() {
         navUrlRef.current = data.url;
       }
     } catch (e) { setError(e.message); }
+    finally { setRefreshing(false); }
   }, []);
 
   useEffect(() => { fetchScreenshot(); }, []);
@@ -145,9 +148,9 @@ function RemoteBrowser() {
         <label style={{ fontSize: '12px', color: '#888', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
           <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} /> Auto
         </label>
-        <button type="button" className="btn-session btn-session-open" onClick={fetchScreenshot} disabled={loading}
+        <button type="button" className="btn-session btn-session-open" onClick={fetchScreenshot} disabled={refreshing}
           style={{ padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-          <FiRefreshCw size={12} className={loading ? 'spin' : ''} />
+          <FiRefreshCw size={12} className={refreshing ? 'spin' : ''} />
         </button>
       </form>
 
