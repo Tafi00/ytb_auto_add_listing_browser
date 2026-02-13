@@ -51,18 +51,32 @@ export class Browser {
       '--disable-backgrounding-occluded-windows',
       '--disable-renderer-backgrounding',
       '--disable-component-update',
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
     ];
 
     if (this.config.headless) {
-      args.push('--headless=new', '--disable-gpu', '--no-sandbox');
+      args.push('--headless=new', '--disable-gpu');
     } else {
       args.push('--window-size=1920,1080');
     }
 
-    // Launch Chrome as a normal process - no CDP control during user interaction
+    // Launch Chrome
+    log(`[Browser] Launching with args: ${args.join(' ')}`);
     this.chromeProcess = spawn(chromePath, args, {
       detached: false,
-      stdio: 'ignore',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    this.chromeProcess.stderr.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) log(`[Browser:stderr] ${msg}`);
+    });
+
+    this.chromeProcess.stdout.on('data', (data) => {
+      const msg = data.toString().trim();
+      if (msg) log(`[Browser:stdout] ${msg}`);
     });
 
     this.chromeProcess.on('error', (err) => {
