@@ -472,7 +472,7 @@ app.post('/api/browser/click', auth, async (req, res) => {
   }
 });
 
-// Type text via CDP
+// Type text
 app.post('/api/browser/type', auth, async (req, res) => {
   const { text } = req.body;
   try {
@@ -480,12 +480,7 @@ app.post('/api/browser/type', auth, async (req, res) => {
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
     const page = browser.contexts()[0]?.pages()[0];
     if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
-    const cdp = await page.context().newCDPSession(page);
-    for (const char of text) {
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', text: char, key: char, code: '', windowsVirtualKeyCode: char.charCodeAt(0) });
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', key: char, code: '', windowsVirtualKeyCode: char.charCodeAt(0) });
-    }
-    await cdp.detach();
+    await page.keyboard.type(text, { delay: 50 });
     await browser.close();
     res.json({ ok: true });
   } catch (e) {
@@ -493,35 +488,15 @@ app.post('/api/browser/type', auth, async (req, res) => {
   }
 });
 
-// Press key via CDP
+// Press key (Enter, Tab, Backspace, etc.)
 app.post('/api/browser/key', auth, async (req, res) => {
   const { key } = req.body;
-  const keyMap = {
-    'Enter': { key: 'Enter', code: 'Enter', windowsVirtualKeyCode: 13 },
-    'Tab': { key: 'Tab', code: 'Tab', windowsVirtualKeyCode: 9 },
-    'Backspace': { key: 'Backspace', code: 'Backspace', windowsVirtualKeyCode: 8 },
-    'Escape': { key: 'Escape', code: 'Escape', windowsVirtualKeyCode: 27 },
-    'ArrowLeft': { key: 'ArrowLeft', code: 'ArrowLeft', windowsVirtualKeyCode: 37 },
-    'ArrowRight': { key: 'ArrowRight', code: 'ArrowRight', windowsVirtualKeyCode: 39 },
-    'ArrowUp': { key: 'ArrowUp', code: 'ArrowUp', windowsVirtualKeyCode: 38 },
-    'ArrowDown': { key: 'ArrowDown', code: 'ArrowDown', windowsVirtualKeyCode: 40 },
-  };
   try {
     const { chromium } = await import('playwright');
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
     const page = browser.contexts()[0]?.pages()[0];
     if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
-
-    // Handle modifier combos like Alt+ArrowLeft
-    if (key.includes('+')) {
-      await page.keyboard.press(key);
-    } else {
-      const cdp = await page.context().newCDPSession(page);
-      const mapped = keyMap[key] || { key, code: key, windowsVirtualKeyCode: 0 };
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyDown', ...mapped });
-      await cdp.send('Input.dispatchKeyEvent', { type: 'keyUp', ...mapped });
-      await cdp.detach();
-    }
+    await page.keyboard.press(key);
     await browser.close();
     res.json({ ok: true });
   } catch (e) {
