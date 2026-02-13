@@ -422,9 +422,19 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
     const url = page.url();
     const title = await page.title().catch(() => '');
 
-    // Use CDP session for screenshot (works even without display)
+    // Get actual viewport size and capture screenshot
     const cdp = await page.context().newCDPSession(page);
-    const { data } = await cdp.send('Page.captureScreenshot', { format: 'jpeg', quality: 70 });
+    const layoutMetrics = await cdp.send('Page.getLayoutMetrics');
+    const cssViewport = layoutMetrics.cssVisualViewport || layoutMetrics.visualViewport || {};
+    const cssWidth = cssViewport.clientWidth || 1920;
+    const cssHeight = cssViewport.clientHeight || 1080;
+
+    // Capture screenshot clipped to CSS viewport to avoid DPR scaling issues
+    const { data } = await cdp.send('Page.captureScreenshot', {
+      format: 'jpeg',
+      quality: 70,
+      clip: { x: 0, y: 0, width: cssWidth, height: cssHeight, scale: 1 },
+    });
     await cdp.detach();
     await browser.close();
 
@@ -432,6 +442,7 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
       image: `data:image/jpeg;base64,${data}`,
       url,
       title,
+      viewport: { width: cssWidth, height: cssHeight },
     });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -455,7 +466,7 @@ app.post('/api/browser/navigate', auth, async (req, res) => {
   }
 });
 
-// Click at coordinates
+// Click at coordinates via CDP (more accurate)
 app.post('/api/browser/click', auth, async (req, res) => {
   const { x, y } = req.body;
   try {
@@ -463,8 +474,12 @@ app.post('/api/browser/click', auth, async (req, res) => {
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
     const page = browser.contexts()[0]?.pages()[0];
     if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
-    await page.mouse.click(x, y);
-    await page.waitForTimeout(500);
+    const cdp = await page.context().newCDPSession(page);
+    // Dispatch mouse events via CDP for precise coordinates
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+    await cdp.detach();
+    await new Promise(r => setTimeout(r, 500));
     await browser.close();
     res.json({ ok: true });
   } catch (e) {
@@ -481,6 +496,24 @@ app.post('/api/browser/type', auth, async (req, res) => {
     const page = browser.contexts()[0]?.pages()[0];
     if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
     await page.keyboard.type(text, { delay: 50 });
+    await browser.close();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Scroll
+app.post('/api/browser/scroll', auth, async (req, res) => {
+  const { x, y, deltaX = 0, deltaY = 0 } = req.body;
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const page = browser.contexts()[0]?.pages()[0];
+    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    const cdp = await page.context().newCDPSession(page);
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX, deltaY });
+    await cdp.detach();
     await browser.close();
     res.json({ ok: true });
   } catch (e) {

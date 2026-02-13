@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef } from 'react';
-import { FiGlobe, FiZap, FiEdit3, FiFilm, FiAlertTriangle, FiList, FiMessageSquare, FiFileText, FiUpload, FiRefreshCw, FiTrash2, FiPlus, FiX } from 'react-icons/fi';
+import { FiGlobe, FiZap, FiEdit3, FiFilm, FiAlertTriangle, FiList, FiMessageSquare, FiFileText, FiUpload, FiRefreshCw, FiTrash2, FiPlus, FiX, FiMonitor } from 'react-icons/fi';
 import { api } from '../App';
 import RemoteBrowser from './RemoteBrowser';
 
@@ -29,6 +29,7 @@ function Dashboard({ user, onLogout }) {
   const [siteConfig, setSiteConfig] = useState(null);
   const [configSaved, setConfigSaved] = useState(false);
   const [uploading, setUploading] = useState(false);
+  const [showRemote, setShowRemote] = useState(false);
   const videoInputRef = useRef(null);
 
   useEffect(() => {
@@ -229,8 +230,39 @@ function Dashboard({ user, onLogout }) {
         </div>
       </div>
 
-      {/* Remote Browser */}
-      {browserRunning && <RemoteBrowser />}
+      {/* Remote Browser Button */}
+      {browserRunning && (
+        <div className="card" style={{ marginTop: '16px' }}>
+          <button className="btn-session btn-session-open" onClick={() => setShowRemote(true)}
+            style={{ width: '100%', padding: '14px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', fontSize: '14px' }}>
+            <FiMonitor size={16} /> Mở Remote Browser
+          </button>
+        </div>
+      )}
+
+      {/* Remote Browser Dialog */}
+      {showRemote && (
+        <div style={{
+          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999,
+          background: '#0a0a0a', display: 'flex', flexDirection: 'column', overflow: 'hidden',
+        }}>
+          <div style={{
+            padding: '8px 16px', borderBottom: '1px solid #252525', display: 'flex',
+            alignItems: 'center', justifyContent: 'space-between', flexShrink: 0,
+          }}>
+            <span style={{ color: '#ccc', fontSize: '14px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
+              <FiMonitor size={16} color="#60a5fa" /> Remote Browser
+            </span>
+            <button className="btn-session btn-session-delete" onClick={() => setShowRemote(false)}
+              style={{ padding: '6px 14px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+              <FiX size={14} /> Đóng
+            </button>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, padding: '10px 16px 12px', display: 'flex', flexDirection: 'column' }}>
+            <RemoteBrowser />
+          </div>
+        </div>
+      )}
 
       {/* Site Config */}
       {siteConfig && (
