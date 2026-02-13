@@ -54,6 +54,8 @@ export class Browser {
       '--no-sandbox',
       '--disable-setuid-sandbox',
       '--disable-dev-shm-usage',
+      '--disable-logging',
+      '--disable-extensions',
     ];
 
     if (this.config.headless) {
