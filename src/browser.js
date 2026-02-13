@@ -146,35 +146,52 @@ export class Browser {
       if (fs.existsSync(p)) return p;
     }
 
-    // Fallback: try Playwright's bundled Chromium
-    const playwrightChromium = this._findPlaywrightChromium();
-    if (playwrightChromium) return playwrightChromium;
+    // Fallback: Playwright's bundled Chromium
+    const pwChrome = this._findPlaywrightChromium();
+    if (pwChrome) return pwChrome;
 
     throw new Error('Chrome not found. Set CHROME_PATH environment variable.');
   }
 
   _findPlaywrightChromium() {
+    // Use Playwright's own API to get the executable path
     try {
-      const homeDir = process.env.HOME || process.env.USERPROFILE || '';
-      const cacheDir = path.join(homeDir, '.cache', 'ms-playwright');
-      if (!fs.existsSync(cacheDir)) return null;
-      const dirs = fs.readdirSync(cacheDir).filter(d => d.startsWith('chromium'));
-      if (dirs.length === 0) return null;
-      dirs.sort().reverse();
-      const chromiumDir = path.join(cacheDir, dirs[0]);
-      const candidates = [
-        path.join(chromiumDir, 'chrome-linux', 'chrome'),
-        path.join(chromiumDir, 'chrome-linux', 'headless_shell'),
-        path.join(chromiumDir, 'chrome-win', 'chrome.exe'),
-        path.join(chromiumDir, 'chrome-mac', 'Chromium.app', 'Contents', 'MacOS', 'Chromium'),
-      ];
-      for (const c of candidates) {
-        if (fs.existsSync(c)) {
-          log(`[Browser] Using Playwright Chromium: ${c}`);
-          return c;
-        }
+      const execPath = chromium.executablePath();
+      if (execPath && fs.existsSync(execPath)) {
+        log(`[Browser] Using Playwright Chromium: ${execPath}`);
+        return execPath;
       }
     } catch {}
+
+    // Manual search in common cache locations
+    const searchDirs = [
+      process.env.PLAYWRIGHT_BROWSERS_PATH,
+      path.join(process.env.HOME || process.env.USERPROFILE || '', '.cache', 'ms-playwright'),
+      '/root/.cache/ms-playwright',
+      '/home/.cache/ms-playwright',
+      path.resolve('node_modules', '.cache', 'ms-playwright'),
+    ].filter(Boolean);
+
+    for (const cacheDir of searchDirs) {
+      try {
+        if (!fs.existsSync(cacheDir)) continue;
+        const dirs = fs.readdirSync(cacheDir).filter(d => d.startsWith('chromium'));
+        if (dirs.length === 0) continue;
+        dirs.sort().reverse();
+        const chromiumDir = path.join(cacheDir, dirs[0]);
+        const candidates = [
+          path.join(chromiumDir, 'chrome-linux', 'chrome'),
+          path.join(chromiumDir, 'chrome-linux', 'headless_shell'),
+          path.join(chromiumDir, 'chrome-win', 'chrome.exe'),
+        ];
+        for (const c of candidates) {
+          if (fs.existsSync(c)) {
+            log(`[Browser] Using Playwright Chromium: ${c}`);
+            return c;
+          }
+        }
+      } catch {}
+    }
     return null;
   }
 
