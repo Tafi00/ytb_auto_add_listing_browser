@@ -1,0 +1,30 @@
+{
+  "name": "profile-manager",
+  "version": "1.0.0",
+  "description": "Admin Dashboard - Browser Profile Manager",
+  "main": "src/server.js",
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "build": "npm install --prefix web && npm run build --prefix web",
+    "dev": "concurrently \"npm run server\" \"npm run dev:web\"",
+    "server": "node src/server.js",
+    "dev:web": "npm run dev:client --prefix web",
+    "browser": "node src/open-browser.js"
+  },
+  "dependencies": {
+    "adm-zip": "^0.5.16",
+    "archiver": "^7.0.1",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "jsonwebtoken": "^9.0.2",
+    "playwright": "^1.40.0"
+  },
+  "devDependencies": {
+    "concurrently": "^8.2.2"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
