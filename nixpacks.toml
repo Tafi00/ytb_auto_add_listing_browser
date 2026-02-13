@@ -1,5 +1,5 @@
 [phases.setup]
-aptPkgs = ["xvfb", "fonts-liberation", "libnss3", "libatk-bridge2.0-0", "libdrm2", "libxkbcommon0", "libgbm1", "libasound2", "libxshmfence1", "libglu1-mesa"]
+aptPkgs = ["xvfb", "fonts-liberation", "libnss3", "libatk-bridge2.0-0", "libdrm2", "libxkbcommon0", "libgbm1", "libasound2t64", "libxshmfence1", "libglu1-mesa"]
 
 [phases.install]
 cmds = ["npm install", "npm install --prefix web", "npx playwright install --with-deps chromium"]
