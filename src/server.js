@@ -483,12 +483,16 @@ app.get('*', (_, res) => {
   }
 });
 
-app.listen(PORT, async () => {
+app.listen(PORT, '0.0.0.0', () => {
   console.log(`Admin Dashboard running on http://localhost:${PORT}`);
 
-  // Auto-launch browser on startup
-  const running = await isChromeRunning();
-  if (!running) {
+  // Auto-launch browser on startup (non-blocking)
+  (async () => {
+    const running = await isChromeRunning();
+    if (running) {
+      console.log('[Server] Chrome already running');
+      return;
+    }
     try {
       const { default: Browser } = await import('./browser.js');
       const jobConfig = loadJobConfig();
@@ -497,7 +501,6 @@ app.listen(PORT, async () => {
       const browser = new Browser(config);
       await browser.init();
 
-      // Navigate to start URL
       try {
         const connection = await browser.connectForExport();
         if (connection?.page) {
@@ -510,14 +513,12 @@ app.listen(PORT, async () => {
       }
 
       console.log('[Server] Chrome started automatically');
-
       browser.chromeProcess.on('exit', () => {
         console.log('[Server] Chrome process exited');
       });
     } catch (e) {
       console.error('[Server] Failed to auto-start browser:', e.message);
+      console.log('[Server] Server continues without browser. Use admin panel to start it.');
     }
-  } else {
-    console.log('[Server] Chrome already running');
-  }
+  })();
 });
