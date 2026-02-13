@@ -483,3 +483,8 @@ body {
   .session-actions { width: 100%; }
   .session-actions .btn-session { flex: 1; text-align: center; }
 }
+
+/* Spin animation for refresh icon */
+.spin {
+  animation: spin 0.8s linear infinite;
+}

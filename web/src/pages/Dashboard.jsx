@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { FiGlobe, FiZap, FiEdit3, FiFilm, FiAlertTriangle, FiList, FiMessageSquare, FiFileText, FiUpload, FiRefreshCw, FiTrash2, FiPlus, FiX } from 'react-icons/fi';
 import { api } from '../App';
+import RemoteBrowser from './RemoteBrowser';
 
 const BrowserIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="20" height="20">
@@ -227,6 +228,9 @@ function Dashboard({ user, onLogout }) {
           </button>
         </div>
       </div>
+
+      {/* Remote Browser */}
+      {browserRunning && <RemoteBrowser />}
 
       {/* Site Config */}
       {siteConfig && (

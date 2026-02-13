@@ -400,6 +400,99 @@ app.delete('/api/profile/session', auth, (req, res) => {
   }
 });
 
+// ==================== Remote Browser Control ====================
+
+// Screenshot
+app.get('/api/browser/screenshot', auth, async (_, res) => {
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const contexts = browser.contexts();
+    if (contexts.length === 0) { await browser.close(); return res.status(400).json({ error: 'No context' }); }
+    const page = contexts[0].pages()[0];
+    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+
+    const screenshot = await page.screenshot({ type: 'jpeg', quality: 70 });
+    const url = page.url();
+    const title = await page.title();
+    await browser.close();
+
+    res.json({
+      image: `data:image/jpeg;base64,${screenshot.toString('base64')}`,
+      url,
+      title,
+    });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Navigate
+app.post('/api/browser/navigate', auth, async (req, res) => {
+  const { url } = req.body;
+  if (!url) return res.status(400).json({ error: 'url required' });
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const page = browser.contexts()[0]?.pages()[0];
+    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    await page.goto(url, { waitUntil: 'commit', timeout: 15000 });
+    await browser.close();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Click at coordinates
+app.post('/api/browser/click', auth, async (req, res) => {
+  const { x, y } = req.body;
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const page = browser.contexts()[0]?.pages()[0];
+    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    await page.mouse.click(x, y);
+    await page.waitForTimeout(500);
+    await browser.close();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Type text
+app.post('/api/browser/type', auth, async (req, res) => {
+  const { text } = req.body;
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const page = browser.contexts()[0]?.pages()[0];
+    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    await page.keyboard.type(text, { delay: 50 });
+    await browser.close();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Press key (Enter, Tab, Backspace, etc.)
+app.post('/api/browser/key', auth, async (req, res) => {
+  const { key } = req.body;
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const page = browser.contexts()[0]?.pages()[0];
+    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    await page.keyboard.press(key);
+    await browser.close();
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 // ==================== Site Config (public page texts) ====================
 
 const configDir = path.resolve(__dirname, '../config');
