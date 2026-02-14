@@ -2,6 +2,8 @@
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
+import rateLimit from 'express-rate-limit';
+import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
 import { spawn } from 'child_process';
 import path from 'path';
@@ -25,8 +27,55 @@ if (!sessionManager.exists(PROFILE_ID)) {
   console.log(`[Server] Created default profile: ${PROFILE_ID}`);
 }
 
-app.use(cors());
-app.use(express.json());
+// Security headers
+app.use(helmet({
+  contentSecurityPolicy: false, // tắt CSP vì SPA tự quản lý
+  crossOriginEmbedderPolicy: false,
+}));
+
+// CORS - chỉ cho phép origin cụ thể trong production
+const allowedOrigins = process.env.ALLOWED_ORIGINS
+  ? process.env.ALLOWED_ORIGINS.split(',').map(s => s.trim())
+  : null; // null = cho phép tất cả (dev mode)
+app.use(cors(allowedOrigins ? {
+  origin: (origin, cb) => {
+    if (!origin || allowedOrigins.includes(origin)) cb(null, true);
+    else cb(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+} : undefined));
+
+// Giới hạn body size để chống abuse (10MB cho upload, 1MB cho JSON)
+app.use(express.json({ limit: '1mb' }));
+
+// Rate limit theo IP
+const limiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 phút
+  max: 100, // tối đa 100 request / IP / 15 phút
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' },
+});
+app.use(limiter);
+
+// Rate limit riêng cho login (chặt hơn)
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10, // tối đa 10 lần login / IP / 15 phút
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts, please try again later.' },
+});
+
+// Rate limit riêng cho public API get-affiliate (chống spam)
+const affiliateLimiter = rateLimit({
+  windowMs: 60 * 1000, // 1 phút
+  max: 5, // tối đa 5 request / IP / phút
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Bạn gửi quá nhiều yêu cầu. Vui lòng đợi 1 phút.' },
+  keyGenerator: (req) => req.headers['x-forwarded-for'] || req.socket.remoteAddress,
+});
 
 // Serve static files from web/dist in production
 const distPath = path.resolve(__dirname, '../web/dist');
@@ -38,6 +87,14 @@ const PORT = process.env.PORT || 3002;
 const JWT_SECRET = process.env.JWT_SECRET || 'default-secret-change-me';
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+
+// Cảnh báo bảo mật khi dùng giá trị mặc định
+if (JWT_SECRET === 'default-secret-change-me') {
+  console.warn('⚠️  [Security] JWT_SECRET đang dùng giá trị mặc định. Hãy đổi trong .env!');
+}
+if (ADMIN_PASSWORD === 'admin123') {
+  console.warn('⚠️  [Security] ADMIN_PASSWORD đang dùng giá trị mặc định. Hãy đổi trong .env!');
+}
 
 // Auth middleware
 const auth = (req, res, next) => {
@@ -53,7 +110,7 @@ const auth = (req, res, next) => {
 };
 
 // Login
-app.post('/api/login', (req, res) => {
+app.post('/api/login', loginLimiter, (req, res) => {
   const { username, password } = req.body;
   if (username === ADMIN_USERNAME && password === ADMIN_PASSWORD) {
     const token = jwt.sign({ username }, JWT_SECRET, { expiresIn: '24h' });
@@ -343,7 +400,7 @@ setInterval(() => {
 function isValidProductUrl(url) {
   try {
     const parsed = new URL(url);
-    const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'lazada.vn', 'www.lazada.vn'];
+    const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'shp.ee', 'lazada.vn', 'www.lazada.vn'];
     return validHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
   } catch {
     return false;
@@ -358,17 +415,26 @@ function containsMultipleLinks(input) {
 }
 
 // Public API: get affiliate URL by product URL (uses Video URL from config)
-app.post('/api/get-affiliate', async (req, res) => {
+app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
   const { productUrl, clientId } = req.body;
-  if (!productUrl) return res.status(400).json({ error: 'productUrl is required' });
+  if (!productUrl || typeof productUrl !== 'string') return res.status(400).json({ error: 'productUrl is required' });
+
+  // Sanitize input - giới hạn độ dài
+  const sanitizedUrl = productUrl.trim().slice(0, 2048);
+  if (sanitizedUrl.length === 0) return res.status(400).json({ error: 'productUrl is required' });
+
+  // Validate clientId nếu có
+  if (clientId && (typeof clientId !== 'string' || clientId.length > 128)) {
+    return res.status(400).json({ error: 'clientId không hợp lệ' });
+  }
 
   // Check multiple links
-  if (containsMultipleLinks(productUrl)) {
+  if (containsMultipleLinks(sanitizedUrl)) {
     return res.status(400).json({ error: 'Mỗi lần chỉ gửi 1 link' });
   }
 
   // Validate URL format immediately
-  if (!isValidProductUrl(productUrl.trim())) {
+  if (!isValidProductUrl(sanitizedUrl)) {
     return res.status(400).json({ error: 'Link sản phẩm không hợp lệ. Vui lòng nhập link Shopee hoặc Lazada.' });
   }
 
@@ -392,7 +458,7 @@ app.post('/api/get-affiliate', async (req, res) => {
     const result = await jobQueue.push(async () => {
       const { browser, page } = await getChromePage();
       try {
-        await addProduct(page, productUrl);
+        await addProduct(page, sanitizedUrl);
         const data = await fetchAffiliateUrl(config.url);
         console.log(`[API] Affiliate URL: ${data.affiliateUrl}`);
         // Remove in background, don't block response
@@ -417,14 +483,17 @@ app.post('/api/get-affiliate', async (req, res) => {
     // Save history to SQLite on success
     if (result.affiliateUrl) {
       addHistory(clientId || 'anonymous', {
-        productUrl: productUrl.trim(),
+        productUrl: sanitizedUrl,
         affiliateUrl: result.affiliateUrl,
         metadata: result.metadata || {},
         createdAt: new Date().toISOString(),
       });
     }
   } catch (e) {
-    res.status(500).json({ error: e.message });
+    // Không leak internal error ra ngoài cho public API
+    console.error(`[API] get-affiliate error: ${e.message}`);
+    const safeMessage = e.message.includes('không gắn giỏ') ? e.message : 'Có lỗi xảy ra, vui lòng thử lại sau.';
+    res.status(500).json({ error: safeMessage });
   }
 });
 
@@ -677,19 +746,38 @@ app.put('/api/site-config', auth, (req, res) => {
   res.json(updated);
 });
 
-// Admin: upload guide video
+// Admin: upload guide video (giới hạn 50MB)
+const MAX_VIDEO_SIZE = 50 * 1024 * 1024;
 app.post('/api/upload-video', auth, (req, res) => {
   const contentType = req.headers['content-type'] || '';
   if (!contentType.startsWith('video/')) {
     return res.status(400).json({ error: 'Only video files are allowed' });
   }
 
+  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+  if (contentLength > MAX_VIDEO_SIZE) {
+    return res.status(413).json({ error: 'File quá lớn. Tối đa 50MB.' });
+  }
+
   const ext = contentType.includes('mp4') ? '.mp4' : contentType.includes('webm') ? '.webm' : '.mp4';
   const filename = `guide-video${ext}`;
   const filepath = path.join(uploadsDir, filename);
 
+  // Chống path traversal
+  if (!filepath.startsWith(uploadsDir)) {
+    return res.status(400).json({ error: 'Invalid file path' });
+  }
+
+  let totalSize = 0;
   const chunks = [];
-  req.on('data', chunk => chunks.push(chunk));
+  req.on('data', chunk => {
+    totalSize += chunk.length;
+    if (totalSize > MAX_VIDEO_SIZE) {
+      req.destroy();
+      return res.status(413).json({ error: 'File quá lớn. Tối đa 50MB.' });
+    }
+    chunks.push(chunk);
+  });
   req.on('end', () => {
     fs.writeFileSync(filepath, Buffer.concat(chunks));
     const videoUrl = `/uploads/${filename}`;
@@ -701,19 +789,38 @@ app.post('/api/upload-video', auth, (req, res) => {
   req.on('error', (e) => res.status(500).json({ error: e.message }));
 });
 
-// Admin: upload favicon
+// Admin: upload favicon (giới hạn 2MB)
+const MAX_FAVICON_SIZE = 2 * 1024 * 1024;
 app.post('/api/upload-favicon', auth, (req, res) => {
   const contentType = req.headers['content-type'] || '';
   if (!contentType.startsWith('image/')) {
     return res.status(400).json({ error: 'Only image files are allowed' });
   }
 
+  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+  if (contentLength > MAX_FAVICON_SIZE) {
+    return res.status(413).json({ error: 'File quá lớn. Tối đa 2MB.' });
+  }
+
   const ext = contentType.includes('png') ? '.png' : contentType.includes('svg') ? '.svg' : contentType.includes('gif') ? '.gif' : '.ico';
   const filename = `favicon${ext}`;
   const filepath = path.join(uploadsDir, filename);
 
+  // Chống path traversal
+  if (!filepath.startsWith(uploadsDir)) {
+    return res.status(400).json({ error: 'Invalid file path' });
+  }
+
+  let totalSize = 0;
   const chunks = [];
-  req.on('data', chunk => chunks.push(chunk));
+  req.on('data', chunk => {
+    totalSize += chunk.length;
+    if (totalSize > MAX_FAVICON_SIZE) {
+      req.destroy();
+      return res.status(413).json({ error: 'File quá lớn. Tối đa 2MB.' });
+    }
+    chunks.push(chunk);
+  });
   req.on('end', () => {
     fs.writeFileSync(filepath, Buffer.concat(chunks));
     const faviconUrl = `/uploads/${filename}`;

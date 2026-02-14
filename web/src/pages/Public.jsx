@@ -81,7 +81,7 @@ function Public() {
     // Validate URL format immediately
     try {
       const parsed = new URL(trimmed);
-      const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'lazada.vn', 'www.lazada.vn'];
+      const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'shp.ee', 'lazada.vn', 'www.lazada.vn'];
       if (!validHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h))) {
         setError('Link sản phẩm không hợp lệ. Vui lòng nhập link Shopee hoặc Lazada.');
         return;
