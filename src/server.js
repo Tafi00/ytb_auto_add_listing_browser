@@ -48,15 +48,8 @@ app.use(cors(allowedOrigins ? {
 // Giới hạn body size để chống abuse (10MB cho upload, 1MB cho JSON)
 app.use(express.json({ limit: '1mb' }));
 
-// Rate limit theo IP
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 phút
-  max: 100, // tối đa 100 request / IP / 15 phút
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Too many requests, please try again later.' },
-});
-app.use(limiter);
+// Rate limit chỉ cho public API get-affiliate (chống spam)
+// Các API admin đã có auth bảo vệ, không cần rate limit
 
 // Rate limit riêng cho login (chặt hơn)
 const loginLimiter = rateLimit({
