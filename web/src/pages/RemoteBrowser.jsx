@@ -14,10 +14,13 @@ function RemoteBrowser() {
   const [viewport, setViewport] = useState({ width: 1920, height: 1080 });
   const [liveMode, setLiveMode] = useState(true);
   const [wsConnected, setWsConnected] = useState(false);
+  // Track the actual screencast image dimensions for accurate coordinate mapping
+  const [screencastSize, setScreencastSize] = useState(null);
   const imgRef = useRef(null);
   const navUrlRef = useRef('');
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
+  const scrollThrottleRef = useRef(null);
 
   // Build WebSocket URL
   const getWsUrl = useCallback(() => {
@@ -25,6 +28,15 @@ function RemoteBrowser() {
     const host = window.location.host;
     const token = localStorage.getItem('token');
     return `${proto}//${host}/ws/screencast?token=${encodeURIComponent(token)}`;
+  }, []);
+
+  // Send a command through the WebSocket (for input events)
+  const wsSend = useCallback((msg) => {
+    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+      wsRef.current.send(JSON.stringify(msg));
+      return true;
+    }
+    return false;
   }, []);
 
   // Connect WebSocket for live screencast
@@ -39,7 +51,6 @@ function RemoteBrowser() {
     ws.onopen = () => {
       setWsConnected(true);
       setError('');
-      console.log('[Screencast] Connected');
     };
 
     ws.onmessage = (e) => {
@@ -48,8 +59,9 @@ function RemoteBrowser() {
         if (msg.type === 'frame') {
           setScreenshot(msg.image);
           if (msg.metadata) {
-            if (msg.metadata.pageScaleFactor) {
-              // Update viewport from metadata if available
+            const { deviceWidth, deviceHeight, offsetTop } = msg.metadata;
+            if (deviceWidth && deviceHeight) {
+              setScreencastSize({ width: deviceWidth, height: deviceHeight, offsetTop: offsetTop || 0 });
             }
           }
         } else if (msg.type === 'error') {
@@ -61,7 +73,6 @@ function RemoteBrowser() {
     ws.onclose = () => {
       setWsConnected(false);
       wsRef.current = null;
-      // Auto-reconnect after 3s if live mode is still on
       if (liveMode) {
         reconnectTimer.current = setTimeout(connectScreencast, 3000);
       }
@@ -95,7 +106,7 @@ function RemoteBrowser() {
     return () => disconnectScreencast();
   }, [liveMode]);
 
-  // Fallback: fetch screenshot via REST (used when live mode is off, or for initial load)
+  // Fallback: fetch screenshot via REST
   const fetchScreenshot = useCallback(async () => {
     try {
       setError('');
@@ -115,7 +126,7 @@ function RemoteBrowser() {
     finally { setRefreshing(false); }
   }, []);
 
-  // Fetch page info (URL, title) periodically when in live mode
+  // Fetch page info periodically when in live mode
   useEffect(() => {
     if (!liveMode) return;
     const fetchInfo = async () => {
@@ -124,6 +135,7 @@ function RemoteBrowser() {
         const data = await res.json();
         if (data.url) setPageUrl(data.url);
         if (data.title) setPageTitle(data.title);
+        if (data.viewport) setViewport(data.viewport);
         if (!navUrlRef.current) {
           setNavUrl(data.url);
           navUrlRef.current = data.url;
@@ -135,26 +147,73 @@ function RemoteBrowser() {
     return () => clearInterval(interval);
   }, [liveMode]);
 
-  const getCoords = (e) => {
-    if (!imgRef.current) return null;
-    const rect = imgRef.current.getBoundingClientRect();
-    const scaleX = viewport.width / rect.width;
-    const scaleY = viewport.height / rect.height;
+  /**
+   * Accurate coordinate mapping that handles objectFit: contain letterboxing.
+   * The img element may have black bars (letterbox) on sides or top/bottom.
+   * We need to find where the actual image content is rendered within the element,
+   * then map that to the real browser viewport coordinates.
+   */
+  const getCoords = useCallback((e) => {
+    const img = imgRef.current;
+    if (!img) return null;
+
+    const rect = img.getBoundingClientRect();
+    // The actual rendered size of the image content (natural aspect ratio within the element)
+    const naturalW = img.naturalWidth;
+    const naturalH = img.naturalHeight;
+    if (!naturalW || !naturalH) return null;
+
+    // Calculate the rendered image dimensions within the element (objectFit: contain)
+    const elemAspect = rect.width / rect.height;
+    const imgAspect = naturalW / naturalH;
+
+    let renderedW, renderedH, offsetX, offsetY;
+    if (imgAspect > elemAspect) {
+      // Image is wider than element — letterbox top/bottom
+      renderedW = rect.width;
+      renderedH = rect.width / imgAspect;
+      offsetX = 0;
+      offsetY = (rect.height - renderedH) / 2;
+    } else {
+      // Image is taller than element — letterbox left/right
+      renderedH = rect.height;
+      renderedW = rect.height * imgAspect;
+      offsetX = (rect.width - renderedW) / 2;
+      offsetY = 0;
+    }
+
+    // Mouse position relative to the rendered image content (not the element)
+    const relX = e.clientX - rect.left - offsetX;
+    const relY = e.clientY - rect.top - offsetY;
+
+    // If click is outside the actual image content (in the letterbox), ignore
+    if (relX < 0 || relY < 0 || relX > renderedW || relY > renderedH) return null;
+
+    // Map to the real browser viewport coordinates
+    // Use screencastSize (from CDP metadata) if in live mode, otherwise use viewport
+    const targetW = (liveMode && screencastSize) ? screencastSize.width : viewport.width;
+    const targetH = (liveMode && screencastSize) ? screencastSize.height : viewport.height;
+
     return {
-      x: Math.round((e.clientX - rect.left) * scaleX),
-      y: Math.round((e.clientY - rect.top) * scaleY),
+      x: Math.round((relX / renderedW) * targetW),
+      y: Math.round((relY / renderedH) * targetH),
     };
-  };
+  }, [viewport, screencastSize, liveMode]);
 
   const handleClick = async (e) => {
     const coords = getCoords(e);
     if (!coords) return;
     setLoading(true);
     try {
-      await api.fetch('/api/browser/click', { method: 'POST', body: JSON.stringify(coords) });
-      if (!liveMode) {
-        await new Promise(r => setTimeout(r, 800));
-        await fetchScreenshot();
+      // Try WebSocket first for lower latency
+      if (liveMode && wsSend({ type: 'click', ...coords })) {
+        // CDP click sent via WS, no need for REST
+      } else {
+        await api.fetch('/api/browser/click', { method: 'POST', body: JSON.stringify(coords) });
+        if (!liveMode) {
+          await new Promise(r => setTimeout(r, 800));
+          await fetchScreenshot();
+        }
       }
     } catch {}
     setLoading(false);
@@ -164,10 +223,21 @@ function RemoteBrowser() {
     e.preventDefault();
     const coords = getCoords(e);
     if (!coords) return;
+    const deltaY = e.deltaY > 0 ? 300 : -300;
+
+    // Throttle scroll events
+    if (scrollThrottleRef.current) return;
+    scrollThrottleRef.current = true;
+    setTimeout(() => { scrollThrottleRef.current = false; }, 80);
+
+    // Try WebSocket first for instant scroll
+    if (liveMode && wsSend({ type: 'scroll', x: coords.x, y: coords.y, deltaX: 0, deltaY })) {
+      return; // Sent via WS, screencast will update automatically
+    }
     try {
       await api.fetch('/api/browser/scroll', {
         method: 'POST',
-        body: JSON.stringify({ x: coords.x, y: coords.y, deltaX: 0, deltaY: e.deltaY > 0 ? 300 : -300 }),
+        body: JSON.stringify({ x: coords.x, y: coords.y, deltaX: 0, deltaY }),
       });
       if (!liveMode) setTimeout(fetchScreenshot, 400);
     } catch {}
@@ -215,10 +285,14 @@ function RemoteBrowser() {
   };
 
   const handleScrollBtn = async (direction) => {
+    const deltaY = direction === 'down' ? 400 : -400;
+    const cx = viewport.width / 2;
+    const cy = viewport.height / 2;
+    if (liveMode && wsSend({ type: 'scroll', x: cx, y: cy, deltaX: 0, deltaY })) return;
     try {
       await api.fetch('/api/browser/scroll', {
         method: 'POST',
-        body: JSON.stringify({ x: viewport.width / 2, y: viewport.height / 2, deltaX: 0, deltaY: direction === 'down' ? 400 : -400 }),
+        body: JSON.stringify({ x: cx, y: cy, deltaX: 0, deltaY }),
       });
       if (!liveMode) setTimeout(fetchScreenshot, 400);
     } catch {}
@@ -264,7 +338,7 @@ function RemoteBrowser() {
         )}
       </form>
 
-      {/* Screenshot - fills remaining space */}
+      {/* Screenshot */}
       <div style={{ flex: 1, minHeight: 0, position: 'relative', borderRadius: '8px', overflow: 'hidden', border: '1px solid #252525', background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         {screenshot ? (
           <img ref={imgRef} src={screenshot} alt="Browser" onClick={handleClick} onWheel={handleScroll}
@@ -279,7 +353,6 @@ function RemoteBrowser() {
             <div className="spinner" />
           </div>
         )}
-        {/* Live indicator */}
         {liveMode && (
           <div style={{
             position: 'absolute', top: '8px', right: '8px',
@@ -299,7 +372,6 @@ function RemoteBrowser() {
         )}
       </div>
 
-      {/* Page info + error */}
       {error && (
         <div style={{ fontSize: '12px', color: '#f87171', marginTop: '4px', padding: '6px 10px', background: 'rgba(239,68,68,0.08)', borderRadius: '6px', flexShrink: 0 }}>
           {error}

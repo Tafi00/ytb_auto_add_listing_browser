@@ -139,7 +139,7 @@ async function addProduct(page, productUrl) {
   } catch {
     console.log('[Job] Product not found within 5s, reloading page...');
     await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => {});
-    throw new Error('Không tìm thấy sản phẩm. Vui lòng kiểm tra lại link.');
+    throw new Error('Sản phẩm này không gắn giỏ được.');
   }
   await tagBtn.click();
   console.log('[Job] Clicked Tag button');
@@ -758,6 +758,7 @@ wss.on('connection', async (ws, req) => {
   let cdpWs = null;
   let sessionId = null;
   let alive = true;
+  let cmdId = 1;
 
   ws.on('close', () => {
     alive = false;
@@ -768,6 +769,22 @@ wss.on('connection', async (ws, req) => {
   ws.on('error', () => {
     alive = false;
     stopScreencast();
+  });
+
+  // Handle input commands from client (click, scroll) via the same CDP connection
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString());
+      if (!cdpWs || cdpWs.readyState !== cdpWs.OPEN) return;
+      if (msg.type === 'click') {
+        const { x, y } = msg;
+        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } }));
+        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } }));
+      } else if (msg.type === 'scroll') {
+        const { x, y, deltaX, deltaY } = msg;
+        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX: deltaX || 0, deltaY: deltaY || 0 } }));
+      }
+    } catch {}
   });
 
   async function stopScreencast() {
@@ -794,8 +811,6 @@ wss.on('connection', async (ws, req) => {
     // Connect directly to Chrome CDP via raw WebSocket
     const { default: WebSocket } = await import('ws');
     cdpWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
-
-    let cmdId = 1;
 
     cdpWs.on('open', () => {
       // Enable Page domain
