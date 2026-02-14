@@ -342,6 +342,14 @@ app.post('/api/get-affiliate', async (req, res) => {
         removeProduct(page).then(() => browser.close()).catch(() => browser.close());
         return data;
       } catch (e) {
+        // Reload page to reset state after error
+        console.log(`[API] Error during job, reloading page: ${e.message}`);
+        try {
+          await page.reload({ waitUntil: 'commit', timeout: 15000 });
+          console.log('[API] Page reloaded after error');
+        } catch (reloadErr) {
+          console.log(`[API] Failed to reload page: ${reloadErr.message}`);
+        }
         await browser.close();
         throw e;
       }
@@ -547,6 +555,9 @@ const uploadsDir = path.resolve(configDir, 'uploads');
 if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
 
 const defaultSiteConfig = {
+  pageTitle: 'GẮN SẢN PHẨM YOUTUBE',
+  pageSubtitle: 'Nhập link sản phẩm Shopee, Lazada để gắn giỏ youtube',
+  faviconUrl: '',
   noteTitle: 'Lưu ý máy tính',
   noteText: 'Tool chỉ hoạt động khi mở link sản phẩm đến ứng dụng Shopee trên điện thoại. Nếu bạn thực hiện trên máy tính, vui lòng copy link sản phẩm đã thêm Youtube hoặc Facebook và mở trên điện thoại.',
   tips: [
@@ -603,6 +614,30 @@ app.post('/api/upload-video', auth, (req, res) => {
     config.guideVideoUrl = videoUrl;
     saveSiteConfig(config);
     res.json({ videoUrl });
+  });
+  req.on('error', (e) => res.status(500).json({ error: e.message }));
+});
+
+// Admin: upload favicon
+app.post('/api/upload-favicon', auth, (req, res) => {
+  const contentType = req.headers['content-type'] || '';
+  if (!contentType.startsWith('image/')) {
+    return res.status(400).json({ error: 'Only image files are allowed' });
+  }
+
+  const ext = contentType.includes('png') ? '.png' : contentType.includes('svg') ? '.svg' : contentType.includes('gif') ? '.gif' : '.ico';
+  const filename = `favicon${ext}`;
+  const filepath = path.join(uploadsDir, filename);
+
+  const chunks = [];
+  req.on('data', chunk => chunks.push(chunk));
+  req.on('end', () => {
+    fs.writeFileSync(filepath, Buffer.concat(chunks));
+    const faviconUrl = `/uploads/${filename}`;
+    const config = loadSiteConfig();
+    config.faviconUrl = faviconUrl;
+    saveSiteConfig(config);
+    res.json({ faviconUrl });
   });
   req.on('error', (e) => res.status(500).json({ error: e.message }));
 });

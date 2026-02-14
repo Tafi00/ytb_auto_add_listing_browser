@@ -36,6 +36,15 @@ function Public() {
   }, []);
 
   useEffect(() => {
+    if (siteConfig?.pageTitle) document.title = siteConfig.pageTitle;
+    if (siteConfig?.faviconUrl) {
+      let link = document.querySelector("link[rel~='icon']");
+      if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link); }
+      link.href = siteConfig.faviconUrl;
+    }
+  }, [siteConfig]);
+
+  useEffect(() => {
     if (cooldown <= 0) return;
     const timer = setInterval(() => {
       const remaining = getCooldownRemaining();
@@ -74,7 +83,7 @@ function Public() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Có lỗi xảy ra');
       if (!data.affiliateUrl) {
-        setError('Không tìm thấy link affiliate. Vui lòng thử sản phẩm khác.');
+        setError('Không tìm thấy link affiliate. Hệ thống đang tự động reload, vui lòng thử lại sau ít giây.');
       } else {
         const entry = {
           productUrl: productUrl.trim(),
@@ -87,7 +96,7 @@ function Public() {
       }
       localStorage.setItem('_lastSubmit', Date.now().toString());
       setCooldown(COOLDOWN_MS);
-    } catch (err) { setError(err.message); }
+    } catch (err) { setError('Lỗi: ' + err.message + '. Hệ thống đang tự động reload trang, vui lòng thử lại sau ít giây.'); }
     finally { setLoading(false); }
   };
 
@@ -107,9 +116,9 @@ function Public() {
         <div className="public-header">
           <div className="public-logo">
             <FaYoutube size={26} />
-            <span>Áp Mã Youtube</span>
+            <span>{cfg.pageTitle || 'GẮN SẢN PHẨM YOUTUBE'}</span>
           </div>
-          <p className="public-subtitle">Nhập link sản phẩm Shopee / Lazada để tạo link affiliate</p>
+          <p className="public-subtitle">{cfg.pageSubtitle || 'Nhập link sản phẩm Shopee, Lazada để gắn giỏ youtube'}</p>
         </div>
 
         <div className="public-card">

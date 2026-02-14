@@ -31,6 +31,7 @@ function Dashboard({ user, onLogout }) {
   const [uploading, setUploading] = useState(false);
   const [showRemote, setShowRemote] = useState(false);
   const videoInputRef = useRef(null);
+  const faviconInputRef = useRef(null);
 
   useEffect(() => {
     loadProfile();
@@ -159,6 +160,39 @@ function Dashboard({ user, onLogout }) {
     } catch {}
   };
 
+  const handleUploadFavicon = async (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    if (!file.type.startsWith('image/')) { alert('Chỉ chấp nhận file ảnh'); return; }
+    if (file.size > 5 * 1024 * 1024) { alert('File quá lớn (tối đa 5MB)'); return; }
+    try {
+      const res = await fetch('/api/upload-favicon', {
+        method: 'POST',
+        headers: { 'Content-Type': file.type, 'Authorization': `Bearer ${api.token}` },
+        body: file,
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error);
+      updateConfig('faviconUrl', data.faviconUrl);
+      const saveRes = await api.fetch('/api/site-config', {
+        method: 'PUT',
+        body: JSON.stringify({ ...siteConfig, faviconUrl: data.faviconUrl }),
+      });
+      if (saveRes.ok) setSiteConfig(await saveRes.json());
+    } catch (err) { alert('Upload failed: ' + err.message); }
+    finally { if (faviconInputRef.current) faviconInputRef.current.value = ''; }
+  };
+
+  const handleRemoveFavicon = async () => {
+    updateConfig('faviconUrl', '');
+    try {
+      await api.fetch('/api/site-config', {
+        method: 'PUT',
+        body: JSON.stringify({ ...siteConfig, faviconUrl: '' }),
+      });
+    } catch {}
+  };
+
   const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
 
   return (
@@ -278,6 +312,47 @@ function Dashboard({ user, onLogout }) {
           </div>
 
           <div style={{ display: 'flex', flexDirection: 'column', gap: '16px' }}>
+            {/* Page Title & Subtitle */}
+            <div>
+              <label style={{ color: '#94a3b8', fontSize: '13px', display: 'block', marginBottom: '6px' }}>
+                <FiFileText size={13} style={{ verticalAlign: 'middle', marginRight: '4px' }} /> Tiêu đề trang Public
+              </label>
+              <input type="text" value={siteConfig.pageTitle || ''} onChange={(e) => updateConfig('pageTitle', e.target.value)}
+                placeholder="GẮN SẢN PHẨM YOUTUBE" style={inputStyle} />
+            </div>
+            <div>
+              <label style={{ color: '#94a3b8', fontSize: '13px', display: 'block', marginBottom: '6px' }}>
+                Mô tả trang Public
+              </label>
+              <input type="text" value={siteConfig.pageSubtitle || ''} onChange={(e) => updateConfig('pageSubtitle', e.target.value)}
+                placeholder="Nhập link sản phẩm Shopee, Lazada để gắn giỏ youtube" style={inputStyle} />
+            </div>
+
+            {/* Favicon */}
+            <div>
+              <label style={{ color: '#94a3b8', fontSize: '13px', display: 'block', marginBottom: '6px' }}>
+                <FiGlobe size={13} style={{ verticalAlign: 'middle', marginRight: '4px' }} /> Favicon
+              </label>
+              {siteConfig.faviconUrl ? (
+                <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+                  <img src={siteConfig.faviconUrl} alt="favicon" style={{ width: '32px', height: '32px', borderRadius: '4px', border: '1px solid #333' }} />
+                  <button className="btn-session btn-session-open" onClick={() => faviconInputRef.current?.click()}>
+                    Đổi favicon
+                  </button>
+                  <button className="btn-session btn-session-delete" onClick={handleRemoveFavicon}>
+                    Xoá
+                  </button>
+                </div>
+              ) : (
+                <button className="btn-session btn-session-open" onClick={() => faviconInputRef.current?.click()}
+                  style={{ padding: '10px 20px' }}>
+                  Upload favicon
+                </button>
+              )}
+              <input ref={faviconInputRef} type="file" accept="image/*" onChange={handleUploadFavicon}
+                style={{ display: 'none' }} />
+            </div>
+
             {/* Video hướng dẫn */}
             <div>
               <label style={{ color: '#94a3b8', fontSize: '13px', display: 'block', marginBottom: '6px' }}>
