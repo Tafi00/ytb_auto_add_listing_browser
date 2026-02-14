@@ -241,6 +241,22 @@ async function removeProduct(page) {
 
 // ==================== Profile API ====================
 
+// History stats file path
+const historyStatsPath = path.resolve(__dirname, '../config/history-stats.json');
+
+const loadHistoryStats = () => {
+  try {
+    if (fs.existsSync(historyStatsPath)) return JSON.parse(fs.readFileSync(historyStatsPath, 'utf8'));
+  } catch {}
+  return { totalLinks: 0 };
+};
+
+const saveHistoryStats = (stats) => {
+  const dir = path.dirname(historyStatsPath);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(historyStatsPath, JSON.stringify(stats, null, 2));
+};
+
 // Job config file path
 const jobConfigPath = path.resolve(__dirname, '../config/job-config.json');
 
@@ -302,6 +318,17 @@ app.put('/api/job-config', auth, async (req, res) => {
 app.get('/api/browser-status', auth, async (_, res) => {
   const running = await isChromeRunning();
   res.json({ running });
+});
+
+// History stats - get total count
+app.get('/api/history-stats', auth, (_, res) => {
+  res.json(loadHistoryStats());
+});
+
+// History stats - reset (delete all)
+app.delete('/api/history-stats', auth, (_, res) => {
+  saveHistoryStats({ totalLinks: 0 });
+  res.json({ message: 'Đã xóa toàn bộ lịch sử' });
 });
 
 // Rate limiting per client (15s cooldown)
@@ -390,6 +417,13 @@ app.post('/api/get-affiliate', async (req, res) => {
     });
 
     res.json({ affiliateUrl: result.affiliateUrl, metadata: result.metadata });
+
+    // Increment history counter on success
+    if (result.affiliateUrl) {
+      const stats = loadHistoryStats();
+      stats.totalLinks++;
+      saveHistoryStats(stats);
+    }
   } catch (e) {
     res.status(500).json({ error: e.message });
   }

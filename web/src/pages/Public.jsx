@@ -118,6 +118,7 @@ function Public() {
       }
       localStorage.setItem('_lastSubmit', Date.now().toString());
       setCooldown(COOLDOWN_MS);
+      setProductUrl('');
     } catch (err) { setError('Lỗi: ' + err.message + '. Hệ thống đang tự động reload trang, vui lòng thử lại sau ít giây.'); }
     finally { setLoading(false); }
   };

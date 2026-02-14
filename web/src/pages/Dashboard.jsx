@@ -24,6 +24,8 @@ function Dashboard({ user, onLogout }) {
   const [jobUrl, setJobUrl] = useState('');
   const [jobSaved, setJobSaved] = useState(false);
   const [browserRunning, setBrowserRunning] = useState(false);
+  const [historyStats, setHistoryStats] = useState(null);
+  const [clearing, setClearing] = useState(false);
 
   // Site config state
   const [siteConfig, setSiteConfig] = useState(null);
@@ -37,6 +39,7 @@ function Dashboard({ user, onLogout }) {
     loadProfile();
     loadJobConfig();
     loadSiteConfig();
+    loadHistoryStats();
     checkBrowserStatus();
     const interval = setInterval(checkBrowserStatus, 5000);
     return () => clearInterval(interval);
@@ -48,6 +51,23 @@ function Dashboard({ user, onLogout }) {
 
   const loadJobConfig = async () => {
     try { const d = await api.getJobConfig(); setJobUrl(d.url || ''); } catch {}
+  };
+
+  const loadHistoryStats = async () => {
+    try {
+      const res = await api.fetch('/api/history-stats');
+      setHistoryStats(await res.json());
+    } catch {}
+  };
+
+  const handleClearHistory = async () => {
+    if (!window.confirm('Xóa toàn bộ lịch sử gắn link? Hành động này không thể hoàn tác.')) return;
+    setClearing(true);
+    try {
+      await api.fetch('/api/history-stats', { method: 'DELETE' });
+      setHistoryStats({ totalLinks: 0 });
+    } catch (err) { alert('Lỗi: ' + err.message); }
+    finally { setClearing(false); }
   };
 
   const loadSiteConfig = async () => {
@@ -261,6 +281,29 @@ function Dashboard({ user, onLogout }) {
             onClick={handleSaveJobConfig}>
             {jobSaved ? '✓ Saved' : 'Save'}
           </button>
+        </div>
+      </div>
+
+      {/* Lịch sử gắn link */}
+      <div className="card" style={{ marginTop: '16px' }}>
+        <div className="card-header">
+          <h2 className="card-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+            <FiList size={16} color="#60a5fa" /> Lịch sử gắn link
+          </h2>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
+            <span style={{ color: '#e2e8f0', fontSize: '28px', fontWeight: 700 }}>
+              {historyStats ? historyStats.totalLinks : '...'}
+            </span>
+            <span style={{ color: '#94a3b8', fontSize: '13px' }}>link đã gắn</span>
+          </div>
+          {historyStats && historyStats.totalLinks > 0 && (
+            <button className="btn-session btn-session-delete" onClick={handleClearHistory} disabled={clearing}
+              style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '8px 16px' }}>
+              <FiTrash2 size={14} /> {clearing ? 'Đang xóa...' : 'Xóa toàn bộ'}
+            </button>
+          )}
         </div>
       </div>
 
