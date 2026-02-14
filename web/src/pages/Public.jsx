@@ -25,11 +25,17 @@ function Public() {
   const [result, setResult] = useState(null);
   const [error, setError] = useState('');
   const [cooldown, setCooldown] = useState(getCooldownRemaining());
-  const [history, setHistory] = useState(() => {
-    try { return JSON.parse(localStorage.getItem('_history') || '[]'); } catch { return []; }
-  });
+  const [history, setHistory] = useState([]);
   const [copied, setCopied] = useState(null);
   const [siteConfig, setSiteConfig] = useState(null);
+
+  // Load history from server on mount
+  useEffect(() => {
+    const cid = getClientId();
+    fetch(`/api/history/${cid}`).then(r => r.json()).then(data => {
+      if (Array.isArray(data)) setHistory(data);
+    }).catch(() => {});
+  }, []);
 
   useEffect(() => {
     fetch('/api/site-config').then(r => r.json()).then(setSiteConfig).catch(() => {});
@@ -55,11 +61,7 @@ function Public() {
   }, [cooldown]);
 
   const saveHistory = useCallback((entry) => {
-    setHistory(prev => {
-      const next = [entry, ...prev].slice(0, 50);
-      localStorage.setItem('_history', JSON.stringify(next));
-      return next;
-    });
+    setHistory(prev => [entry, ...prev].slice(0, 50));
   }, []);
 
   const handleSubmit = async (e) => {
@@ -127,7 +129,7 @@ function Public() {
     navigator.clipboard.writeText(text).then(() => { setCopied(idx); setTimeout(() => setCopied(null), 2000); });
   };
 
-  const clearHistory = () => { setHistory([]); localStorage.removeItem('_history'); };
+  const clearHistory = () => { setHistory([]); };
   const cooldownSec = Math.ceil(cooldown / 1000);
 
   const cfg = siteConfig || {};

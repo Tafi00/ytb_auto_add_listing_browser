@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { FiRefreshCw, FiNavigation, FiType, FiCornerDownLeft, FiArrowLeft, FiArrowRight, FiDelete, FiArrowUp, FiArrowDown } from 'react-icons/fi';
+import { FiRefreshCw, FiNavigation, FiType, FiCornerDownLeft, FiArrowLeft, FiArrowRight, FiDelete, FiArrowUp, FiArrowDown, FiZap, FiZapOff } from 'react-icons/fi';
 import { api } from '../App';
 
 function RemoteBrowser() {
@@ -10,13 +10,92 @@ function RemoteBrowser() {
   const [typeText, setTypeText] = useState('');
   const [loading, setLoading] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(false);
   const [error, setError] = useState('');
   const [viewport, setViewport] = useState({ width: 1920, height: 1080 });
+  const [liveMode, setLiveMode] = useState(true);
+  const [wsConnected, setWsConnected] = useState(false);
   const imgRef = useRef(null);
-  const intervalRef = useRef(null);
   const navUrlRef = useRef('');
+  const wsRef = useRef(null);
+  const reconnectTimer = useRef(null);
 
+  // Build WebSocket URL
+  const getWsUrl = useCallback(() => {
+    const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const host = window.location.host;
+    const token = localStorage.getItem('token');
+    return `${proto}//${host}/ws/screencast?token=${encodeURIComponent(token)}`;
+  }, []);
+
+  // Connect WebSocket for live screencast
+  const connectScreencast = useCallback(() => {
+    if (wsRef.current) {
+      try { wsRef.current.close(); } catch {}
+    }
+
+    const ws = new WebSocket(getWsUrl());
+    wsRef.current = ws;
+
+    ws.onopen = () => {
+      setWsConnected(true);
+      setError('');
+      console.log('[Screencast] Connected');
+    };
+
+    ws.onmessage = (e) => {
+      try {
+        const msg = JSON.parse(e.data);
+        if (msg.type === 'frame') {
+          setScreenshot(msg.image);
+          if (msg.metadata) {
+            if (msg.metadata.pageScaleFactor) {
+              // Update viewport from metadata if available
+            }
+          }
+        } else if (msg.type === 'error') {
+          setError(msg.error);
+        }
+      } catch {}
+    };
+
+    ws.onclose = () => {
+      setWsConnected(false);
+      wsRef.current = null;
+      // Auto-reconnect after 3s if live mode is still on
+      if (liveMode) {
+        reconnectTimer.current = setTimeout(connectScreencast, 3000);
+      }
+    };
+
+    ws.onerror = () => {
+      setWsConnected(false);
+    };
+  }, [getWsUrl, liveMode]);
+
+  // Disconnect WebSocket
+  const disconnectScreencast = useCallback(() => {
+    if (reconnectTimer.current) {
+      clearTimeout(reconnectTimer.current);
+      reconnectTimer.current = null;
+    }
+    if (wsRef.current) {
+      try { wsRef.current.close(); } catch {}
+      wsRef.current = null;
+    }
+    setWsConnected(false);
+  }, []);
+
+  // Toggle live mode
+  useEffect(() => {
+    if (liveMode) {
+      connectScreencast();
+    } else {
+      disconnectScreencast();
+    }
+    return () => disconnectScreencast();
+  }, [liveMode]);
+
+  // Fallback: fetch screenshot via REST (used when live mode is off, or for initial load)
   const fetchScreenshot = useCallback(async () => {
     try {
       setError('');
@@ -36,16 +115,25 @@ function RemoteBrowser() {
     finally { setRefreshing(false); }
   }, []);
 
-  useEffect(() => { fetchScreenshot(); }, []);
-
+  // Fetch page info (URL, title) periodically when in live mode
   useEffect(() => {
-    if (autoRefresh) {
-      intervalRef.current = setInterval(fetchScreenshot, 2000);
-    } else if (intervalRef.current) {
-      clearInterval(intervalRef.current);
-    }
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
-  }, [autoRefresh, fetchScreenshot]);
+    if (!liveMode) return;
+    const fetchInfo = async () => {
+      try {
+        const res = await api.fetch('/api/browser/page-info');
+        const data = await res.json();
+        if (data.url) setPageUrl(data.url);
+        if (data.title) setPageTitle(data.title);
+        if (!navUrlRef.current) {
+          setNavUrl(data.url);
+          navUrlRef.current = data.url;
+        }
+      } catch {}
+    };
+    fetchInfo();
+    const interval = setInterval(fetchInfo, 5000);
+    return () => clearInterval(interval);
+  }, [liveMode]);
 
   const getCoords = (e) => {
     if (!imgRef.current) return null;
@@ -64,8 +152,10 @@ function RemoteBrowser() {
     setLoading(true);
     try {
       await api.fetch('/api/browser/click', { method: 'POST', body: JSON.stringify(coords) });
-      await new Promise(r => setTimeout(r, 800));
-      await fetchScreenshot();
+      if (!liveMode) {
+        await new Promise(r => setTimeout(r, 800));
+        await fetchScreenshot();
+      }
     } catch {}
     setLoading(false);
   };
@@ -79,7 +169,7 @@ function RemoteBrowser() {
         method: 'POST',
         body: JSON.stringify({ x: coords.x, y: coords.y, deltaX: 0, deltaY: e.deltaY > 0 ? 300 : -300 }),
       });
-      setTimeout(fetchScreenshot, 400);
+      if (!liveMode) setTimeout(fetchScreenshot, 400);
     } catch {}
   };
 
@@ -89,8 +179,10 @@ function RemoteBrowser() {
     setLoading(true);
     try {
       await api.fetch('/api/browser/navigate', { method: 'POST', body: JSON.stringify({ url: navUrl }) });
-      await new Promise(r => setTimeout(r, 1500));
-      await fetchScreenshot();
+      if (!liveMode) {
+        await new Promise(r => setTimeout(r, 1500));
+        await fetchScreenshot();
+      }
     } catch {}
     setLoading(false);
   };
@@ -102,8 +194,10 @@ function RemoteBrowser() {
     try {
       await api.fetch('/api/browser/type', { method: 'POST', body: JSON.stringify({ text: typeText }) });
       setTypeText('');
-      await new Promise(r => setTimeout(r, 500));
-      await fetchScreenshot();
+      if (!liveMode) {
+        await new Promise(r => setTimeout(r, 500));
+        await fetchScreenshot();
+      }
     } catch {}
     setLoading(false);
   };
@@ -112,8 +206,10 @@ function RemoteBrowser() {
     setLoading(true);
     try {
       await api.fetch('/api/browser/key', { method: 'POST', body: JSON.stringify({ key }) });
-      await new Promise(r => setTimeout(r, 500));
-      await fetchScreenshot();
+      if (!liveMode) {
+        await new Promise(r => setTimeout(r, 500));
+        await fetchScreenshot();
+      }
     } catch {}
     setLoading(false);
   };
@@ -124,7 +220,7 @@ function RemoteBrowser() {
         method: 'POST',
         body: JSON.stringify({ x: viewport.width / 2, y: viewport.height / 2, deltaX: 0, deltaY: direction === 'down' ? 400 : -400 }),
       });
-      setTimeout(fetchScreenshot, 400);
+      if (!liveMode) setTimeout(fetchScreenshot, 400);
     } catch {}
   };
 
@@ -145,13 +241,27 @@ function RemoteBrowser() {
           }} />
         <button type="submit" className="btn-session btn-session-open" disabled={loading}
           style={{ padding: '6px 14px' }}><FiNavigation size={12} /> Go</button>
-        <label style={{ fontSize: '12px', color: '#888', display: 'flex', alignItems: 'center', gap: '4px', cursor: 'pointer', whiteSpace: 'nowrap' }}>
-          <input type="checkbox" checked={autoRefresh} onChange={(e) => setAutoRefresh(e.target.checked)} /> Auto
-        </label>
-        <button type="button" className="btn-session btn-session-open" onClick={fetchScreenshot} disabled={refreshing}
-          style={{ padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-          <FiRefreshCw size={12} className={refreshing ? 'spin' : ''} />
+        <button
+          type="button"
+          className="btn-session btn-session-open"
+          onClick={() => setLiveMode(!liveMode)}
+          style={{
+            padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '4px',
+            background: liveMode && wsConnected ? 'rgba(34,197,94,0.15)' : undefined,
+            borderColor: liveMode && wsConnected ? '#22c55e' : undefined,
+            color: liveMode && wsConnected ? '#22c55e' : undefined,
+          }}
+          title={liveMode ? 'Live mode ON - click to switch to manual' : 'Manual mode - click for live preview'}
+        >
+          {liveMode ? <FiZap size={12} /> : <FiZapOff size={12} />}
+          {liveMode ? 'Live' : 'Manual'}
         </button>
+        {!liveMode && (
+          <button type="button" className="btn-session btn-session-open" onClick={fetchScreenshot} disabled={refreshing}
+            style={{ padding: '6px 12px', display: 'flex', alignItems: 'center', gap: '4px' }}>
+            <FiRefreshCw size={12} className={refreshing ? 'spin' : ''} />
+          </button>
+        )}
       </form>
 
       {/* Screenshot - fills remaining space */}
@@ -160,11 +270,31 @@ function RemoteBrowser() {
           <img ref={imgRef} src={screenshot} alt="Browser" onClick={handleClick} onWheel={handleScroll}
             style={{ maxWidth: '100%', maxHeight: '100%', display: 'block', cursor: 'crosshair', objectFit: 'contain' }} draggable={false} />
         ) : (
-          <div style={{ padding: '60px', textAlign: 'center', color: '#555' }}>Click Refresh to load screenshot</div>
+          <div style={{ padding: '60px', textAlign: 'center', color: '#555' }}>
+            {liveMode ? 'Connecting live preview...' : 'Click Refresh to load screenshot'}
+          </div>
         )}
         {loading && (
           <div style={{ position: 'absolute', top: 0, left: 0, right: 0, bottom: 0, background: 'rgba(0,0,0,0.3)', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
             <div className="spinner" />
+          </div>
+        )}
+        {/* Live indicator */}
+        {liveMode && (
+          <div style={{
+            position: 'absolute', top: '8px', right: '8px',
+            padding: '3px 8px', borderRadius: '4px', fontSize: '11px', fontWeight: 500,
+            background: wsConnected ? 'rgba(34,197,94,0.2)' : 'rgba(239,68,68,0.2)',
+            color: wsConnected ? '#22c55e' : '#f87171',
+            border: `1px solid ${wsConnected ? '#22c55e33' : '#f8717133'}`,
+            display: 'flex', alignItems: 'center', gap: '4px',
+          }}>
+            <span style={{
+              width: '6px', height: '6px', borderRadius: '50%',
+              background: wsConnected ? '#22c55e' : '#f87171',
+              animation: wsConnected ? 'pulse 2s infinite' : 'none',
+            }} />
+            {wsConnected ? 'LIVE' : 'Reconnecting...'}
           </div>
         )}
       </div>
@@ -199,6 +329,13 @@ function RemoteBrowser() {
         <button className="btn-session btn-session-open" onClick={() => handleScrollBtn('up')} style={{ padding: '6px 10px' }}><FiArrowUp size={12} /></button>
         <button className="btn-session btn-session-open" onClick={() => handleScrollBtn('down')} style={{ padding: '6px 10px' }}><FiArrowDown size={12} /></button>
       </div>
+
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.4; }
+        }
+      `}</style>
     </div>
   );
 }

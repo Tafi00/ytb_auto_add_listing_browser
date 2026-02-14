@@ -7,8 +7,11 @@ import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
+import http from 'http';
+import { WebSocketServer } from 'ws';
 import { SessionManager } from './session-manager.js';
 import { CONFIG } from './config.js';
+import { addHistory, getHistory, getTotalLinks, clearAllHistory } from './history-db.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -241,21 +244,7 @@ async function removeProduct(page) {
 
 // ==================== Profile API ====================
 
-// History stats file path
-const historyStatsPath = path.resolve(__dirname, '../config/history-stats.json');
-
-const loadHistoryStats = () => {
-  try {
-    if (fs.existsSync(historyStatsPath)) return JSON.parse(fs.readFileSync(historyStatsPath, 'utf8'));
-  } catch {}
-  return { totalLinks: 0 };
-};
-
-const saveHistoryStats = (stats) => {
-  const dir = path.dirname(historyStatsPath);
-  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(historyStatsPath, JSON.stringify(stats, null, 2));
-};
+// History stats (now backed by SQLite via history-db.js)
 
 // Job config file path
 const jobConfigPath = path.resolve(__dirname, '../config/job-config.json');
@@ -322,18 +311,25 @@ app.get('/api/browser-status', auth, async (_, res) => {
 
 // History stats - get total count
 app.get('/api/history-stats', auth, (_, res) => {
-  res.json(loadHistoryStats());
+  res.json({ totalLinks: getTotalLinks() });
 });
 
 // History stats - reset (delete all)
 app.delete('/api/history-stats', auth, (_, res) => {
-  saveHistoryStats({ totalLinks: 0 });
+  clearAllHistory();
   res.json({ message: 'Đã xóa toàn bộ lịch sử' });
 });
 
 // Rate limiting per client (15s cooldown)
 const clientCooldowns = new Map();
 const CLIENT_COOLDOWN_MS = 15000;
+
+// Public API: get history by clientId
+app.get('/api/history/:clientId', (req, res) => {
+  const { clientId } = req.params;
+  if (!clientId) return res.status(400).json({ error: 'clientId required' });
+  res.json(getHistory(clientId));
+});
 
 // Cleanup old entries every 5 minutes
 setInterval(() => {
@@ -418,11 +414,14 @@ app.post('/api/get-affiliate', async (req, res) => {
 
     res.json({ affiliateUrl: result.affiliateUrl, metadata: result.metadata });
 
-    // Increment history counter on success
+    // Save history to SQLite on success
     if (result.affiliateUrl) {
-      const stats = loadHistoryStats();
-      stats.totalLinks++;
-      saveHistoryStats(stats);
+      addHistory(clientId || 'anonymous', {
+        productUrl: productUrl.trim(),
+        affiliateUrl: result.affiliateUrl,
+        metadata: result.metadata || {},
+        createdAt: new Date().toISOString(),
+      });
     }
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -477,6 +476,22 @@ app.delete('/api/profile/session', auth, (req, res) => {
 });
 
 // ==================== Remote Browser Control ====================
+
+// Lightweight page info (URL + title only, no screenshot)
+app.get('/api/browser/page-info', auth, async (_, res) => {
+  try {
+    const { chromium } = await import('playwright');
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const page = browser.contexts()[0]?.pages()[0];
+    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    const url = page.url();
+    const title = await page.title().catch(() => '');
+    await browser.close();
+    res.json({ url, title });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
 
 // Screenshot via CDP directly (more reliable than Playwright)
 app.get('/api/browser/screenshot', auth, async (_, res) => {
@@ -723,7 +738,118 @@ app.get('*', (_, res) => {
   }
 });
 
-app.listen(PORT, '0.0.0.0', () => {
+const server = http.createServer(app);
+
+// ==================== WebSocket Screencast ====================
+const wss = new WebSocketServer({ server, path: '/ws/screencast' });
+
+wss.on('connection', async (ws, req) => {
+  // Verify JWT from query string
+  const url = new URL(req.url, `http://${req.headers.host}`);
+  const token = url.searchParams.get('token');
+  try {
+    jwt.verify(token, JWT_SECRET);
+  } catch {
+    ws.close(4001, 'Unauthorized');
+    return;
+  }
+
+  console.log('[Screencast] Client connected');
+  let cdpWs = null;
+  let sessionId = null;
+  let alive = true;
+
+  ws.on('close', () => {
+    alive = false;
+    console.log('[Screencast] Client disconnected');
+    stopScreencast();
+  });
+
+  ws.on('error', () => {
+    alive = false;
+    stopScreencast();
+  });
+
+  async function stopScreencast() {
+    if (cdpWs && cdpWs.readyState === cdpWs.OPEN) {
+      try {
+        cdpWs.send(JSON.stringify({ id: 999, method: 'Page.stopScreencast' }));
+      } catch {}
+      setTimeout(() => { try { cdpWs.close(); } catch {} }, 200);
+    }
+    cdpWs = null;
+  }
+
+  try {
+    // Find the page target's webSocketDebuggerUrl
+    const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
+    const targets = await targetsRes.json();
+    const pageTarget = targets.find(t => t.type === 'page');
+    if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
+      ws.send(JSON.stringify({ type: 'error', error: 'No browser page found' }));
+      ws.close();
+      return;
+    }
+
+    // Connect directly to Chrome CDP via raw WebSocket
+    const { default: WebSocket } = await import('ws');
+    cdpWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
+
+    let cmdId = 1;
+
+    cdpWs.on('open', () => {
+      // Enable Page domain
+      cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.enable' }));
+      // Start screencast - JPEG, reasonable quality and size for streaming
+      cdpWs.send(JSON.stringify({
+        id: cmdId++,
+        method: 'Page.startScreencast',
+        params: { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 }
+      }));
+      console.log('[Screencast] CDP screencast started');
+    });
+
+    cdpWs.on('message', (data) => {
+      if (!alive) return;
+      try {
+        const msg = JSON.parse(data.toString());
+        if (msg.method === 'Page.screencastFrame') {
+          const { data: frameData, metadata, sessionId: sid } = msg.params;
+          sessionId = sid;
+          // Acknowledge frame to keep receiving
+          cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
+          // Send frame to client
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'frame',
+              image: `data:image/jpeg;base64,${frameData}`,
+              metadata
+            }));
+          }
+        }
+      } catch {}
+    });
+
+    cdpWs.on('close', () => {
+      if (alive && ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
+      }
+    });
+
+    cdpWs.on('error', (err) => {
+      console.log(`[Screencast] CDP error: ${err.message}`);
+    });
+
+  } catch (e) {
+    console.log(`[Screencast] Error: ${e.message}`);
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ type: 'error', error: e.message }));
+      ws.close();
+    }
+  }
+});
+
+server.listen(PORT, '0.0.0.0', () => {
   console.log(`Admin Dashboard running on http://localhost:${PORT}`);
 
   // Auto-launch browser on startup (non-blocking)
