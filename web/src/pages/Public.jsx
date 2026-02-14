@@ -66,7 +66,29 @@ function Public() {
     e.preventDefault();
     setError('');
     setResult(null);
-    if (!productUrl.trim()) { setError('Vui lòng nhập link sản phẩm'); return; }
+    const trimmed = productUrl.trim();
+    if (!trimmed) { setError('Vui lòng nhập link sản phẩm'); return; }
+
+    // Check multiple links
+    const urlMatches = trimmed.match(/https?:\/\/[^\s]+/g);
+    if (urlMatches && urlMatches.length > 1) {
+      setError('Mỗi lần chỉ gửi 1 link');
+      return;
+    }
+
+    // Validate URL format immediately
+    try {
+      const parsed = new URL(trimmed);
+      const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'lazada.vn', 'www.lazada.vn'];
+      if (!validHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h))) {
+        setError('Link sản phẩm không hợp lệ. Vui lòng nhập link Shopee hoặc Lazada.');
+        return;
+      }
+    } catch {
+      setError('Link sản phẩm không hợp lệ. Vui lòng nhập link Shopee hoặc Lazada.');
+      return;
+    }
+
     const remaining = getCooldownRemaining();
     if (remaining > 0) {
       setCooldown(remaining);

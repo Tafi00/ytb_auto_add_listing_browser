@@ -128,10 +128,16 @@ async function addProduct(page, productUrl) {
 
   await searchInput.press('Enter');
   console.log('[Job] Pressed Enter to search');
-  await page.waitForTimeout(2000);
 
+  // Wait up to 5s for product to appear, if not found reload and throw error
   const tagBtn = page.locator('ytcp-icon-button.tag-product-button[aria-label="Tag"]').first();
-  await tagBtn.waitFor({ state: 'visible', timeout: 5000 });
+  try {
+    await tagBtn.waitFor({ state: 'visible', timeout: 5000 });
+  } catch {
+    console.log('[Job] Product not found within 5s, reloading page...');
+    await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => {});
+    throw new Error('Không tìm thấy sản phẩm. Vui lòng kiểm tra lại link.');
+  }
   await tagBtn.click();
   console.log('[Job] Clicked Tag button');
 
@@ -310,10 +316,38 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// Validate product URL format
+function isValidProductUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'lazada.vn', 'www.lazada.vn'];
+    return validHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
+  } catch {
+    return false;
+  }
+}
+
+// Check if input contains multiple links
+function containsMultipleLinks(input) {
+  const urlPattern = /https?:\/\/[^\s]+/g;
+  const matches = input.match(urlPattern);
+  return matches && matches.length > 1;
+}
+
 // Public API: get affiliate URL by product URL (uses Video URL from config)
 app.post('/api/get-affiliate', async (req, res) => {
   const { productUrl, clientId } = req.body;
   if (!productUrl) return res.status(400).json({ error: 'productUrl is required' });
+
+  // Check multiple links
+  if (containsMultipleLinks(productUrl)) {
+    return res.status(400).json({ error: 'Mỗi lần chỉ gửi 1 link' });
+  }
+
+  // Validate URL format immediately
+  if (!isValidProductUrl(productUrl.trim())) {
+    return res.status(400).json({ error: 'Link sản phẩm không hợp lệ. Vui lòng nhập link Shopee hoặc Lazada.' });
+  }
 
   // Rate limit by clientId + IP combo
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
