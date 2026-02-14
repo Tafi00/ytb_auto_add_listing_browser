@@ -107,7 +107,7 @@ function Public() {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || 'Có lỗi xảy ra');
       if (!data.affiliateUrl) {
-        setError('Không tìm thấy link affiliate. Hệ thống đang tự động reload, vui lòng thử lại sau ít giây.');
+        setError('Sản phẩm này không gắn giỏ được');
       } else {
         const entry = {
           productUrl: productUrl.trim(),
