@@ -213,8 +213,6 @@ function Dashboard({ user, onLogout }) {
     } catch {}
   };
 
-  const isLocalhost = window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1';
-
   return (
     <div className="container">
       <header className="header">
@@ -228,9 +226,8 @@ function Dashboard({ user, onLogout }) {
         </div>
       </header>
 
-      {/* Chrome Profile - only on localhost */}
-      {isLocalhost && (
-        <div className="card">
+      {/* Chrome Profile */}
+      <div className="card">
         <div className="card-header">
           <h2 className="card-title" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
             <div style={{ width: '20px', height: '20px', color: '#60a5fa' }}><BrowserIcon /></div>
@@ -264,7 +261,6 @@ function Dashboard({ user, onLogout }) {
           </div>
         ) : <p className="empty">Loading...</p>}
       </div>
-      )}
 
       {/* Job Config */}
       <div className="card" style={{ marginTop: '16px' }}>
@@ -308,14 +304,12 @@ function Dashboard({ user, onLogout }) {
       </div>
 
       {/* Remote Browser Button */}
-      {browserRunning && (
-        <div className="card" style={{ marginTop: '16px' }}>
-          <button className="btn-session btn-session-open" onClick={() => setShowRemote(true)}
-            style={{ width: '100%', padding: '14px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', fontSize: '14px' }}>
-            <FiMonitor size={16} /> Mở Remote Browser
-          </button>
-        </div>
-      )}
+      <div className="card" style={{ marginTop: '16px' }}>
+        <button className="btn-session btn-session-open" onClick={() => setShowRemote(true)}
+          style={{ width: '100%', padding: '14px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', fontSize: '14px' }}>
+          <FiMonitor size={16} /> Mở Remote Browser
+        </button>
+      </div>
 
       {/* Remote Browser Dialog */}
       {showRemote && (
