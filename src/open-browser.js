@@ -18,7 +18,7 @@ async function main() {
     console.log(`[OpenBrowser] Created profile: ${sessionId}`);
   }
 
-  const config = { ...CONFIG, sessionId };
+  const config = { ...CONFIG, headless: false, sessionId };
 
   console.log(`[OpenBrowser] Starting Chrome with profile "${sessionId}"...`);
   console.log('[OpenBrowser] Chrome will open as a normal browser (no automation detection)');
@@ -27,21 +27,30 @@ async function main() {
   const browser = new Browser(config);
   await browser.init();
 
-  // Navigate to start URL via CDP
+  // Navigate via CDP directly (avoids Playwright crash)
   if (url && url !== 'about:blank') {
-    let connection = null;
     try {
-      connection = await browser.connectForExport();
-      if (connection?.page) {
-        await connection.page.goto(url, { waitUntil: 'commit', timeout: 15000 });
+      const targetsRes = await fetch(`http://127.0.0.1:19222/json`);
+      const targets = await targetsRes.json();
+      const pageTarget = targets.find(t => t.type === 'page');
+      if (pageTarget) {
+        const { default: WebSocket } = await import('ws');
+        const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
+        await new Promise((resolve, reject) => {
+          ws.on('open', () => {
+            ws.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url } }));
+            ws.on('message', (data) => {
+              const msg = JSON.parse(data.toString());
+              if (msg.id === 1) { ws.close(); resolve(); }
+            });
+          });
+          ws.on('error', reject);
+          setTimeout(() => { ws.close(); resolve(); }, 10000);
+        });
         console.log(`[OpenBrowser] Navigated to: ${url}`);
       }
     } catch (e) {
       console.log(`[OpenBrowser] Could not navigate to URL: ${e.message}`);
-    } finally {
-      if (connection?.browser) {
-        try { await connection.browser.close(); } catch {}
-      }
     }
   }
 

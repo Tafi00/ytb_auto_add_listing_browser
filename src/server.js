@@ -898,14 +898,6 @@ wss.on('connection', async (ws, req) => {
   }
 
   try {
-    // Check if Chrome is running first
-    const running = await isChromeRunning();
-    if (!running) {
-      ws.send(JSON.stringify({ type: 'error', error: 'browser_not_running' }));
-      ws.close();
-      return;
-    }
-
     // Find the page target's webSocketDebuggerUrl
     const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
     const targets = await targetsRes.json();
@@ -986,17 +978,32 @@ server.listen(PORT, '0.0.0.0', () => {
       const { default: Browser } = await import('./browser.js');
       const jobConfig = loadJobConfig();
       const startUrl = jobConfig.url || 'https://www.youtube.com';
-      const config = { ...CONFIG, sessionId: PROFILE_ID };
+      const config = { ...CONFIG, headless: false, sessionId: PROFILE_ID };
       const browser = new Browser(config);
       await browser.init();
 
+      // Navigate via CDP HTTP directly (avoids Playwright crash)
       try {
-        const connection = await browser.connectForExport();
-        if (connection?.page) {
-          await connection.page.goto(startUrl, { waitUntil: 'commit', timeout: 15000 });
+        const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
+        const targets = await targetsRes.json();
+        const pageTarget = targets.find(t => t.type === 'page');
+        if (pageTarget) {
+          const wsUrl = pageTarget.webSocketDebuggerUrl;
+          const { default: WebSocket } = await import('ws');
+          const ws = new WebSocket(wsUrl);
+          await new Promise((resolve, reject) => {
+            ws.on('open', () => {
+              ws.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: startUrl } }));
+              ws.on('message', (data) => {
+                const msg = JSON.parse(data.toString());
+                if (msg.id === 1) { ws.close(); resolve(); }
+              });
+            });
+            ws.on('error', reject);
+            setTimeout(() => { ws.close(); resolve(); }, 10000);
+          });
           console.log(`[Server] Browser navigated to: ${startUrl}`);
         }
-        if (connection?.browser) await connection.browser.close();
       } catch (e) {
         console.log(`[Server] Could not navigate: ${e.message}`);
       }
