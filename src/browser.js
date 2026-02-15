@@ -59,7 +59,7 @@ export class Browser {
     ];
 
     if (this.config.headless) {
-      args.push('--headless=new', '--disable-gpu');
+      args.push('--headless=new', '--disable-gpu', '--window-size=1920,1080');
     } else {
       args.push('--window-size=1920,1080');
     }

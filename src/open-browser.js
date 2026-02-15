@@ -18,7 +18,7 @@ async function main() {
     console.log(`[OpenBrowser] Created profile: ${sessionId}`);
   }
 
-  const config = { ...CONFIG, headless: false, sessionId };
+  const config = { ...CONFIG, sessionId };
 
   console.log(`[OpenBrowser] Starting Chrome with profile "${sessionId}"...`);
   console.log('[OpenBrowser] Chrome will open as a normal browser (no automation detection)');

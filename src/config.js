@@ -1,7 +1,7 @@
 // Configuration
 export const CONFIG = {
   sessionsDir: process.env.SESSIONS_DIR || './sessions',
-  headless: false,
+  headless: process.env.HEADLESS === 'true' || (!process.env.DISPLAY && process.platform === 'linux'),
   defaultProfile: 'default',
 };
 

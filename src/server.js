@@ -898,6 +898,14 @@ wss.on('connection', async (ws, req) => {
   }
 
   try {
+    // Check if Chrome is running first
+    const running = await isChromeRunning();
+    if (!running) {
+      ws.send(JSON.stringify({ type: 'error', error: 'browser_not_running' }));
+      ws.close();
+      return;
+    }
+
     // Find the page target's webSocketDebuggerUrl
     const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
     const targets = await targetsRes.json();
@@ -978,7 +986,7 @@ server.listen(PORT, '0.0.0.0', () => {
       const { default: Browser } = await import('./browser.js');
       const jobConfig = loadJobConfig();
       const startUrl = jobConfig.url || 'https://www.youtube.com';
-      const config = { ...CONFIG, headless: false, sessionId: PROFILE_ID };
+      const config = { ...CONFIG, sessionId: PROFILE_ID };
       const browser = new Browser(config);
       await browser.init();
 
