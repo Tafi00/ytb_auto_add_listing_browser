@@ -1,8 +1,10 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { FiRefreshCw, FiNavigation, FiType, FiCornerDownLeft, FiArrowLeft, FiArrowRight, FiDelete, FiArrowUp, FiArrowDown, FiZap, FiZapOff } from 'react-icons/fi';
+import { FiRefreshCw, FiNavigation, FiType, FiCornerDownLeft, FiArrowLeft, FiArrowRight, FiDelete, FiArrowUp, FiArrowDown, FiZap, FiZapOff, FiPlus, FiX } from 'react-icons/fi';
 import { api } from '../App';
 
 function RemoteBrowser() {
+  const [tabs, setTabs] = useState([]);
+  const [activeTabId, setActiveTabId] = useState(null);
   const [screenshot, setScreenshot] = useState(null);
   const [pageUrl, setPageUrl] = useState('');
   const [pageTitle, setPageTitle] = useState('');
@@ -21,6 +23,77 @@ function RemoteBrowser() {
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
   const scrollThrottleRef = useRef(null);
+
+  // Fetch tabs list
+  const fetchTabs = useCallback(async () => {
+    try {
+      const res = await api.fetch('/api/browser/tabs');
+      const data = await res.json();
+      if (data.tabs) {
+        setTabs(data.tabs);
+        const active = data.tabs.find(t => t.active);
+        if (active) setActiveTabId(active.id);
+      }
+    } catch {}
+  }, []);
+
+  // Switch tab
+  const switchTab = useCallback(async (targetId) => {
+    try {
+      await api.fetch('/api/browser/tabs/switch', { method: 'POST', body: JSON.stringify({ targetId }) });
+      setActiveTabId(targetId);
+      // Tell screencast WS to switch
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(JSON.stringify({ type: 'switchTab', targetId }));
+      }
+      fetchTabs();
+    } catch {}
+  }, [fetchTabs]);
+
+  // New tab
+  const newTab = useCallback(async () => {
+    try {
+      const res = await api.fetch('/api/browser/tabs/new', { method: 'POST', body: JSON.stringify({}) });
+      const data = await res.json();
+      if (data.tab) {
+        setActiveTabId(data.tab.id);
+        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+          wsRef.current.send(JSON.stringify({ type: 'switchTab', targetId: data.tab.id }));
+        }
+      }
+      fetchTabs();
+    } catch {}
+  }, [fetchTabs]);
+
+  // Close tab
+  const closeTab = useCallback(async (targetId, e) => {
+    e.stopPropagation();
+    try {
+      await api.fetch('/api/browser/tabs/close', { method: 'POST', body: JSON.stringify({ targetId }) });
+      // If we closed the active tab, the backend will reset, refetch to get new active
+      fetchTabs();
+      // If we closed the active tab, screencast needs to reconnect
+      if (targetId === activeTabId && wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        // Small delay then tell WS to switch to whatever is now active
+        setTimeout(async () => {
+          const res = await api.fetch('/api/browser/tabs');
+          const data = await res.json();
+          if (data.tabs && data.tabs.length > 0) {
+            const newActive = data.tabs.find(t => t.active) || data.tabs[0];
+            setActiveTabId(newActive.id);
+            wsRef.current?.send(JSON.stringify({ type: 'switchTab', targetId: newActive.id }));
+          }
+        }, 300);
+      }
+    } catch {}
+  }, [activeTabId, fetchTabs]);
+
+  // Fetch tabs periodically
+  useEffect(() => {
+    fetchTabs();
+    const interval = setInterval(fetchTabs, 5000);
+    return () => clearInterval(interval);
+  }, [fetchTabs]);
 
   // Build WebSocket URL
   const getWsUrl = useCallback(() => {
@@ -300,6 +373,58 @@ function RemoteBrowser() {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      {/* Tab bar */}
+      <div style={{
+        display: 'flex', alignItems: 'center', gap: '2px', marginBottom: '4px', flexShrink: 0,
+        overflowX: 'auto', paddingBottom: '2px',
+      }}>
+        {tabs.map(tab => (
+          <div
+            key={tab.id}
+            onClick={() => switchTab(tab.id)}
+            style={{
+              display: 'flex', alignItems: 'center', gap: '6px',
+              padding: '5px 10px', borderRadius: '6px 6px 0 0', cursor: 'pointer',
+              fontSize: '12px', maxWidth: '180px', minWidth: '80px',
+              background: tab.id === activeTabId ? '#1a1a1a' : '#0a0a0a',
+              border: `1px solid ${tab.id === activeTabId ? '#444' : '#222'}`,
+              borderBottom: tab.id === activeTabId ? '1px solid #1a1a1a' : '1px solid #222',
+              color: tab.id === activeTabId ? '#fff' : '#888',
+            }}
+          >
+            <span style={{
+              flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>
+              {tab.title || 'Untitled'}
+            </span>
+            <span
+              onClick={(e) => closeTab(tab.id, e)}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                width: '16px', height: '16px', borderRadius: '3px', flexShrink: 0,
+                opacity: 0.5, cursor: 'pointer',
+              }}
+              onMouseEnter={(e) => e.currentTarget.style.opacity = 1}
+              onMouseLeave={(e) => e.currentTarget.style.opacity = 0.5}
+            >
+              <FiX size={10} />
+            </span>
+          </div>
+        ))}
+        <button
+          onClick={newTab}
+          style={{
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+            width: '28px', height: '28px', borderRadius: '6px', cursor: 'pointer',
+            background: 'transparent', border: '1px solid #333', color: '#888',
+            flexShrink: 0,
+          }}
+          title="New tab"
+        >
+          <FiPlus size={12} />
+        </button>
+      </div>
+
       {/* URL bar */}
       <form onSubmit={handleNavigate} style={{ display: 'flex', gap: '6px', marginBottom: '8px', flexShrink: 0 }}>
         <div style={{ display: 'flex', gap: '4px' }}>

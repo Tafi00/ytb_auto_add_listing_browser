@@ -540,16 +540,96 @@ app.delete('/api/profile/session', auth, (req, res) => {
 // ==================== Remote Browser Control ====================
 
 // Lightweight page info (URL + title only, no screenshot)
+// Track which tab (by CDP targetId) is currently active for remote control
+let activeTargetId = null;
+
+// Helper: get all page targets from CDP
+async function getCdpPageTargets() {
+  const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
+  const targets = await targetsRes.json();
+  return targets.filter(t => t.type === 'page');
+}
+
+// Helper: get the active target (or fall back to first page)
+async function getActiveTarget() {
+  const pages = await getCdpPageTargets();
+  if (pages.length === 0) return null;
+  if (activeTargetId) {
+    const found = pages.find(t => t.id === activeTargetId);
+    if (found) return found;
+  }
+  activeTargetId = pages[0].id;
+  return pages[0];
+}
+
+// List all tabs
+app.get('/api/browser/tabs', auth, async (_, res) => {
+  try {
+    const pages = await getCdpPageTargets();
+    const tabs = pages.map(t => ({
+      id: t.id,
+      title: t.title || 'Untitled',
+      url: t.url,
+      active: t.id === activeTargetId || (!activeTargetId && pages[0]?.id === t.id),
+    }));
+    res.json({ tabs });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Switch active tab
+app.post('/api/browser/tabs/switch', auth, async (req, res) => {
+  const { targetId } = req.body;
+  if (!targetId) return res.status(400).json({ error: 'targetId required' });
+  try {
+    const pages = await getCdpPageTargets();
+    const found = pages.find(t => t.id === targetId);
+    if (!found) return res.status(404).json({ error: 'Tab not found' });
+    activeTargetId = targetId;
+    // Activate the tab via CDP
+    await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/activate/${targetId}`);
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Create new tab
+app.post('/api/browser/tabs/new', auth, async (req, res) => {
+  const { url } = req.body;
+  try {
+    const targetUrl = url || 'about:blank';
+    const newRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/new?${encodeURIComponent(targetUrl)}`);
+    const newTarget = await newRes.json();
+    activeTargetId = newTarget.id;
+    res.json({ ok: true, tab: { id: newTarget.id, title: newTarget.title || 'New Tab', url: newTarget.url } });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
+// Close a tab
+app.post('/api/browser/tabs/close', auth, async (req, res) => {
+  const { targetId } = req.body;
+  if (!targetId) return res.status(400).json({ error: 'targetId required' });
+  try {
+    await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/close/${targetId}`);
+    // If we closed the active tab, reset
+    if (activeTargetId === targetId) {
+      activeTargetId = null;
+    }
+    res.json({ ok: true });
+  } catch (e) {
+    res.status(500).json({ error: e.message });
+  }
+});
+
 app.get('/api/browser/page-info', auth, async (_, res) => {
   try {
-    const { chromium } = await import('playwright');
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
-    const page = browser.contexts()[0]?.pages()[0];
-    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
-    const url = page.url();
-    const title = await page.title().catch(() => '');
-    await browser.close();
-    res.json({ url, title });
+    const target = await getActiveTarget();
+    if (!target) return res.status(400).json({ error: 'No page' });
+    res.json({ url: target.url, title: target.title || '', targetId: target.id });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -558,18 +638,16 @@ app.get('/api/browser/page-info', auth, async (_, res) => {
 // Screenshot via CDP directly (more reliable than Playwright)
 app.get('/api/browser/screenshot', auth, async (_, res) => {
   try {
-    // Get page target
-    const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
-    const targets = await targetsRes.json();
-    const pageTarget = targets.find(t => t.type === 'page');
-    if (!pageTarget) return res.status(400).json({ error: 'No page found' });
+    const target = await getActiveTarget();
+    if (!target) return res.status(400).json({ error: 'No page found' });
 
-    // Connect via WebSocket
     const { chromium } = await import('playwright');
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
     const contexts = browser.contexts();
     if (contexts.length === 0) { await browser.close(); return res.status(400).json({ error: 'No context' }); }
-    const page = contexts[0].pages()[0];
+    // Find the page matching our active target
+    const allPages = contexts[0].pages();
+    const page = allPages.find(p => p.url() === target.url) || allPages[0];
     if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
 
     const url = page.url();
@@ -602,15 +680,27 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
   }
 });
 
+// Helper: get Playwright page for the active target
+async function getActivePage() {
+  const target = await getActiveTarget();
+  if (!target) throw new Error('No page');
+  const { chromium } = await import('playwright');
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+  const contexts = browser.contexts();
+  if (contexts.length === 0) { await browser.close(); throw new Error('No context'); }
+  const allPages = contexts[0].pages();
+  // Match by target URL or fall back to first
+  const page = allPages.find(p => p.url() === target.url) || allPages[0];
+  if (!page) { await browser.close(); throw new Error('No page'); }
+  return { browser, page };
+}
+
 // Navigate
 app.post('/api/browser/navigate', auth, async (req, res) => {
   const { url } = req.body;
   if (!url) return res.status(400).json({ error: 'url required' });
   try {
-    const { chromium } = await import('playwright');
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
-    const page = browser.contexts()[0]?.pages()[0];
-    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    const { browser, page } = await getActivePage();
     await page.goto(url, { waitUntil: 'commit', timeout: 15000 });
     await browser.close();
     res.json({ ok: true });
@@ -623,12 +713,8 @@ app.post('/api/browser/navigate', auth, async (req, res) => {
 app.post('/api/browser/click', auth, async (req, res) => {
   const { x, y } = req.body;
   try {
-    const { chromium } = await import('playwright');
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
-    const page = browser.contexts()[0]?.pages()[0];
-    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    const { browser, page } = await getActivePage();
     const cdp = await page.context().newCDPSession(page);
-    // Dispatch mouse events via CDP for precise coordinates
     await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
     await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
     await cdp.detach();
@@ -644,10 +730,7 @@ app.post('/api/browser/click', auth, async (req, res) => {
 app.post('/api/browser/type', auth, async (req, res) => {
   const { text } = req.body;
   try {
-    const { chromium } = await import('playwright');
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
-    const page = browser.contexts()[0]?.pages()[0];
-    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    const { browser, page } = await getActivePage();
     await page.keyboard.type(text, { delay: 50 });
     await browser.close();
     res.json({ ok: true });
@@ -660,10 +743,7 @@ app.post('/api/browser/type', auth, async (req, res) => {
 app.post('/api/browser/scroll', auth, async (req, res) => {
   const { x, y, deltaX = 0, deltaY = 0 } = req.body;
   try {
-    const { chromium } = await import('playwright');
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
-    const page = browser.contexts()[0]?.pages()[0];
-    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    const { browser, page } = await getActivePage();
     const cdp = await page.context().newCDPSession(page);
     await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX, deltaY });
     await cdp.detach();
@@ -678,10 +758,7 @@ app.post('/api/browser/scroll', auth, async (req, res) => {
 app.post('/api/browser/key', auth, async (req, res) => {
   const { key } = req.body;
   try {
-    const { chromium } = await import('playwright');
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
-    const page = browser.contexts()[0]?.pages()[0];
-    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
+    const { browser, page } = await getActivePage();
     await page.keyboard.press(key);
     await browser.close();
     res.json({ ok: true });
@@ -859,6 +936,7 @@ wss.on('connection', async (ws, req) => {
   let sessionId = null;
   let alive = true;
   let cmdId = 1;
+  let currentTargetId = null;
 
   ws.on('close', () => {
     alive = false;
@@ -871,10 +949,16 @@ wss.on('connection', async (ws, req) => {
     stopScreencast();
   });
 
-  // Handle input commands from client (click, scroll) via the same CDP connection
+  // Handle input commands from client (click, scroll, switchTab) via the same CDP connection
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
+      if (msg.type === 'switchTab') {
+        // Client wants to switch to a different tab
+        activeTargetId = msg.targetId;
+        connectToTarget(msg.targetId);
+        return;
+      }
       if (!cdpWs || cdpWs.readyState !== cdpWs.OPEN) return;
       if (msg.type === 'click') {
         const { x, y } = msg;
@@ -897,71 +981,72 @@ wss.on('connection', async (ws, req) => {
     cdpWs = null;
   }
 
-  try {
-    // Find the page target's webSocketDebuggerUrl
-    const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
-    const targets = await targetsRes.json();
-    const pageTarget = targets.find(t => t.type === 'page');
-    if (!pageTarget || !pageTarget.webSocketDebuggerUrl) {
-      ws.send(JSON.stringify({ type: 'error', error: 'No browser page found' }));
-      ws.close();
-      return;
-    }
+  async function connectToTarget(targetId) {
+    // Stop existing screencast first
+    await stopScreencast();
+    cmdId = 1;
 
-    // Connect directly to Chrome CDP via raw WebSocket
-    const { default: WebSocket } = await import('ws');
-    cdpWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
-
-    cdpWs.on('open', () => {
-      // Enable Page domain
-      cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.enable' }));
-      // Start screencast - JPEG, reasonable quality and size for streaming
-      cdpWs.send(JSON.stringify({
-        id: cmdId++,
-        method: 'Page.startScreencast',
-        params: { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 }
-      }));
-      console.log('[Screencast] CDP screencast started');
-    });
-
-    cdpWs.on('message', (data) => {
-      if (!alive) return;
-      try {
-        const msg = JSON.parse(data.toString());
-        if (msg.method === 'Page.screencastFrame') {
-          const { data: frameData, metadata, sessionId: sid } = msg.params;
-          sessionId = sid;
-          // Acknowledge frame to keep receiving
-          cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
-          // Send frame to client
-          if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify({
-              type: 'frame',
-              image: `data:image/jpeg;base64,${frameData}`,
-              metadata
-            }));
-          }
-        }
-      } catch {}
-    });
-
-    cdpWs.on('close', () => {
-      if (alive && ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
+    try {
+      const pages = await getCdpPageTargets();
+      const target = targetId ? pages.find(t => t.id === targetId) : pages[0];
+      if (!target || !target.webSocketDebuggerUrl) {
+        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', error: 'No browser page found' }));
+        return;
       }
-    });
+      currentTargetId = target.id;
 
-    cdpWs.on('error', (err) => {
-      console.log(`[Screencast] CDP error: ${err.message}`);
-    });
+      const { default: WebSocket } = await import('ws');
+      cdpWs = new WebSocket(target.webSocketDebuggerUrl);
 
-  } catch (e) {
-    console.log(`[Screencast] Error: ${e.message}`);
-    if (ws.readyState === ws.OPEN) {
-      ws.send(JSON.stringify({ type: 'error', error: e.message }));
-      ws.close();
+      cdpWs.on('open', () => {
+        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.enable' }));
+        cdpWs.send(JSON.stringify({
+          id: cmdId++,
+          method: 'Page.startScreencast',
+          params: { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 }
+        }));
+        console.log(`[Screencast] CDP screencast started for target ${target.id}`);
+      });
+
+      cdpWs.on('message', (data) => {
+        if (!alive) return;
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.method === 'Page.screencastFrame') {
+            const { data: frameData, metadata, sessionId: sid } = msg.params;
+            sessionId = sid;
+            cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({
+                type: 'frame',
+                image: `data:image/jpeg;base64,${frameData}`,
+                metadata
+              }));
+            }
+          }
+        } catch {}
+      });
+
+      cdpWs.on('close', () => {
+        if (alive && ws.readyState === ws.OPEN) {
+          ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
+        }
+      });
+
+      cdpWs.on('error', (err) => {
+        console.log(`[Screencast] CDP error: ${err.message}`);
+      });
+
+    } catch (e) {
+      console.log(`[Screencast] Error: ${e.message}`);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: 'error', error: e.message }));
+      }
     }
   }
+
+  // Initial connection — use active target
+  connectToTarget(activeTargetId);
 });
 
 server.listen(PORT, '0.0.0.0', () => {
