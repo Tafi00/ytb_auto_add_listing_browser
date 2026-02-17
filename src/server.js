@@ -194,7 +194,7 @@ async function addProduct(page, productUrl) {
   await tagBtn.click();
   console.log('[Job] Clicked Tag button');
 
-  const nextBtn = page.locator('ytcp-button#next-button button').first();
+  const nextBtn = page.locator('ytcp-button#picker-next-button button').first();
   await nextBtn.waitFor({ state: 'visible', timeout: 5000 });
   await nextBtn.click();
   console.log('[Job] Clicked Next button');
