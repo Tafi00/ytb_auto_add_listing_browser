@@ -141,10 +141,35 @@ class JobQueue {
   }
 }
 
-const jobQueue = new JobQueue();
+class JobPool {
+  constructor() {
+    this.queues = new Map();
+  }
+  getQueue(id) {
+    if (!this.queues.has(id)) {
+      this.queues.set(id, new JobQueue());
+    }
+    return this.queues.get(id);
+  }
+  getLeastBusyQueue(urls) {
+    if (!urls || urls.length === 0) return null;
+    let bestUrl = urls[0];
+    let minWait = this.getQueue(bestUrl).queue.length;
+    for (let i = 1; i < urls.length; i++) {
+      let qs = this.getQueue(urls[i]).queue.length;
+      if (qs < minWait) {
+        minWait = qs;
+        bestUrl = urls[i];
+      }
+    }
+    return { url: bestUrl, queue: this.getQueue(bestUrl) };
+  }
+}
+
+const jobPool = new JobPool();
 
 // Connect to Chrome and get page
-async function getChromePage() {
+async function getChromePage(targetUrl) {
   const { chromium } = await import('playwright');
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
   const contexts = browser.contexts();
@@ -155,10 +180,17 @@ async function getChromePage() {
   const context = contexts[0];
   const pages = context.pages();
 
-  // Ưu tiên tìm tab đang mở Youtube Studio, nếu không có thì lấy tab đầu tiên
-  let page = pages.find(p => p.url().includes('studio.youtube.com'));
+  let page;
+  if (targetUrl) {
+    page = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetUrl.split('?')[0]));
+  }
+
   if (!page) {
-    page = pages[0] || (await context.newPage());
+    // Ưu tiên tìm tab đang mở Youtube Studio, nếu không có thì lấy tab đầu tiên
+    page = pages.find(p => p.url().includes('studio.youtube.com'));
+    if (!page) {
+      page = pages[0] || (await context.newPage());
+    }
   }
   return { browser, context, page };
 }
@@ -358,10 +390,20 @@ app.put('/api/job-config', auth, async (req, res) => {
       const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
       const contexts = browser.contexts();
       if (contexts.length > 0) {
-        const pages = contexts[0].pages();
-        // Ưu tiên tìm tab đang mở Youtube Studio, nếu không thì dùng tab đầu tiên
-        const page = pages.find(p => p.url().includes('studio.youtube.com')) || pages[0];
-        if (page) await page.goto(url, { waitUntil: 'commit', timeout: 15000 });
+        const context = contexts[0];
+        const pages = context.pages();
+        const urls = url.split('\n').map(u => u.trim()).filter(Boolean);
+        for (const u of urls) {
+          const page = pages.find(p => p.url() === u || p.url().startsWith(u.split('?')[0]));
+          if (!page) {
+            let emptyPage = pages.find(p => p.url() === 'about:blank' || p.url() === 'chrome://newtab/' || p.url() === 'chrome://new-tab-page/');
+            if (urls.length === 1) { // If there's only one URL, reuse studio tab to be compatible
+              emptyPage = pages.find(p => p.url().includes('studio.youtube.com')) || emptyPage;
+            }
+            const targetPage = emptyPage || await context.newPage();
+            await targetPage.goto(u, { waitUntil: 'commit', timeout: 15000 }).catch(() => { });
+          }
+        }
       }
       await browser.close();
     } catch { }
@@ -461,15 +503,20 @@ app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
   const config = loadJobConfig();
   if (!config.url) return res.status(400).json({ error: 'No Video URL configured in admin' });
 
+  const urls = config.url.split('\n').map(u => u.trim()).filter(Boolean);
+  if (urls.length === 0) return res.status(400).json({ error: 'No Video URL configured in admin' });
+
   const running = await isChromeRunning();
   if (!running) return res.status(400).json({ error: 'Browser is not running' });
 
   try {
-    const result = await jobQueue.push(async () => {
-      const { browser, page } = await getChromePage();
+    const { url: targetUrl, queue } = jobPool.getLeastBusyQueue(urls);
+
+    const result = await queue.push(async () => {
+      const { browser, page } = await getChromePage(targetUrl);
       try {
         await addProduct(page, sanitizedUrl);
-        const data = await fetchAffiliateUrl(config.url);
+        const data = await fetchAffiliateUrl(targetUrl);
         console.log(`[API] Affiliate URL: ${data.affiliateUrl}`);
 
         // Gửi response sớm cho client không bị đợi lâu quá trình remove
@@ -528,7 +575,11 @@ app.get('/api/profile', auth, (_, res) => {
 // Open browser
 app.post('/api/profile/open-browser', auth, (req, res) => {
   const jobConfig = loadJobConfig();
-  const startUrl = jobConfig.url || 'about:blank';
+  let startUrl = 'about:blank';
+  if (jobConfig.url) {
+    const urls = jobConfig.url.split('\n').map(u => u.trim()).filter(Boolean);
+    if (urls.length > 0) startUrl = urls[0];
+  }
   const browserScript = path.resolve(__dirname, 'open-browser.js');
   const child = spawn('node', [browserScript, `--session=${PROFILE_ID}`, startUrl], {
     cwd: path.resolve(__dirname, '..'),

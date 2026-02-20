@@ -46,18 +46,18 @@ function Dashboard({ user, onLogout }) {
   }, []);
 
   const loadProfile = async () => {
-    try { setProfile(await api.getProfile()); } catch {}
+    try { setProfile(await api.getProfile()); } catch { }
   };
 
   const loadJobConfig = async () => {
-    try { const d = await api.getJobConfig(); setJobUrl(d.url || ''); } catch {}
+    try { const d = await api.getJobConfig(); setJobUrl(d.url || ''); } catch { }
   };
 
   const loadHistoryStats = async () => {
     try {
       const res = await api.fetch('/api/history-stats');
       setHistoryStats(await res.json());
-    } catch {}
+    } catch { }
   };
 
   const handleClearHistory = async () => {
@@ -74,7 +74,7 @@ function Dashboard({ user, onLogout }) {
     try {
       const res = await api.fetch('/api/site-config');
       setSiteConfig(await res.json());
-    } catch {}
+    } catch { }
   };
 
   const checkBrowserStatus = async () => {
@@ -177,7 +177,7 @@ function Dashboard({ user, onLogout }) {
         method: 'PUT',
         body: JSON.stringify({ ...siteConfig, guideVideoUrl: '' }),
       });
-    } catch {}
+    } catch { }
   };
 
   const handleUploadFavicon = async (e) => {
@@ -210,7 +210,7 @@ function Dashboard({ user, onLogout }) {
         method: 'PUT',
         body: JSON.stringify({ ...siteConfig, faviconUrl: '' }),
       });
-    } catch {}
+    } catch { }
   };
 
   return (
@@ -266,12 +266,13 @@ function Dashboard({ user, onLogout }) {
       <div className="card" style={{ marginTop: '16px' }}>
         <div className="card-header">
           <h2 className="card-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-            <FiZap size={16} color="#60a5fa" /> Job Configuration</h2>
+            <FiZap size={16} color="#60a5fa" /> Job Configuration (Nhiều luồng)</h2>
         </div>
-        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
-          <span style={{ color: '#94a3b8', fontSize: '13px', minWidth: '90px' }}>Video URL</span>
-          <input type="text" value={jobUrl} onChange={(e) => setJobUrl(e.target.value)}
-            placeholder="https://studio.youtube.com/video/.../edit" style={{ ...inputStyle, flex: 1 }} />
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
+          <span style={{ color: '#94a3b8', fontSize: '13px', minWidth: '90px', marginTop: '10px' }}>Video URLs</span>
+          <textarea value={jobUrl} onChange={(e) => setJobUrl(e.target.value)}
+            placeholder="https://studio.youtube.com/video/.../edit&#10;https://studio.youtube.com/video/.../edit&#10;(Mỗi link 1 dòng)"
+            style={{ ...inputStyle, flex: 1, resize: 'vertical', minHeight: '80px' }} />
           <button className="btn-session btn-session-open"
             style={{ borderColor: 'rgba(52,211,153,0.4)', color: '#34d399', whiteSpace: 'nowrap' }}
             onClick={handleSaveJobConfig}>
