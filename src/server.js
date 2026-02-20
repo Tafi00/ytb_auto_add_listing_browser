@@ -153,7 +153,13 @@ async function getChromePage() {
     throw new Error('No browser context found. Reopen browser.');
   }
   const context = contexts[0];
-  const page = context.pages()[0] || await context.newPage();
+  const pages = context.pages();
+
+  // Ưu tiên tìm tab đang mở Youtube Studio, nếu không có thì lấy tab đầu tiên
+  let page = pages.find(p => p.url().includes('studio.youtube.com'));
+  if (!page) {
+    page = pages[0] || (await context.newPage());
+  }
   return { browser, context, page };
 }
 
@@ -188,7 +194,7 @@ async function addProduct(page, productUrl) {
     await tagBtn.waitFor({ state: 'visible', timeout: 5000 });
   } catch {
     console.log('[Job] Product not found within 5s, reloading page...');
-    await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => {});
+    await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
     throw new Error('Sản phẩm này không gắn giỏ được.');
   }
   await tagBtn.click();
@@ -219,40 +225,49 @@ async function fetchAffiliateUrl(videoUrl) {
   const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
   console.log(`[Job] Fetching public video: ${publicUrl}`);
 
-  const response = await fetch(publicUrl, {
-    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36' }
-  });
-  const pageContent = await response.text();
-
   // Decode unicode escapes helper
   const decodeUnicode = (str) => str.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 
-  // Extract affiliate URL
-  const urlMatch = pageContent.match(/"url"\s*:\s*"(https:\/\/s\.shopee\.vn\/[^"]+|https:\/\/www\.lazada\.vn\/products[^"]+)"/);
-  const affiliateUrl = urlMatch ? decodeUnicode(urlMatch[1]) : null;
-
-  // Extract product metadata from productListItemRenderer
+  let affiliateUrl = null;
   let metadata = { title: '', price: '', image: '' };
-  
-  // Find the actual product data block (not the renderer name list)
-  const blockMarker = 'productListItemRenderer":{"title"';
-  const blockStart = pageContent.indexOf(blockMarker);
-  if (blockStart !== -1) {
-    const block = pageContent.substring(blockStart, blockStart + 5000);
-    console.log('[Job] Product block (first 600):', block.substring(0, 600));
 
-    // Title from simpleText - first occurrence
-    const titleMatch = block.match(/simpleText":"([^"]+)"/);
-    if (titleMatch) metadata.title = decodeUnicode(titleMatch[1]);
+  // Lặp retry tối đa 5 lần (mỗi lần cách 2s) = chờ tối đa 10s cho dữ liệu YT cập nhật
+  for (let attempt = 1; attempt <= 5; attempt++) {
+    const response = await fetch(publicUrl, {
+      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36' }
+    });
+    const pageContent = await response.text();
 
-    // Price: "147.869 ₫" or "₫147,869" format
-    const priceMatch = block.match(/([0-9][0-9.,]+)\s*₫/) || block.match(/₫\s*([0-9][0-9,.]+)/);
-    if (priceMatch) metadata.price = decodeUnicode(priceMatch[1]) + ' ₫';
+    // Extract affiliate URL (Bắt mọi link thuộc Shopee hoặc Lazada)
+    const urlMatch = pageContent.match(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/);
+    if (urlMatch) {
+      affiliateUrl = decodeUnicode(urlMatch[1]);
 
-    // Thumbnails: match all gstatic shopping URLs
-    const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
-      .map(m => decodeUnicode(m[1]));
-    if (thumbUrls.length > 0) metadata.image = thumbUrls[thumbUrls.length - 1];
+      // Extract product metadata from productListItemRenderer
+      const blockMarker = 'productListItemRenderer":{"title"';
+      const blockStart = pageContent.indexOf(blockMarker);
+      if (blockStart !== -1) {
+        const block = pageContent.substring(blockStart, blockStart + 5000);
+        console.log('[Job] Product block (first 600):', block.substring(0, 600));
+
+        // Title from simpleText - first occurrence
+        const titleMatch = block.match(/simpleText":"([^"]+)"/);
+        if (titleMatch) metadata.title = decodeUnicode(titleMatch[1]);
+
+        // Price: "147.869 ₫" or "₫147,869" format
+        const priceMatch = block.match(/([0-9][0-9.,]+)\s*₫/) || block.match(/₫\s*([0-9][0-9,.]+)/);
+        if (priceMatch) metadata.price = decodeUnicode(priceMatch[1]) + ' ₫';
+
+        // Thumbnails: match all gstatic shopping URLs
+        const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
+          .map(m => decodeUnicode(m[1]));
+        if (thumbUrls.length > 0) metadata.image = thumbUrls[thumbUrls.length - 1];
+      }
+      break; // Thành công, thoát vòng lặp
+    }
+
+    console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link, waiting 2s...`);
+    await new Promise(r => setTimeout(r, 2000));
   }
 
   console.log('[Job] Extracted metadata:', JSON.stringify(metadata));
@@ -302,7 +317,7 @@ const jobConfigPath = path.resolve(__dirname, '../config/job-config.json');
 const loadJobConfig = () => {
   try {
     if (fs.existsSync(jobConfigPath)) return JSON.parse(fs.readFileSync(jobConfigPath, 'utf8'));
-  } catch {}
+  } catch { }
   return { url: '' };
 };
 
@@ -343,11 +358,13 @@ app.put('/api/job-config', auth, async (req, res) => {
       const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
       const contexts = browser.contexts();
       if (contexts.length > 0) {
-        const page = contexts[0].pages()[0];
+        const pages = contexts[0].pages();
+        // Ưu tiên tìm tab đang mở Youtube Studio, nếu không thì dùng tab đầu tiên
+        const page = pages.find(p => p.url().includes('studio.youtube.com')) || pages[0];
         if (page) await page.goto(url, { waitUntil: 'commit', timeout: 15000 });
       }
       await browser.close();
-    } catch {}
+    } catch { }
   }
 
   res.json({ message: 'Config saved', ...config });
@@ -393,7 +410,7 @@ setInterval(() => {
 function isValidProductUrl(url) {
   try {
     const parsed = new URL(url);
-    const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'shp.ee', 'lazada.vn', 'www.lazada.vn'];
+    const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'shp.ee', 'lazada.vn', 'www.lazada.vn', 's.lazada.vn', 'c.lazada.vn'];
     return validHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
   } catch {
     return false;
@@ -454,9 +471,24 @@ app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
         await addProduct(page, sanitizedUrl);
         const data = await fetchAffiliateUrl(config.url);
         console.log(`[API] Affiliate URL: ${data.affiliateUrl}`);
-        // Remove in background, don't block response
-        removeProduct(page).then(() => browser.close()).catch(() => browser.close());
-        return data;
+
+        // Gửi response sớm cho client không bị đợi lâu quá trình remove
+        res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
+
+        // Save history to SQLite on success
+        if (data.affiliateUrl) {
+          addHistory(clientId || 'anonymous', {
+            productUrl: sanitizedUrl,
+            affiliateUrl: data.affiliateUrl,
+            metadata: data.metadata || {},
+            createdAt: new Date().toISOString(),
+          });
+        }
+
+        // Đợi background xoá sản phẩm xong mới nhả JobQueue cho Job sau chạy tiếp
+        await removeProduct(page);
+        await browser.close();
+        return data; // Result is returned but ignored by the caller
       } catch (e) {
         // Reload page to reset state after error
         console.log(`[API] Error during job, reloading page: ${e.message}`);
@@ -467,26 +499,18 @@ app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
           console.log(`[API] Failed to reload page: ${reloadErr.message}`);
         }
         await browser.close();
-        throw e;
+        throw e; // Outer catch block will log this
       }
     });
-
-    res.json({ affiliateUrl: result.affiliateUrl, metadata: result.metadata });
-
-    // Save history to SQLite on success
-    if (result.affiliateUrl) {
-      addHistory(clientId || 'anonymous', {
-        productUrl: sanitizedUrl,
-        affiliateUrl: result.affiliateUrl,
-        metadata: result.metadata || {},
-        createdAt: new Date().toISOString(),
-      });
-    }
   } catch (e) {
-    // Không leak internal error ra ngoài cho public API
-    console.error(`[API] get-affiliate error: ${e.message}`);
-    const safeMessage = e.message.includes('không gắn giỏ') ? e.message : 'Có lỗi xảy ra, vui lòng thử lại sau.';
-    res.status(500).json({ error: safeMessage });
+    if (!res.headersSent) {
+      // Không leak internal error ra ngoài cho public API
+      console.error(`[API] get-affiliate error: ${e.message}`);
+      const safeMessage = e.message.includes('không gắn giỏ') ? e.message : 'Có lỗi xảy ra, vui lòng thử lại sau.';
+      res.status(500).json({ error: safeMessage });
+    } else {
+      console.error(`[API] get-affiliate background error after response sent: ${e.message}`);
+    }
   }
 });
 
@@ -795,7 +819,7 @@ const defaultSiteConfig = {
 const loadSiteConfig = () => {
   try {
     if (fs.existsSync(siteConfigPath)) return { ...defaultSiteConfig, ...JSON.parse(fs.readFileSync(siteConfigPath, 'utf8')) };
-  } catch {}
+  } catch { }
   return { ...defaultSiteConfig };
 };
 
@@ -968,15 +992,15 @@ wss.on('connection', async (ws, req) => {
         const { x, y, deltaX, deltaY } = msg;
         cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX: deltaX || 0, deltaY: deltaY || 0 } }));
       }
-    } catch {}
+    } catch { }
   });
 
   async function stopScreencast() {
     if (cdpWs && cdpWs.readyState === cdpWs.OPEN) {
       try {
         cdpWs.send(JSON.stringify({ id: 999, method: 'Page.stopScreencast' }));
-      } catch {}
-      setTimeout(() => { try { cdpWs.close(); } catch {} }, 200);
+      } catch { }
+      setTimeout(() => { try { cdpWs.close(); } catch { } }, 200);
     }
     cdpWs = null;
   }
@@ -1024,7 +1048,7 @@ wss.on('connection', async (ws, req) => {
               }));
             }
           }
-        } catch {}
+        } catch { }
       });
 
       cdpWs.on('close', () => {
