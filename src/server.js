@@ -461,7 +461,7 @@ function containsMultipleLinks(input) {
 }
 
 // Public API: get affiliate URL by product URL (uses Video URL from config)
-app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
+app.post('/api/get-affiliate', async (req, res) => {
   const { productUrl, clientId } = req.body;
   if (!productUrl || typeof productUrl !== 'string') return res.status(400).json({ error: 'productUrl is required' });
 
