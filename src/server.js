@@ -125,6 +125,10 @@ class JobQueue {
     this.queue = [];
     this.running = false;
   }
+  // Total pending = running (0 or 1) + waiting in queue
+  get pending() {
+    return (this.running ? 1 : 0) + this.queue.length;
+  }
   push(fn) {
     return new Promise((resolve, reject) => {
       this.queue.push({ fn, resolve, reject });
@@ -154,11 +158,11 @@ class JobPool {
   getLeastBusyQueue(urls) {
     if (!urls || urls.length === 0) return null;
     let bestUrl = urls[0];
-    let minWait = this.getQueue(bestUrl).queue.length;
+    let minPending = this.getQueue(bestUrl).pending;
     for (let i = 1; i < urls.length; i++) {
-      let qs = this.getQueue(urls[i]).queue.length;
-      if (qs < minWait) {
-        minWait = qs;
+      const p = this.getQueue(urls[i]).pending;
+      if (p < minPending) {
+        minPending = p;
         bestUrl = urls[i];
       }
     }
@@ -195,7 +199,7 @@ async function getChromePage(targetUrl) {
   return { browser, context, page };
 }
 
-// Add product and save
+// Add product and save (auto-removes existing product before adding)
 async function addProduct(page, productUrl) {
   // Click "Sản phẩm" / "Products" only if edit button is not visible
   const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit');
@@ -211,8 +215,28 @@ async function addProduct(page, productUrl) {
   await editBtn.click();
   console.log('[Job] Clicked edit button');
 
+  // Wait for product picker to fully load
   const searchInput = page.locator('input#search-input.search-input');
   await searchInput.waitFor({ state: 'visible', timeout: 10000 });
+
+  // Check and remove existing product if any (picker is loaded, no extra wait needed)
+  try {
+    const existingProduct = page.locator('ytshopping-product-picker-selected-product ytshopping-product').first();
+    const hasExisting = await existingProduct.isVisible().catch(() => false);
+    if (hasExisting) {
+      console.log('[Job] Found existing product, removing before adding new one...');
+      await existingProduct.hover();
+      const deleteBtn = page.locator('ytcp-icon-button.delete-product-button[aria-label="Delete"]').first();
+      await deleteBtn.waitFor({ state: 'visible', timeout: 5000 });
+      await deleteBtn.click();
+      console.log('[Job] Removed existing product');
+      await page.waitForTimeout(500);
+    }
+  } catch (e) {
+    console.log(`[Job] Warning: could not remove existing product: ${e.message}`);
+  }
+
+  // Add new product
   await searchInput.click();
   await searchInput.fill(productUrl);
   console.log(`[Job] Filled product URL: ${productUrl}`);
@@ -307,37 +331,7 @@ async function fetchAffiliateUrl(videoUrl) {
   return { affiliateUrl, metadata };
 }
 
-// Remove product and save
-async function removeProduct(page) {
-  console.log('[Job] Removing product from video...');
-
-  const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit');
-  await editBtn.waitFor({ state: 'visible', timeout: 10000 });
-  await editBtn.click();
-  console.log('[Job] Clicked edit button for removal');
-
-  const product = page.locator('ytshopping-product-picker-selected-product ytshopping-product').first();
-  await product.waitFor({ state: 'visible', timeout: 10000 });
-  await product.hover();
-  console.log('[Job] Hovered on product');
-
-  const deleteBtn = page.locator('ytcp-icon-button.delete-product-button[aria-label="Delete"]').first();
-  await deleteBtn.waitFor({ state: 'visible', timeout: 5000 });
-  await deleteBtn.click();
-  console.log('[Job] Clicked Delete button');
-
-  const doneBtn = page.locator('button[aria-label="Done"]:has(div.ytcpButtonShapeImpl__button-text-content:text("Done"))').first();
-  await doneBtn.waitFor({ state: 'visible', timeout: 5000 });
-  await doneBtn.click();
-  console.log('[Job] Clicked Done button (remove)');
-
-  const saveBtn = page.locator('ytcp-button#save button').first();
-  await saveBtn.waitFor({ state: 'visible', timeout: 5000 });
-  await saveBtn.click();
-  console.log('[Job] Clicked Save button (remove)');
-  await page.waitForTimeout(2000);
-  console.log('[Job] Remove completed');
-}
+// removeProduct is no longer needed — removal is integrated into addProduct
 
 // ==================== Profile API ====================
 
@@ -512,14 +506,19 @@ app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
   try {
     const { url: targetUrl, queue } = jobPool.getLeastBusyQueue(urls);
 
+    const queuePos = queue.pending;
+    if (queuePos > 0) {
+      console.log(`[API] Job queued for ${targetUrl} (position ${queuePos})`);
+    }
+
     const result = await queue.push(async () => {
       const { browser, page } = await getChromePage(targetUrl);
       try {
+        // addProduct now auto-removes existing product before adding
         await addProduct(page, sanitizedUrl);
         const data = await fetchAffiliateUrl(targetUrl);
         console.log(`[API] Affiliate URL: ${data.affiliateUrl}`);
 
-        // Gửi response sớm cho client không bị đợi lâu quá trình remove
         res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
 
         // Save history to SQLite on success
@@ -532,10 +531,8 @@ app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
           });
         }
 
-        // Đợi background xoá sản phẩm xong mới nhả JobQueue cho Job sau chạy tiếp
-        await removeProduct(page);
         await browser.close();
-        return data; // Result is returned but ignored by the caller
+        return data;
       } catch (e) {
         // Reload page to reset state after error
         console.log(`[API] Error during job, reloading page: ${e.message}`);
@@ -546,7 +543,7 @@ app.post('/api/get-affiliate', affiliateLimiter, async (req, res) => {
           console.log(`[API] Failed to reload page: ${reloadErr.message}`);
         }
         await browser.close();
-        throw e; // Outer catch block will log this
+        throw e;
       }
     });
   } catch (e) {
