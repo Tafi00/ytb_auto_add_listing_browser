@@ -540,7 +540,7 @@ app.post('/api/get-affiliate', async (req, res) => {
           });
         }
 
-        await browser.close();
+        await browser.close().catch(() => { });
         return data;
       } catch (e) {
         // Reload page to reset state after error
@@ -551,7 +551,7 @@ app.post('/api/get-affiliate', async (req, res) => {
         } catch (reloadErr) {
           console.log(`[API] Failed to reload page: ${reloadErr.message}`);
         }
-        await browser.close();
+        await browser.close().catch(() => { });
         throw e;
       }
     });
@@ -626,9 +626,14 @@ let activeTargetId = null;
 
 // Helper: get all page targets from CDP
 async function getCdpPageTargets() {
-  const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
-  const targets = await targetsRes.json();
-  return targets.filter(t => t.type === 'page');
+  try {
+    const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
+    const targets = await targetsRes.json();
+    return targets.filter(t => t.type === 'page');
+  } catch (e) {
+    console.log(`[CDP] Failed to get page targets: ${e.message}`);
+    return [];
+  }
 }
 
 // Helper: get the active target (or fall back to first page)
@@ -1037,17 +1042,22 @@ wss.on('connection', async (ws, req) => {
       if (msg.type === 'switchTab') {
         // Client wants to switch to a different tab
         activeTargetId = msg.targetId;
-        connectToTarget(msg.targetId);
+        connectToTarget(msg.targetId).catch(() => { });
         return;
       }
-      if (!cdpWs || cdpWs.readyState !== cdpWs.OPEN) return;
-      if (msg.type === 'click') {
-        const { x, y } = msg;
-        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } }));
-        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } }));
-      } else if (msg.type === 'scroll') {
-        const { x, y, deltaX, deltaY } = msg;
-        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX: deltaX || 0, deltaY: deltaY || 0 } }));
+      const currentCdp = cdpWs; // snapshot to avoid race
+      if (!currentCdp || currentCdp.readyState !== currentCdp.OPEN) return;
+      try {
+        if (msg.type === 'click') {
+          const { x, y } = msg;
+          currentCdp.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } }));
+          currentCdp.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } }));
+        } else if (msg.type === 'scroll') {
+          const { x, y, deltaX, deltaY } = msg;
+          currentCdp.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX: deltaX || 0, deltaY: deltaY || 0 } }));
+        }
+      } catch (sendErr) {
+        console.log(`[Screencast] Error sending input command: ${sendErr.message}`);
       }
     } catch { }
   });
@@ -1168,17 +1178,21 @@ server.listen(PORT, '0.0.0.0', () => {
         if (pageTarget) {
           const wsUrl = pageTarget.webSocketDebuggerUrl;
           const { default: WebSocket } = await import('ws');
-          const ws = new WebSocket(wsUrl);
-          await new Promise((resolve, reject) => {
-            ws.on('open', () => {
-              ws.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: startUrl } }));
-              ws.on('message', (data) => {
-                const msg = JSON.parse(data.toString());
-                if (msg.id === 1) { ws.close(); resolve(); }
+          const navWs = new WebSocket(wsUrl);
+          await new Promise((resolve) => {
+            navWs.on('open', () => {
+              try {
+                navWs.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: startUrl } }));
+              } catch { navWs.close(); resolve(); return; }
+              navWs.on('message', (data) => {
+                try {
+                  const msg = JSON.parse(data.toString());
+                  if (msg.id === 1) { navWs.close(); resolve(); }
+                } catch { }
               });
             });
-            ws.on('error', reject);
-            setTimeout(() => { ws.close(); resolve(); }, 10000);
+            navWs.on('error', () => resolve());
+            setTimeout(() => { try { navWs.close(); } catch { } resolve(); }, 10000);
           });
           console.log(`[Server] Browser navigated to: ${startUrl}`);
         }
