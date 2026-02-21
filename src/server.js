@@ -181,9 +181,19 @@ class JobPool {
 
 const jobPool = new JobPool();
 
+// Cache playwright module at top level for faster access
+let _playwrightChromium = null;
+async function getPlaywright() {
+  if (!_playwrightChromium) {
+    const pw = await import('playwright');
+    _playwrightChromium = pw.chromium;
+  }
+  return _playwrightChromium;
+}
+
 // Connect to Chrome and get page
 async function getChromePage(targetUrl) {
-  const { chromium } = await import('playwright');
+  const chromium = await getPlaywright();
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
   const contexts = browser.contexts();
   if (contexts.length === 0) {
@@ -279,7 +289,24 @@ async function addProduct(page, productUrl) {
   await saveBtn.waitFor({ state: 'visible', timeout: 5000 });
   await saveBtn.click();
   console.log('[Job] Clicked Save button');
-  await page.waitForTimeout(3000);
+
+  // Smart wait: wait for save to complete by detecting the save button becoming hidden/disabled
+  // instead of a hard 3s delay. Max wait 5s, poll every 200ms.
+  const saveStart = Date.now();
+  for (let i = 0; i < 25; i++) { // 25 * 200ms = 5s max
+    await page.waitForTimeout(200);
+    const stillVisible = await saveBtn.isVisible().catch(() => false);
+    if (!stillVisible) {
+      console.log(`[Job] Save completed in ${Date.now() - saveStart}ms`);
+      break;
+    }
+    // Also check if the edit button reappears (means save succeeded and picker closed)
+    const editBtnBack = await page.locator('ytcp-icon-button#shopping-toolbar-edit').isVisible().catch(() => false);
+    if (editBtnBack) {
+      console.log(`[Job] Save completed (edit btn reappeared) in ${Date.now() - saveStart}ms`);
+      break;
+    }
+  }
 }
 
 // Fetch affiliate URL from public YouTube page
@@ -296,8 +323,14 @@ async function fetchAffiliateUrl(videoUrl) {
   let affiliateUrl = null;
   let metadata = { title: '', price: '', image: '' };
 
-  // Lặp retry tối đa 5 lần (mỗi lần cách 2s) = chờ tối đa 10s cho dữ liệu YT cập nhật
-  for (let attempt = 1; attempt <= 5; attempt++) {
+  // Lặp retry tối đa 3 lần (lần đầu ngay lập tức, sau đó cách 1s) = chờ tối đa ~2s
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    // Delay trước mỗi retry (lần đầu không delay)
+    if (attempt > 1) {
+      console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl retrying after 1s...`);
+      await new Promise(r => setTimeout(r, 1000));
+    }
+
     const response = await fetch(publicUrl, {
       headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36' }
     });
@@ -331,8 +364,7 @@ async function fetchAffiliateUrl(videoUrl) {
       break; // Thành công, thoát vòng lặp
     }
 
-    console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link, waiting 2s...`);
-    await new Promise(r => setTimeout(r, 2000));
+    console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link`);
   }
 
   console.log('[Job] Extracted metadata:', JSON.stringify(metadata));
@@ -389,7 +421,7 @@ app.put('/api/job-config', auth, async (req, res) => {
   const running = await isChromeRunning();
   if (running) {
     try {
-      const { chromium } = await import('playwright');
+      const chromium = await getPlaywright();
       const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
       const contexts = browser.contexts();
       if (contexts.length > 0) {
@@ -521,23 +553,33 @@ app.post('/api/get-affiliate', async (req, res) => {
     }
 
     const result = await queue.push(async () => {
+      const jobStart = Date.now();
       const { browser, page } = await getChromePage(targetUrl);
       try {
         // addProduct now auto-removes existing product before adding
         await addProduct(page, sanitizedUrl);
+        console.log(`[API] addProduct took ${Date.now() - jobStart}ms`);
+
+        const fetchStart = Date.now();
         const data = await fetchAffiliateUrl(targetUrl);
+        console.log(`[API] fetchAffiliateUrl took ${Date.now() - fetchStart}ms`);
+        console.log(`[API] Total job time: ${Date.now() - jobStart}ms`);
         console.log(`[API] Affiliate URL: ${data.affiliateUrl}`);
 
         res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
 
-        // Save history to SQLite on success
+        // Save history to SQLite on success (non-blocking)
         if (data.affiliateUrl) {
-          addHistory(clientId || 'anonymous', {
-            productUrl: sanitizedUrl,
-            affiliateUrl: data.affiliateUrl,
-            metadata: data.metadata || {},
-            createdAt: new Date().toISOString(),
-          });
+          try {
+            addHistory(clientId || 'anonymous', {
+              productUrl: sanitizedUrl,
+              affiliateUrl: data.affiliateUrl,
+              metadata: data.metadata || {},
+              createdAt: new Date().toISOString(),
+            });
+          } catch (histErr) {
+            console.log(`[API] History save error: ${histErr.message}`);
+          }
         }
 
         await browser.close().catch(() => { });
@@ -727,7 +769,7 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
     const target = await getActiveTarget();
     if (!target) return res.status(400).json({ error: 'No page found' });
 
-    const { chromium } = await import('playwright');
+    const chromium = await getPlaywright();
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
     const contexts = browser.contexts();
     if (contexts.length === 0) { await browser.close(); return res.status(400).json({ error: 'No context' }); }
@@ -770,7 +812,7 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
 async function getActivePage() {
   const target = await getActiveTarget();
   if (!target) throw new Error('No page');
-  const { chromium } = await import('playwright');
+  const chromium = await getPlaywright();
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
   const contexts = browser.contexts();
   if (contexts.length === 0) { await browser.close(); throw new Error('No context'); }
