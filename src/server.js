@@ -247,7 +247,7 @@ async function addProduct(page, productUrl) {
   // Wait up to 5s for product to appear, if not found reload and throw error
   const tagBtn = page.locator('ytcp-icon-button.tag-product-button[aria-label="Tag"]').first();
   try {
-    await tagBtn.waitFor({ state: 'visible', timeout: 5000 });
+    await tagBtn.waitFor({ state: 'visible', timeout: 8000 });
   } catch {
     console.log('[Job] Product not found within 5s, reloading page...');
     await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
