@@ -1,4 +1,13 @@
 // Admin Dashboard - Single Profile Server
+
+// Prevent unhandled errors from crashing the entire server
+process.on('uncaughtException', (err) => {
+  console.error('[Server] Uncaught exception (server continues):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[Server] Unhandled rejection (server continues):', reason?.message || reason);
+});
+
 import 'dotenv/config';
 import express from 'express';
 import cors from 'cors';
@@ -1068,26 +1077,38 @@ wss.on('connection', async (ws, req) => {
       currentTargetId = target.id;
 
       const { default: WebSocket } = await import('ws');
-      cdpWs = new WebSocket(target.webSocketDebuggerUrl);
+      const newCdpWs = new WebSocket(target.webSocketDebuggerUrl);
+      cdpWs = newCdpWs;
 
-      cdpWs.on('open', () => {
-        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.enable' }));
-        cdpWs.send(JSON.stringify({
-          id: cmdId++,
-          method: 'Page.startScreencast',
-          params: { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 }
-        }));
-        console.log(`[Screencast] CDP screencast started for target ${target.id}`);
+      newCdpWs.on('open', () => {
+        // Check if this connection is still the active one (race condition guard)
+        if (cdpWs !== newCdpWs || !alive) {
+          try { newCdpWs.close(); } catch { }
+          return;
+        }
+        try {
+          newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.enable' }));
+          newCdpWs.send(JSON.stringify({
+            id: cmdId++,
+            method: 'Page.startScreencast',
+            params: { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 }
+          }));
+          console.log(`[Screencast] CDP screencast started for target ${target.id}`);
+        } catch (e) {
+          console.log(`[Screencast] Error starting screencast: ${e.message}`);
+        }
       });
 
-      cdpWs.on('message', (data) => {
-        if (!alive) return;
+      newCdpWs.on('message', (data) => {
+        if (!alive || cdpWs !== newCdpWs) return;
         try {
           const msg = JSON.parse(data.toString());
           if (msg.method === 'Page.screencastFrame') {
             const { data: frameData, metadata, sessionId: sid } = msg.params;
             sessionId = sid;
-            cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
+            if (newCdpWs.readyState === newCdpWs.OPEN) {
+              newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
+            }
             if (ws.readyState === ws.OPEN) {
               ws.send(JSON.stringify({
                 type: 'frame',
@@ -1099,13 +1120,13 @@ wss.on('connection', async (ws, req) => {
         } catch { }
       });
 
-      cdpWs.on('close', () => {
-        if (alive && ws.readyState === ws.OPEN) {
+      newCdpWs.on('close', () => {
+        if (alive && ws.readyState === ws.OPEN && cdpWs === newCdpWs) {
           ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
         }
       });
 
-      cdpWs.on('error', (err) => {
+      newCdpWs.on('error', (err) => {
         console.log(`[Screencast] CDP error: ${err.message}`);
       });
 
