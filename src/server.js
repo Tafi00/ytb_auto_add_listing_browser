@@ -352,16 +352,19 @@ async function fetchAffiliateUrl(videoUrl) {
     console.log(`[Job] Fetched page in ${Date.now() - fetchStart}ms (${(pageContent.length / 1024).toFixed(0)}KB)`);
 
     // Extract affiliate URL (Shopee or Lazada links)
-    const urlMatch = pageContent.match(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/);
+    // Use matchAll + take LAST match to get the newly added product (not the old one)
+    const allUrlMatches = [...pageContent.matchAll(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/g)];
+    const urlMatch = allUrlMatches.length > 0 ? allUrlMatches[allUrlMatches.length - 1] : null;
     if (urlMatch) {
       affiliateUrl = decodeUnicode(urlMatch[1]);
 
       // Extract product metadata from productListItemRenderer
+      // Use lastIndexOf to get the LAST (newest) product block
       const blockMarker = 'productListItemRenderer":{"title"';
-      const blockStart = pageContent.indexOf(blockMarker);
+      const blockStart = pageContent.lastIndexOf(blockMarker);
       if (blockStart !== -1) {
         const block = pageContent.substring(blockStart, blockStart + 5000);
-        console.log('[Job] Product block (first 600):', block.substring(0, 600));
+        console.log('[Job] Product block (last, first 600):', block.substring(0, 600));
 
         const titleMatch = block.match(/simpleText":"([^"]+)"/);
         if (titleMatch) metadata.title = decodeUnicode(titleMatch[1]);
