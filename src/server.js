@@ -576,6 +576,12 @@ app.post('/api/get-affiliate', async (req, res) => {
       console.log(`[API] Job START for product: ${sanitizedUrl} on tab: ${targetUrl}`);
       const { browser, page } = await getChromePage(targetUrl);
       try {
+        // CRITICAL: Bring the tab to the front so Chrome renders it properly
+        // This prevents "Element is not visible" errors for background tabs
+        await page.bringToFront().catch(() => { });
+        // Wait a tiny bit for the browser to paint the newly active tab
+        await page.waitForTimeout(300);
+
         // addProduct now auto-removes existing product before adding
         await addProduct(page, sanitizedUrl);
         const addProductTime = Date.now() - jobStart;
