@@ -245,10 +245,13 @@ async function addProduct(page, productUrl) {
     await btn.waitFor({ state: 'visible', timeout: 15000 });
     await btn.click();
     console.log('[Job] Clicked Products row (matched by regex)');
+    // Wait for slide-in animation or UI update to settle before clicking edit
+    await page.waitForTimeout(500);
   }
 
-  await editBtn.waitFor({ state: 'visible', timeout: 10000 });
-  await editBtn.click();
+  // Use state: 'attached' and force: true to bypass Playwright's strict visibility/overlap checks
+  await editBtn.waitFor({ state: 'attached', timeout: 10000 });
+  await editBtn.click({ force: true });
   console.log('[Job] Clicked edit button');
 
   // Wait for product picker to fully load
