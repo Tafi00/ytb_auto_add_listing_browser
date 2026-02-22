@@ -154,32 +154,9 @@ class JobQueue {
   }
 }
 
-class JobPool {
-  constructor() {
-    this.queues = new Map();
-  }
-  getQueue(id) {
-    if (!this.queues.has(id)) {
-      this.queues.set(id, new JobQueue());
-    }
-    return this.queues.get(id);
-  }
-  getLeastBusyQueue(urls) {
-    if (!urls || urls.length === 0) return null;
-    let bestUrl = urls[0];
-    let minPending = this.getQueue(bestUrl).pending;
-    for (let i = 1; i < urls.length; i++) {
-      const p = this.getQueue(urls[i]).pending;
-      if (p < minPending) {
-        minPending = p;
-        bestUrl = urls[i];
-      }
-    }
-    return { url: bestUrl, queue: this.getQueue(bestUrl) };
-  }
-}
-
-const jobPool = new JobPool();
+// Ensure strict sequential execution for Playwright to prevent CDP crashes
+const globalJobQueue = new JobQueue();
+let globalJobCounter = 0;
 
 // Cache playwright module at top level for faster access
 let _playwrightChromium = null;
@@ -234,14 +211,26 @@ async function getChromePage(targetUrl) {
 // Add product and save (auto-removes existing product before adding)
 // Returns a promise that resolves when save is complete
 async function addProduct(page, productUrl) {
-  // Click the Products row if edit button is not visible
+  // Wait for the Products row to at least be attached so we know the page has rendered
+  const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content)').filter({
+    hasText: /(Sản phẩm|Products|tagged product|sản phẩm đã gắn)/i
+  }).first();
+
+  // Give the page a moment to render in case the edit panel is already open
   const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+
+  // Try to wait for either the edit button or the products row to appear
+  try {
+    await Promise.race([
+      editBtn.waitFor({ state: 'visible', timeout: 8000 }),
+      btn.waitFor({ state: 'visible', timeout: 8000 })
+    ]);
+  } catch (e) {
+    // Ignore timeout, we'll let the individual checks handle it
+  }
+
   const editVisible = await editBtn.isVisible().catch(() => false);
   if (!editVisible) {
-    // Button text changes dynamically: "Sản phẩm", "Products", "1 tagged product", "1 sản phẩm đã gắn thẻ", etc.
-    const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content)').filter({
-      hasText: /(Sản phẩm|Products|tagged product|sản phẩm đã gắn)/i
-    }).first();
     await btn.waitFor({ state: 'visible', timeout: 15000 });
     await btn.click();
     console.log('[Job] Clicked Products row (matched by regex)');
@@ -574,15 +563,15 @@ app.post('/api/get-affiliate', async (req, res) => {
   if (!running) return res.status(400).json({ error: 'Browser is not running' });
 
   try {
-    const { url: targetUrl, queue } = jobPool.getLeastBusyQueue(urls);
+    // Round-robin tab selection
+    const targetUrl = urls[globalJobCounter % urls.length];
+    globalJobCounter++;
 
-    const queuePos = queue.pending;
-    // Log queue distribution for multi-tab diagnostics
-    const queueStatus = urls.map(u => `${u.split('/video/')[1]?.split('/')[0] || u}: pending=${jobPool.getQueue(u).pending}`).join(', ');
-    console.log(`[API] Queue status: [${queueStatus}]`);
+    const queuePos = globalJobQueue.pending;
+    console.log(`[API] Global queue pending: ${queuePos}`);
     console.log(`[API] Assigned to: ${targetUrl} (position ${queuePos}), product: ${sanitizedUrl}`);
 
-    const result = await queue.push(async () => {
+    const result = await globalJobQueue.push(async () => {
       const jobStart = Date.now();
       console.log(`[API] Job START for product: ${sanitizedUrl} on tab: ${targetUrl}`);
       const { browser, page } = await getChromePage(targetUrl);
