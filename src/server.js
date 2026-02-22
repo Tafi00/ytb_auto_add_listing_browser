@@ -229,6 +229,7 @@ async function getChromePage(targetUrl) {
 }
 
 // Add product and save (auto-removes existing product before adding)
+// Returns a promise that resolves when save is complete
 async function addProduct(page, productUrl) {
   // Click "Sản phẩm" / "Products" only if edit button is not visible
   const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit');
@@ -259,7 +260,8 @@ async function addProduct(page, productUrl) {
       await deleteBtn.waitFor({ state: 'visible', timeout: 5000 });
       await deleteBtn.click();
       console.log('[Job] Removed existing product');
-      await page.waitForTimeout(500);
+      // Wait for search input to be ready again instead of hard 500ms delay
+      await searchInput.waitFor({ state: 'visible', timeout: 3000 }).catch(() => { });
     }
   } catch (e) {
     console.log(`[Job] Warning: could not remove existing product: ${e.message}`);
@@ -273,12 +275,12 @@ async function addProduct(page, productUrl) {
   await searchInput.press('Enter');
   console.log('[Job] Pressed Enter to search');
 
-  // Wait up to 5s for product to appear, if not found reload and throw error
+  // Wait up to 8s for product to appear, if not found reload and throw error
   const tagBtn = page.locator('ytcp-icon-button.tag-product-button[aria-label="Tag"]').first();
   try {
     await tagBtn.waitFor({ state: 'visible', timeout: 8000 });
   } catch {
-    console.log('[Job] Product not found within 5s, reloading page...');
+    console.log('[Job] Product not found within 8s, reloading page...');
     await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
     throw new Error('Sản phẩm này không gắn giỏ được.');
   }
@@ -300,26 +302,27 @@ async function addProduct(page, productUrl) {
   await saveBtn.click();
   console.log('[Job] Clicked Save button');
 
-  // Smart wait: wait for save to complete by detecting the save button becoming hidden/disabled
-  // instead of a hard 3s delay. Max wait 5s, poll every 200ms.
+  // Efficient save wait: use Promise.race with two conditions instead of polling
+  // This is faster because waitForSelector uses CDP events (push) instead of polling (pull)
   const saveStart = Date.now();
-  for (let i = 0; i < 25; i++) { // 25 * 200ms = 5s max
-    await page.waitForTimeout(200);
-    const stillVisible = await saveBtn.isVisible().catch(() => false);
-    if (!stillVisible) {
-      console.log(`[Job] Save completed in ${Date.now() - saveStart}ms`);
-      break;
-    }
-    // Also check if the edit button reappears (means save succeeded and picker closed)
-    const editBtnBack = await page.locator('ytcp-icon-button#shopping-toolbar-edit').isVisible().catch(() => false);
-    if (editBtnBack) {
-      console.log(`[Job] Save completed (edit btn reappeared) in ${Date.now() - saveStart}ms`);
-      break;
-    }
+  try {
+    await Promise.race([
+      // Condition 1: save button disappears
+      saveBtn.waitFor({ state: 'hidden', timeout: 8000 }).catch(() => { }),
+      // Condition 2: edit button reappears (picker closed = save done)
+      page.locator('ytcp-icon-button#shopping-toolbar-edit').waitFor({ state: 'visible', timeout: 8000 }).catch(() => { }),
+    ]);
+    console.log(`[Job] Save completed in ${Date.now() - saveStart}ms`);
+  } catch {
+    console.log(`[Job] Save wait timed out after ${Date.now() - saveStart}ms (may still have saved)`);
   }
 }
 
+// Decode unicode escapes helper (module-level for reuse)
+const decodeUnicode = (str) => str.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+
 // Fetch affiliate URL from public YouTube page
+// Optimized: reduced retry delay, faster parsing
 async function fetchAffiliateUrl(videoUrl) {
   const videoIdMatch = videoUrl.match(/\/video\/([^/]+)\//);
   if (!videoIdMatch) throw new Error('Could not extract video ID from URL');
@@ -327,26 +330,28 @@ async function fetchAffiliateUrl(videoUrl) {
   const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
   console.log(`[Job] Fetching public video: ${publicUrl}`);
 
-  // Decode unicode escapes helper
-  const decodeUnicode = (str) => str.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-
   let affiliateUrl = null;
   let metadata = { title: '', price: '', image: '' };
 
-  // Lặp retry tối đa 3 lần (lần đầu ngay lập tức, sau đó cách 1s) = chờ tối đa ~2s
+  // Retry up to 3 times (first immediately, then 500ms delay) = max ~1s total retry wait
   for (let attempt = 1; attempt <= 3; attempt++) {
-    // Delay trước mỗi retry (lần đầu không delay)
     if (attempt > 1) {
-      console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl retrying after 1s...`);
-      await new Promise(r => setTimeout(r, 1000));
+      console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl retrying after 500ms...`);
+      await new Promise(r => setTimeout(r, 500));
     }
 
+    const fetchStart = Date.now();
     const response = await fetch(publicUrl, {
-      headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36' }
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Accept': 'text/html',
+      }
     });
     const pageContent = await response.text();
+    console.log(`[Job] Fetched page in ${Date.now() - fetchStart}ms (${(pageContent.length / 1024).toFixed(0)}KB)`);
 
-    // Extract affiliate URL (Bắt mọi link thuộc Shopee hoặc Lazada)
+    // Extract affiliate URL (Shopee or Lazada links)
     const urlMatch = pageContent.match(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/);
     if (urlMatch) {
       affiliateUrl = decodeUnicode(urlMatch[1]);
@@ -358,27 +363,23 @@ async function fetchAffiliateUrl(videoUrl) {
         const block = pageContent.substring(blockStart, blockStart + 5000);
         console.log('[Job] Product block (first 600):', block.substring(0, 600));
 
-        // Title from simpleText - first occurrence
         const titleMatch = block.match(/simpleText":"([^"]+)"/);
         if (titleMatch) metadata.title = decodeUnicode(titleMatch[1]);
 
-        // Price: "147.869 ₫" or "₫147,869" format
         const priceMatch = block.match(/([0-9][0-9.,]+)\s*₫/) || block.match(/₫\s*([0-9][0-9,.]+)/);
         if (priceMatch) metadata.price = decodeUnicode(priceMatch[1]) + ' ₫';
 
-        // Thumbnails: match all gstatic shopping URLs
         const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
           .map(m => decodeUnicode(m[1]));
         if (thumbUrls.length > 0) metadata.image = thumbUrls[thumbUrls.length - 1];
       }
-      break; // Thành công, thoát vòng lặp
+      break;
     }
 
     console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link`);
   }
 
   console.log('[Job] Extracted metadata:', JSON.stringify(metadata));
-
   return { affiliateUrl, metadata };
 }
 
@@ -569,8 +570,12 @@ app.post('/api/get-affiliate', async (req, res) => {
       try {
         // addProduct now auto-removes existing product before adding
         await addProduct(page, sanitizedUrl);
-        console.log(`[API] addProduct took ${Date.now() - jobStart}ms for product: ${sanitizedUrl}`);
+        const addProductTime = Date.now() - jobStart;
+        console.log(`[API] addProduct took ${addProductTime}ms for product: ${sanitizedUrl}`);
 
+        // Start fetching affiliate URL
+        // After save is clicked and confirmed, the product is committed on YouTube's side.
+        // We can now fetch the public page to get the affiliate link.
         const fetchStart = Date.now();
         const data = await fetchAffiliateUrl(targetUrl);
         console.log(`[API] fetchAffiliateUrl took ${Date.now() - fetchStart}ms for product: ${sanitizedUrl}`);
@@ -578,7 +583,6 @@ app.post('/api/get-affiliate', async (req, res) => {
         console.log(`[API] Affiliate URL for ${sanitizedUrl}: ${data.affiliateUrl}`);
 
         // Verify: ensure affiliate URL contains the expected product domain
-        // This catches cases where the wrong product was fetched
         if (data.affiliateUrl) {
           const productDomain = sanitizedUrl.includes('shopee') ? 'shopee' :
             sanitizedUrl.includes('lazada') ? 'lazada' : null;
@@ -589,7 +593,7 @@ app.post('/api/get-affiliate', async (req, res) => {
 
         res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
 
-        // Save history to SQLite on success (non-blocking)
+        // Save history to SQLite on success (fire-and-forget, don't block response)
         if (data.affiliateUrl) {
           try {
             addHistory(clientId || 'anonymous', {
