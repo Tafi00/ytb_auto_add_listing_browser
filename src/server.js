@@ -234,14 +234,17 @@ async function getChromePage(targetUrl) {
 // Add product and save (auto-removes existing product before adding)
 // Returns a promise that resolves when save is complete
 async function addProduct(page, productUrl) {
-  // Click "Sản phẩm" / "Products" only if edit button is not visible
+  // Click the Products row if edit button is not visible
   const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit');
   const editVisible = await editBtn.isVisible().catch(() => false);
   if (!editVisible) {
-    const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content:text("Sản phẩm")), button:has(div.ytcpButtonShapeImpl__button-text-content:text("Products"))').first();
+    // Button text changes dynamically: "Sản phẩm", "Products", "1 tagged product", "1 sản phẩm đã gắn thẻ", etc.
+    const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content)').filter({
+      hasText: /(Sản phẩm|Products|tagged product|sản phẩm đã gắn)/i
+    }).first();
     await btn.waitFor({ state: 'visible', timeout: 15000 });
     await btn.click();
-    console.log('[Job] Clicked "Sản phẩm/Products"');
+    console.log('[Job] Clicked Products row (matched by regex)');
   }
 
   await editBtn.waitFor({ state: 'visible', timeout: 10000 });
