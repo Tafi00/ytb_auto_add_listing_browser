@@ -249,22 +249,32 @@ async function addProduct(page, productUrl) {
   const searchInput = page.locator('input#search-input.search-input');
   await searchInput.waitFor({ state: 'visible', timeout: 10000 });
 
-  // Check and remove existing product if any (picker is loaded, no extra wait needed)
+  // Check and remove ALL existing products (picker is loaded, no extra wait needed)
   try {
-    const existingProduct = page.locator('ytshopping-product-picker-selected-product ytshopping-product').first();
-    const hasExisting = await existingProduct.isVisible().catch(() => false);
-    if (hasExisting) {
-      console.log('[Job] Found existing product, removing before adding new one...');
-      await existingProduct.hover();
-      const deleteBtn = page.locator('ytcp-icon-button.delete-product-button[aria-label="Delete"]').first();
-      await deleteBtn.waitFor({ state: 'visible', timeout: 5000 });
-      await deleteBtn.click();
-      console.log('[Job] Removed existing product');
-      // Wait for search input to be ready again instead of hard 500ms delay
+    const allProducts = page.locator('ytshopping-product-picker-selected-product ytshopping-product');
+    let productCount = await allProducts.count().catch(() => 0);
+    if (productCount > 0) {
+      console.log(`[Job] Found ${productCount} existing product(s), removing all before adding new one...`);
+      // Remove products one by one from the first element (DOM updates after each removal)
+      while (productCount > 0) {
+        const product = allProducts.first();
+        const isVisible = await product.isVisible().catch(() => false);
+        if (!isVisible) break;
+        await product.hover();
+        const deleteBtn = page.locator('ytcp-icon-button.delete-product-button[aria-label="Delete"]').first();
+        await deleteBtn.waitFor({ state: 'visible', timeout: 5000 });
+        await deleteBtn.click();
+        console.log(`[Job] Removed product (${productCount} remaining before this removal)`);
+        // Wait briefly for DOM to update after removal
+        await page.waitForTimeout(300);
+        productCount = await allProducts.count().catch(() => 0);
+      }
+      console.log('[Job] All existing products removed');
+      // Wait for search input to be ready again
       await searchInput.waitFor({ state: 'visible', timeout: 3000 }).catch(() => { });
     }
   } catch (e) {
-    console.log(`[Job] Warning: could not remove existing product: ${e.message}`);
+    console.log(`[Job] Warning: could not remove existing products: ${e.message}`);
   }
 
   // Add new product
@@ -302,20 +312,10 @@ async function addProduct(page, productUrl) {
   await saveBtn.click();
   console.log('[Job] Clicked Save button');
 
-  // Efficient save wait: use Promise.race with two conditions instead of polling
-  // This is faster because waitForSelector uses CDP events (push) instead of polling (pull)
-  const saveStart = Date.now();
-  try {
-    await Promise.race([
-      // Condition 1: save button disappears
-      saveBtn.waitFor({ state: 'hidden', timeout: 8000 }).catch(() => { }),
-      // Condition 2: edit button reappears (picker closed = save done)
-      page.locator('ytcp-icon-button#shopping-toolbar-edit').waitFor({ state: 'visible', timeout: 8000 }).catch(() => { }),
-    ]);
-    console.log(`[Job] Save completed in ${Date.now() - saveStart}ms`);
-  } catch {
-    console.log(`[Job] Save wait timed out after ${Date.now() - saveStart}ms (may still have saved)`);
-  }
+  // YouTube updates public page almost immediately after save click (~200ms)
+  // No need to wait for save button to disappear or edit button to reappear
+  await page.waitForTimeout(200);
+  console.log('[Job] Save clicked, proceeding to fetch after 200ms');
 }
 
 // Decode unicode escapes helper (module-level for reuse)
@@ -333,11 +333,11 @@ async function fetchAffiliateUrl(videoUrl) {
   let affiliateUrl = null;
   let metadata = { title: '', price: '', image: '' };
 
-  // Retry up to 3 times (first immediately, then 500ms delay) = max ~1s total retry wait
+  // Retry up to 3 times (first immediately, then 200ms delay)
   for (let attempt = 1; attempt <= 3; attempt++) {
     if (attempt > 1) {
-      console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl retrying after 500ms...`);
-      await new Promise(r => setTimeout(r, 500));
+      console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl retrying after 200ms...`);
+      await new Promise(r => setTimeout(r, 200));
     }
 
     const fetchStart = Date.now();
