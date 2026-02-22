@@ -8,7 +8,9 @@ async function main() {
   const args = process.argv.slice(2);
   const sessionArg = args.find(arg => arg.startsWith('--session='));
   const sessionId = sessionArg ? sessionArg.split('=')[1] : (process.env.SESSION_ID || CONFIG.defaultProfile);
-  const url = args.find(arg => !arg.startsWith('--') && arg.startsWith('http')) || 'https://www.youtube.com';
+  // Accept multiple URLs from command line arguments
+  const urls = args.filter(arg => !arg.startsWith('--') && arg.startsWith('http'));
+  if (urls.length === 0) urls.push('https://www.youtube.com');
 
   const sessionManager = new SessionManager({ sessionsDir: CONFIG.sessionsDir });
 
@@ -27,8 +29,9 @@ async function main() {
   const browser = new Browser(config);
   await browser.init();
 
-  // Navigate via CDP directly (avoids Playwright crash)
-  if (url && url !== 'about:blank') {
+  // Navigate first tab to first URL via CDP WebSocket
+  const firstUrl = urls[0];
+  if (firstUrl && firstUrl !== 'about:blank') {
     try {
       const targetsRes = await fetch(`http://127.0.0.1:19222/json`);
       const targets = await targetsRes.json();
@@ -38,7 +41,7 @@ async function main() {
         const ws = new WebSocket(pageTarget.webSocketDebuggerUrl);
         await new Promise((resolve, reject) => {
           ws.on('open', () => {
-            ws.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url } }));
+            ws.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: firstUrl } }));
             ws.on('message', (data) => {
               const msg = JSON.parse(data.toString());
               if (msg.id === 1) { ws.close(); resolve(); }
@@ -47,12 +50,25 @@ async function main() {
           ws.on('error', reject);
           setTimeout(() => { ws.close(); resolve(); }, 10000);
         });
-        console.log(`[OpenBrowser] Navigated to: ${url}`);
+        console.log(`[OpenBrowser] Tab 1 navigated to: ${firstUrl}`);
       }
     } catch (e) {
       console.log(`[OpenBrowser] Could not navigate to URL: ${e.message}`);
     }
   }
+
+  // Open additional tabs for remaining URLs via CDP HTTP API
+  for (let i = 1; i < urls.length; i++) {
+    try {
+      await fetch(`http://127.0.0.1:19222/json/new?${encodeURIComponent(urls[i])}`);
+      console.log(`[OpenBrowser] Tab ${i + 1} opened: ${urls[i]}`);
+      // Small delay between tab opens to avoid overwhelming Chrome
+      await new Promise(r => setTimeout(r, 500));
+    } catch (e) {
+      console.log(`[OpenBrowser] Failed to open tab for ${urls[i]}: ${e.message}`);
+    }
+  }
+  console.log(`[OpenBrowser] Opened ${urls.length} tab(s) total`);
 
   // Export session periodically by connecting via CDP briefly
   const doExport = async () => {
@@ -70,7 +86,7 @@ async function main() {
     } finally {
       // Disconnect Playwright so Chrome runs clean again
       if (connection?.browser) {
-        try { await connection.browser.close(); } catch {}
+        try { await connection.browser.close(); } catch { }
       }
     }
   };
@@ -81,7 +97,7 @@ async function main() {
     setInterval(doExport, 30000);
   }, 10000);
 
-  console.log(`[OpenBrowser] Chrome is running. Navigate to ${url} manually if needed.`);
+  console.log(`[OpenBrowser] Chrome is running with ${urls.length} tab(s).`);
   console.log('[OpenBrowser] Session will be auto-saved every 30 seconds.\n');
 
   // Keep process alive until Chrome closes
@@ -90,7 +106,7 @@ async function main() {
     process.exit(0);
   });
 
-  await new Promise(() => {});
+  await new Promise(() => { });
 }
 
 main().catch(console.error);

@@ -192,9 +192,7 @@ async function getPlaywright() {
 }
 
 // Connect to Chrome and get page
-// IMPORTANT: When targetUrl is provided, this function strictly finds the matching tab.
-// It will NOT fall back to a random Studio tab, to prevent race conditions
-// when multiple tabs are open and jobs run concurrently.
+// When targetUrl is provided, finds the matching tab or auto-creates it.
 async function getChromePage(targetUrl) {
   const chromium = await getPlaywright();
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
@@ -213,10 +211,15 @@ async function getChromePage(targetUrl) {
     page = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetBase));
 
     if (!page) {
-      // Tab for this URL not found — do NOT fall back to another tab
-      // This prevents jobs from accidentally running on the wrong tab
-      await browser.close();
-      throw new Error(`Tab not found for URL: ${targetUrl}. Please ensure the tab is open.`);
+      // Tab not found — auto-create a new tab and navigate to the URL
+      console.log(`[Chrome] Tab not found for ${targetUrl}, creating new tab...`);
+      page = await context.newPage();
+      await page.goto(targetUrl, { waitUntil: 'commit', timeout: 20000 });
+      // Wait for YouTube Studio to load
+      await page.waitForTimeout(2000);
+      console.log(`[Chrome] New tab created and navigated to: ${targetUrl}`);
+    } else {
+      console.log(`[Chrome] Found existing tab: ${page.url()}`);
     }
   } else {
     // No targetUrl specified: legacy behavior — find any Studio tab or first tab
@@ -430,31 +433,27 @@ app.put('/api/job-config', auth, async (req, res) => {
   const config = { url, productUrl: productUrl || '', updatedAt: new Date().toISOString() };
   saveJobConfig(config);
 
-  // Navigate browser to new URL if running
+  // Open missing tabs via CDP HTTP API (much more reliable than Playwright)
   const running = await isChromeRunning();
   if (running) {
     try {
-      const chromium = await getPlaywright();
-      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
-      const contexts = browser.contexts();
-      if (contexts.length > 0) {
-        const context = contexts[0];
-        const pages = context.pages();
-        const urls = url.split('\n').map(u => u.trim()).filter(Boolean);
-        for (const u of urls) {
-          const page = pages.find(p => p.url() === u || p.url().startsWith(u.split('?')[0]));
-          if (!page) {
-            let emptyPage = pages.find(p => p.url() === 'about:blank' || p.url() === 'chrome://newtab/' || p.url() === 'chrome://new-tab-page/');
-            if (urls.length === 1) { // If there's only one URL, reuse studio tab to be compatible
-              emptyPage = pages.find(p => p.url().includes('studio.youtube.com')) || emptyPage;
-            }
-            const targetPage = emptyPage || await context.newPage();
-            await targetPage.goto(u, { waitUntil: 'commit', timeout: 15000 }).catch(() => { });
-          }
+      const urls = url.split('\n').map(u => u.trim()).filter(Boolean);
+      const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
+      const targets = await targetsRes.json();
+      const pageTargets = targets.filter(t => t.type === 'page');
+
+      for (const u of urls) {
+        const uBase = u.split('?')[0];
+        const found = pageTargets.find(t => t.url === u || t.url.startsWith(uBase));
+        if (!found) {
+          // Create new tab via CDP HTTP API
+          await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/new?${encodeURIComponent(u)}`);
+          console.log(`[Config] Opened new tab for: ${u}`);
         }
       }
-      await browser.close();
-    } catch { }
+    } catch (e) {
+      console.log(`[Config] Error opening tabs: ${e.message}`);
+    }
   }
 
   res.json({ message: 'Config saved', ...config });
@@ -561,9 +560,10 @@ app.post('/api/get-affiliate', async (req, res) => {
     const { url: targetUrl, queue } = jobPool.getLeastBusyQueue(urls);
 
     const queuePos = queue.pending;
-    if (queuePos > 0) {
-      console.log(`[API] Job queued for ${targetUrl} (position ${queuePos}), product: ${sanitizedUrl}`);
-    }
+    // Log queue distribution for multi-tab diagnostics
+    const queueStatus = urls.map(u => `${u.split('/video/')[1]?.split('/')[0] || u}: pending=${jobPool.getQueue(u).pending}`).join(', ');
+    console.log(`[API] Queue status: [${queueStatus}]`);
+    console.log(`[API] Assigned to: ${targetUrl} (position ${queuePos}), product: ${sanitizedUrl}`);
 
     const result = await queue.push(async () => {
       const jobStart = Date.now();
@@ -650,20 +650,22 @@ app.get('/api/profile', auth, (_, res) => {
 // Open browser
 app.post('/api/profile/open-browser', auth, (req, res) => {
   const jobConfig = loadJobConfig();
-  let startUrl = 'about:blank';
+  // Collect all URLs to pass to open-browser script
+  let allUrls = ['about:blank'];
   if (jobConfig.url) {
     const urls = jobConfig.url.split('\n').map(u => u.trim()).filter(Boolean);
-    if (urls.length > 0) startUrl = urls[0];
+    if (urls.length > 0) allUrls = urls;
   }
   const browserScript = path.resolve(__dirname, 'open-browser.js');
-  const child = spawn('node', [browserScript, `--session=${PROFILE_ID}`, startUrl], {
+  const child = spawn('node', [browserScript, `--session=${PROFILE_ID}`, ...allUrls], {
     cwd: path.resolve(__dirname, '..'),
     env: { ...process.env, SESSION_ID: PROFILE_ID },
     detached: true,
     stdio: 'ignore',
   });
   child.unref();
-  res.json({ message: 'Browser opened', pid: child.pid });
+  console.log(`[Server] Browser opened with ${allUrls.length} URL(s)`);
+  res.json({ message: 'Browser opened', pid: child.pid, tabs: allUrls.length });
 });
 
 // Clear session data (cookies, localStorage, browser-data)
