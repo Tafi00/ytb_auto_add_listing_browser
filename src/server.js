@@ -252,12 +252,20 @@ async function addProduct(page, productUrl) {
   const searchInput = page.locator('input#search-input.search-input');
   await searchInput.waitFor({ state: 'visible', timeout: 10000 });
 
-  // Check and remove ALL existing products (picker is loaded, no extra wait needed)
+  // Step 1: Fill search input and press Enter FIRST (start searching immediately)
+  await searchInput.click();
+  await searchInput.fill(productUrl);
+  console.log(`[Job] Filled product URL: ${productUrl}`);
+
+  await searchInput.press('Enter');
+  console.log('[Job] Pressed Enter to search');
+
+  // Step 2: While search is loading, remove existing products in parallel
   try {
     const allProducts = page.locator('ytshopping-product-picker-selected-product ytshopping-product');
     let productCount = await allProducts.count().catch(() => 0);
     if (productCount > 0) {
-      console.log(`[Job] Found ${productCount} existing product(s), removing all before adding new one...`);
+      console.log(`[Job] Found ${productCount} existing product(s), removing while search loads...`);
       // Remove products one by one from the first element (DOM updates after each removal)
       while (productCount > 0) {
         const product = allProducts.first();
@@ -273,22 +281,12 @@ async function addProduct(page, productUrl) {
         productCount = await allProducts.count().catch(() => 0);
       }
       console.log('[Job] All existing products removed');
-      // Wait for search input to be ready again
-      await searchInput.waitFor({ state: 'visible', timeout: 3000 }).catch(() => { });
     }
   } catch (e) {
     console.log(`[Job] Warning: could not remove existing products: ${e.message}`);
   }
 
-  // Add new product
-  await searchInput.click();
-  await searchInput.fill(productUrl);
-  console.log(`[Job] Filled product URL: ${productUrl}`);
-
-  await searchInput.press('Enter');
-  console.log('[Job] Pressed Enter to search');
-
-  // Wait up to 8s for product to appear, if not found reload and throw error
+  // Step 3: Wait for search results (product tag button)
   const tagBtn = page.locator('ytcp-icon-button.tag-product-button[aria-label="Tag"]').first();
   try {
     await tagBtn.waitFor({ state: 'visible', timeout: 8000 });
@@ -297,6 +295,19 @@ async function addProduct(page, productUrl) {
     await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
     throw new Error('Sản phẩm này không gắn giỏ được.');
   }
+
+  // Check if banner-title has error message (product not eligible for shopping cart)
+  const bannerText = await page.evaluate(() => {
+    const el = document.querySelector(".banner-title > ytcp-msg");
+    return el ? el.textContent : null;
+  }).catch(() => null);
+
+  if (bannerText !== null) {
+    console.log(`[Job] Banner message detected: "${bannerText}", product cannot be added to cart. Reloading...`);
+    await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
+    throw new Error('Sản phẩm này không gắn giỏ được.');
+  }
+
   await tagBtn.click();
   console.log('[Job] Clicked Tag button');
 

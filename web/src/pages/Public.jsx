@@ -34,11 +34,11 @@ function Public() {
     const cid = getClientId();
     fetch(`/api/history/${cid}`).then(r => r.json()).then(data => {
       if (Array.isArray(data)) setHistory(data);
-    }).catch(() => {});
+    }).catch(() => { });
   }, []);
 
   useEffect(() => {
-    fetch('/api/site-config').then(r => r.json()).then(setSiteConfig).catch(() => {});
+    fetch('/api/site-config').then(r => r.json()).then(setSiteConfig).catch(() => { });
   }, []);
 
   useEffect(() => {
@@ -121,7 +121,7 @@ function Public() {
       localStorage.setItem('_lastSubmit', Date.now().toString());
       setCooldown(COOLDOWN_MS);
       setProductUrl('');
-    } catch (err) { setError('Lỗi: ' + err.message ); }
+    } catch (err) { setError(err.message); }
     finally { setLoading(false); }
   };
 
@@ -157,7 +157,7 @@ function Public() {
             <button type="submit" className="public-btn" disabled={loading || cooldown > 0}>
               {loading ? <><span className="spinner-small" /> Đang xử lý...</>
                 : cooldown > 0 ? <><FiClock size={14} /> {cooldownSec}s</>
-                : 'Thêm giỏ hàng'}
+                  : 'Thêm giỏ hàng'}
             </button>
           </form>
           {error && <div className="public-error"><FiAlertTriangle size={14} /> {error}</div>}

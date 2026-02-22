@@ -66,7 +66,7 @@ function Dashboard({ user, onLogout }) {
     try {
       await api.fetch('/api/history-stats', { method: 'DELETE' });
       setHistoryStats({ totalLinks: 0 });
-    } catch (err) { alert('Lỗi: ' + err.message); }
+    } catch (err) { alert(err.message); }
     finally { setClearing(false); }
   };
 
