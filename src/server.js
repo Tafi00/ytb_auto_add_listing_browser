@@ -312,10 +312,9 @@ async function addProduct(page, productUrl) {
   await saveBtn.click();
   console.log('[Job] Clicked Save button');
 
-  // YouTube updates public page almost immediately after save click (~200ms)
-  // No need to wait for save button to disappear or edit button to reappear
-  await page.waitForTimeout(200);
-  console.log('[Job] Save clicked, proceeding to fetch after 200ms');
+  // Wait 1.5s after save for YouTube to update public page
+  await page.waitForTimeout(1500);
+  console.log('[Job] Save clicked, proceeding to fetch after 1.5s');
 }
 
 // Decode unicode escapes helper (module-level for reuse)
@@ -352,19 +351,19 @@ async function fetchAffiliateUrl(videoUrl) {
     console.log(`[Job] Fetched page in ${Date.now() - fetchStart}ms (${(pageContent.length / 1024).toFixed(0)}KB)`);
 
     // Extract affiliate URL (Shopee or Lazada links)
-    // Use matchAll + take LAST match to get the newly added product (not the old one)
+    // Take FIRST match — old products are removed so first match is the correct one
     const allUrlMatches = [...pageContent.matchAll(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/g)];
-    const urlMatch = allUrlMatches.length > 0 ? allUrlMatches[allUrlMatches.length - 1] : null;
+    const urlMatch = allUrlMatches.length > 0 ? allUrlMatches[0] : null;
     if (urlMatch) {
       affiliateUrl = decodeUnicode(urlMatch[1]);
 
       // Extract product metadata from productListItemRenderer
-      // Use lastIndexOf to get the LAST (newest) product block
+      // Take FIRST product block — old products are removed so first is correct
       const blockMarker = 'productListItemRenderer":{"title"';
-      const blockStart = pageContent.lastIndexOf(blockMarker);
+      const blockStart = pageContent.indexOf(blockMarker);
       if (blockStart !== -1) {
         const block = pageContent.substring(blockStart, blockStart + 5000);
-        console.log('[Job] Product block (last, first 600):', block.substring(0, 600));
+        console.log('[Job] Product block (first, 600 chars):', block.substring(0, 600));
 
         const titleMatch = block.match(/simpleText":"([^"]+)"/);
         if (titleMatch) metadata.title = decodeUnicode(titleMatch[1]);
@@ -374,7 +373,7 @@ async function fetchAffiliateUrl(videoUrl) {
 
         const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
           .map(m => decodeUnicode(m[1]));
-        if (thumbUrls.length > 0) metadata.image = thumbUrls[thumbUrls.length - 1];
+        if (thumbUrls.length > 0) metadata.image = thumbUrls[0];
       }
       break;
     }
