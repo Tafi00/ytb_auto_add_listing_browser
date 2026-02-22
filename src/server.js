@@ -192,6 +192,9 @@ async function getPlaywright() {
 }
 
 // Connect to Chrome and get page
+// IMPORTANT: When targetUrl is provided, this function strictly finds the matching tab.
+// It will NOT fall back to a random Studio tab, to prevent race conditions
+// when multiple tabs are open and jobs run concurrently.
 async function getChromePage(targetUrl) {
   const chromium = await getPlaywright();
   const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
@@ -205,11 +208,18 @@ async function getChromePage(targetUrl) {
 
   let page;
   if (targetUrl) {
-    page = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetUrl.split('?')[0]));
-  }
+    // Strict match: exact URL or same base path (ignoring query params)
+    const targetBase = targetUrl.split('?')[0];
+    page = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetBase));
 
-  if (!page) {
-    // Ưu tiên tìm tab đang mở Youtube Studio, nếu không có thì lấy tab đầu tiên
+    if (!page) {
+      // Tab for this URL not found — do NOT fall back to another tab
+      // This prevents jobs from accidentally running on the wrong tab
+      await browser.close();
+      throw new Error(`Tab not found for URL: ${targetUrl}. Please ensure the tab is open.`);
+    }
+  } else {
+    // No targetUrl specified: legacy behavior — find any Studio tab or first tab
     page = pages.find(p => p.url().includes('studio.youtube.com'));
     if (!page) {
       page = pages[0] || (await context.newPage());
@@ -549,22 +559,33 @@ app.post('/api/get-affiliate', async (req, res) => {
 
     const queuePos = queue.pending;
     if (queuePos > 0) {
-      console.log(`[API] Job queued for ${targetUrl} (position ${queuePos})`);
+      console.log(`[API] Job queued for ${targetUrl} (position ${queuePos}), product: ${sanitizedUrl}`);
     }
 
     const result = await queue.push(async () => {
       const jobStart = Date.now();
+      console.log(`[API] Job START for product: ${sanitizedUrl} on tab: ${targetUrl}`);
       const { browser, page } = await getChromePage(targetUrl);
       try {
         // addProduct now auto-removes existing product before adding
         await addProduct(page, sanitizedUrl);
-        console.log(`[API] addProduct took ${Date.now() - jobStart}ms`);
+        console.log(`[API] addProduct took ${Date.now() - jobStart}ms for product: ${sanitizedUrl}`);
 
         const fetchStart = Date.now();
         const data = await fetchAffiliateUrl(targetUrl);
-        console.log(`[API] fetchAffiliateUrl took ${Date.now() - fetchStart}ms`);
+        console.log(`[API] fetchAffiliateUrl took ${Date.now() - fetchStart}ms for product: ${sanitizedUrl}`);
         console.log(`[API] Total job time: ${Date.now() - jobStart}ms`);
-        console.log(`[API] Affiliate URL: ${data.affiliateUrl}`);
+        console.log(`[API] Affiliate URL for ${sanitizedUrl}: ${data.affiliateUrl}`);
+
+        // Verify: ensure affiliate URL contains the expected product domain
+        // This catches cases where the wrong product was fetched
+        if (data.affiliateUrl) {
+          const productDomain = sanitizedUrl.includes('shopee') ? 'shopee' :
+            sanitizedUrl.includes('lazada') ? 'lazada' : null;
+          if (productDomain && !data.affiliateUrl.toLowerCase().includes(productDomain)) {
+            console.warn(`[API] WARNING: Product domain mismatch! Expected ${productDomain} in affiliate URL but got: ${data.affiliateUrl}`);
+          }
+        }
 
         res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
 
@@ -586,7 +607,7 @@ app.post('/api/get-affiliate', async (req, res) => {
         return data;
       } catch (e) {
         // Reload page to reset state after error
-        console.log(`[API] Error during job, reloading page: ${e.message}`);
+        console.log(`[API] Error during job for product ${sanitizedUrl}: ${e.message}`);
         try {
           await page.reload({ waitUntil: 'commit', timeout: 15000 });
           console.log('[API] Page reloaded after error');
