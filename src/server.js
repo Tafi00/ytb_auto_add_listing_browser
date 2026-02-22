@@ -273,7 +273,7 @@ async function addProduct(page, productUrl) {
         if (!isVisible) break;
         await product.hover();
         const deleteBtn = page.locator('ytcp-icon-button.delete-product-button[aria-label="Delete"]').first();
-        await deleteBtn.waitFor({ state: 'visible', timeout: 5000 });
+        await deleteBtn.waitFor({ state: 'visible', timeout: 10000 });
         await deleteBtn.click();
         console.log(`[Job] Removed product (${productCount} remaining before this removal)`);
         // Wait briefly for DOM to update after removal
@@ -312,17 +312,17 @@ async function addProduct(page, productUrl) {
   console.log('[Job] Clicked Tag button');
 
   const nextBtn = page.locator('ytcp-button#picker-next-button button').first();
-  await nextBtn.waitFor({ state: 'visible', timeout: 5000 });
+  await nextBtn.waitFor({ state: 'visible', timeout: 10000 });
   await nextBtn.click();
   console.log('[Job] Clicked Next button');
 
   const doneBtn = page.locator('button[aria-label="Done"]:has(div.ytcpButtonShapeImpl__button-text-content:text("Done"))').first();
-  await doneBtn.waitFor({ state: 'visible', timeout: 5000 });
+  await doneBtn.waitFor({ state: 'visible', timeout: 10000 });
   await doneBtn.click();
   console.log('[Job] Clicked Done button');
 
   const saveBtn = page.locator('ytcp-button#save button').first();
-  await saveBtn.waitFor({ state: 'visible', timeout: 5000 });
+  await saveBtn.waitFor({ state: 'visible', timeout: 10000 });
   await saveBtn.click();
   console.log('[Job] Clicked Save button');
 
@@ -637,9 +637,11 @@ app.post('/api/get-affiliate', async (req, res) => {
     });
   } catch (e) {
     if (!res.headersSent) {
-      // Không leak internal error ra ngoài cho public API
+      // Không leak internal error ra ngoài cho public API ngoại trừ các lỗi đã biết
       console.error(`[API] get-affiliate error: ${e.message}`);
-      const safeMessage = e.message.includes('không gắn giỏ') ? e.message : 'Có lỗi xảy ra, vui lòng thử lại sau.';
+      const safeMessage = e.message.includes('không gắn giỏ')
+        ? e.message
+        : `Có lỗi xảy ra, vui lòng thử lại sau. (Chi tiết: ${e.message.substring(0, 150)})`;
       res.status(500).json({ error: safeMessage });
     } else {
       console.error(`[API] get-affiliate background error after response sent: ${e.message}`);
