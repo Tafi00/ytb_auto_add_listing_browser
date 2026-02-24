@@ -154,9 +154,33 @@ class JobQueue {
   }
 }
 
-// Ensure strict sequential execution for Playwright to prevent CDP crashes
-const globalJobQueue = new JobQueue();
+// Use per-tab Job Queues to allow concurrent processing across tabs
+// while maintaining strict sequential execution within each tab
+const tabQueues = new Map();
 let globalJobCounter = 0;
+
+let activeWorkers = [];
+
+// Clean up dead workers
+setInterval(() => {
+  activeWorkers = activeWorkers.filter(w => {
+    try {
+      if (w.pid) {
+        process.kill(w.pid, 0); // Check if process is still running
+      }
+      return true;
+    } catch {
+      return false; // Process dead
+    }
+  });
+}, 5000);
+
+function getQueueForTab(targetUrl) {
+  if (!tabQueues.has(targetUrl)) {
+    tabQueues.set(targetUrl, new JobQueue());
+  }
+  return tabQueues.get(targetUrl);
+}
 
 // Cache playwright module at top level for faster access
 let _playwrightChromium = null;
@@ -169,41 +193,33 @@ async function getPlaywright() {
 }
 
 // Connect to Chrome and get page
-// When targetUrl is provided, finds the matching tab or auto-creates it.
 async function getChromePage(targetUrl) {
   const chromium = await getPlaywright();
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+
+  const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
+  let worker = targetUrl ? activeWorkers.find(w => w.url === targetUrl || w.url.startsWith(targetBase)) : null;
+
+  if (!worker) {
+    if (activeWorkers.length === 0) throw new Error('No browser running.');
+    worker = activeWorkers[0]; // fallback
+  }
+
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
   const contexts = browser.contexts();
   if (contexts.length === 0) {
     await browser.close();
-    throw new Error('No browser context found. Reopen browser.');
+    throw new Error(`No browser context found on port ${worker.port}. Reopen browser.`);
   }
   const context = contexts[0];
   const pages = context.pages();
 
   let page;
   if (targetUrl) {
-    // Strict match: exact URL or same base path (ignoring query params)
-    const targetBase = targetUrl.split('?')[0];
     page = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetBase));
+  }
 
-    if (!page) {
-      // Tab not found — auto-create a new tab and navigate to the URL
-      console.log(`[Chrome] Tab not found for ${targetUrl}, creating new tab...`);
-      page = await context.newPage();
-      await page.goto(targetUrl, { waitUntil: 'commit', timeout: 20000 });
-      // Wait for YouTube Studio to load
-      await page.waitForTimeout(2000);
-      console.log(`[Chrome] New tab created and navigated to: ${targetUrl}`);
-    } else {
-      console.log(`[Chrome] Found existing tab: ${page.url()}`);
-    }
-  } else {
-    // No targetUrl specified: legacy behavior — find any Studio tab or first tab
-    page = pages.find(p => p.url().includes('studio.youtube.com'));
-    if (!page) {
-      page = pages[0] || (await context.newPage());
-    }
+  if (!page) {
+    page = pages[0]; // Since 1 worker = 1 target url, just return its first page
   }
   return { browser, context, page };
 }
@@ -222,8 +238,8 @@ async function addProduct(page, productUrl) {
   // Try to wait for either the edit button or the products row to appear
   try {
     await Promise.race([
-      editBtn.waitFor({ state: 'visible', timeout: 8000 }),
-      btn.waitFor({ state: 'visible', timeout: 8000 })
+      editBtn.waitFor({ state: 'attached', timeout: 8000 }),
+      btn.waitFor({ state: 'attached', timeout: 8000 })
     ]);
   } catch (e) {
     // Ignore timeout, we'll let the individual checks handle it
@@ -231,16 +247,20 @@ async function addProduct(page, productUrl) {
 
   const editVisible = await editBtn.isVisible().catch(() => false);
   if (!editVisible) {
-    await btn.waitFor({ state: 'visible', timeout: 15000 });
-    await btn.click();
+    await btn.waitFor({ state: 'attached', timeout: 15000 });
+    await btn.evaluate(b => b.click()).catch(async () => {
+      await btn.click({ force: true }).catch(() => { });
+    });
     console.log('[Job] Clicked Products row (matched by regex)');
     // Wait for slide-in animation or UI update to settle before clicking edit
-    await page.waitForTimeout(500);
+    await page.waitForTimeout(800);
   }
 
-  // Use state: 'attached' and force: true to bypass Playwright's strict visibility/overlap checks
+  // Use state: 'attached' and evaluate click to completely bypass Playwright's visibility/overlap checks
   await editBtn.waitFor({ state: 'attached', timeout: 10000 });
-  await editBtn.click({ force: true });
+  await editBtn.evaluate(b => b.click()).catch(async () => {
+    await editBtn.click({ force: true }).catch(() => { });
+  });
   console.log('[Job] Clicked edit button');
 
   // Wait for product picker to fully load
@@ -317,14 +337,27 @@ async function addProduct(page, productUrl) {
   console.log('[Job] Clicked Done button');
 
   const saveBtn = page.locator('ytcp-button#save button').first();
-  await saveBtn.waitFor({ state: 'visible', timeout: 10000 });
-  await saveBtn.click();
-  console.log('[Job] Clicked Save button');
+  await saveBtn.waitFor({ state: 'attached', timeout: 10000 });
 
-  // Wait 1.5s after save for YouTube to update public page
-  await page.waitForTimeout(1500);
-  console.log('[Job] Save clicked, proceeding to fetch after 1.5s');
-}
+  // Give UI a moment to update button state
+  await page.waitForTimeout(500);
+
+  const isDisabled = await saveBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true').catch(() => false);
+
+  if (isDisabled) {
+    console.log('[Job] Save button is disabled (no net changes made to products). Proceeding directly.');
+  } else {
+    // Normal scroll to view and click
+    await saveBtn.evaluate(b => b.scrollIntoView()).catch(() => { });
+    await saveBtn.click({ force: true }).catch(async () => {
+      await saveBtn.evaluate(b => b.click());
+    });
+    console.log('[Job] Clicked Save button');
+    // Wait 1.5s after save for YouTube to update public page
+    await page.waitForTimeout(1500);
+    console.log('[Job] Save clicked, proceeding to fetch after 1.5s');
+  }
+} // End addProduct
 
 // Decode unicode escapes helper (module-level for reuse)
 const decodeUnicode = (str) => str.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
@@ -416,15 +449,18 @@ const saveJobConfig = (config) => {
   fs.writeFileSync(jobConfigPath, JSON.stringify(config, null, 2));
 };
 
-// Helper: check if Chrome debugging port is available
 const CHROME_DEBUG_PORT = 19222;
+
 const isChromeRunning = async () => {
-  try {
-    const res = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/version`);
-    return res.ok;
-  } catch {
-    return false;
+  if (activeWorkers.length === 0) return false;
+  // Check if at least one worker is alive
+  for (const w of activeWorkers) {
+    try {
+      const res = await fetch(`http://127.0.0.1:${w.port}/json/version`, { signal: AbortSignal.timeout(1000) });
+      if (res.ok) return true;
+    } catch { }
   }
+  return false;
 };
 
 // Get job config
@@ -438,29 +474,6 @@ app.put('/api/job-config', auth, async (req, res) => {
   if (!url) return res.status(400).json({ error: 'URL is required' });
   const config = { url, productUrl: productUrl || '', updatedAt: new Date().toISOString() };
   saveJobConfig(config);
-
-  // Open missing tabs via CDP HTTP API (much more reliable than Playwright)
-  const running = await isChromeRunning();
-  if (running) {
-    try {
-      const urls = url.split('\n').map(u => u.trim()).filter(Boolean);
-      const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
-      const targets = await targetsRes.json();
-      const pageTargets = targets.filter(t => t.type === 'page');
-
-      for (const u of urls) {
-        const uBase = u.split('?')[0];
-        const found = pageTargets.find(t => t.url === u || t.url.startsWith(uBase));
-        if (!found) {
-          // Create new tab via CDP HTTP API
-          await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/new?${encodeURIComponent(u)}`);
-          console.log(`[Config] Opened new tab for: ${u}`);
-        }
-      }
-    } catch (e) {
-      console.log(`[Config] Error opening tabs: ${e.message}`);
-    }
-  }
 
   res.json({ message: 'Config saved', ...config });
 });
@@ -546,32 +559,47 @@ app.post('/api/get-affiliate', async (req, res) => {
   // Rate limit by clientId + IP combo
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   const rateLimitKey = clientId ? `${clientId}_${ip}` : ip;
-  const lastRequest = clientCooldowns.get(rateLimitKey);
-  if (lastRequest && Date.now() - lastRequest < CLIENT_COOLDOWN_MS) {
-    const wait = Math.ceil((CLIENT_COOLDOWN_MS - (Date.now() - lastRequest)) / 1000);
-    return res.status(429).json({ error: `Vui lòng đợi ${wait}s trước khi gửi tiếp` });
+  if (!req.body.bypassRateLimit) {
+    const lastRequest = clientCooldowns.get(rateLimitKey);
+    if (lastRequest && Date.now() - lastRequest < CLIENT_COOLDOWN_MS) {
+      const wait = Math.ceil((CLIENT_COOLDOWN_MS - (Date.now() - lastRequest)) / 1000);
+      return res.status(429).json({ error: `Vui lòng đợi ${wait}s trước khi gửi tiếp` });
+    }
+    clientCooldowns.set(rateLimitKey, Date.now());
   }
-  clientCooldowns.set(rateLimitKey, Date.now());
 
   const config = loadJobConfig();
   if (!config.url) return res.status(400).json({ error: 'No Video URL configured in admin' });
 
-  const urls = config.url.split('\n').map(u => u.trim()).filter(Boolean);
+  const urlPattern = /https?:\/\/[^\s]+/g;
+  const urls = config.url.match(urlPattern) || [];
   if (urls.length === 0) return res.status(400).json({ error: 'No Video URL configured in admin' });
 
   const running = await isChromeRunning();
   if (!running) return res.status(400).json({ error: 'Browser is not running' });
 
   try {
-    // Round-robin tab selection
-    const targetUrl = urls[globalJobCounter % urls.length];
+    // Select the tab (URL) that currently has the shortest queue
+    let targetUrl = urls[0];
+    let minPending = Infinity;
+
+    for (const url of urls) {
+      const q = getQueueForTab(url);
+      if (q.pending < minPending) {
+        minPending = q.pending;
+        targetUrl = url;
+      }
+    }
+
+    // We update the counter just for logging/tracking purposes if needed
     globalJobCounter++;
 
-    const queuePos = globalJobQueue.pending;
-    console.log(`[API] Global queue pending: ${queuePos}`);
+    const tabQueue = getQueueForTab(targetUrl);
+    const queuePos = tabQueue.pending;
+    console.log(`[API] Tab queue pending: ${queuePos}`);
     console.log(`[API] Assigned to: ${targetUrl} (position ${queuePos}), product: ${sanitizedUrl}`);
 
-    const result = await globalJobQueue.push(async () => {
+    const result = await tabQueue.push(async () => {
       const jobStart = Date.now();
       console.log(`[API] Job START for product: ${sanitizedUrl} on tab: ${targetUrl}`);
       const { browser, page } = await getChromePage(targetUrl);
@@ -661,30 +689,109 @@ app.get('/api/profile', auth, (_, res) => {
   }
 });
 
+async function launchBrowsersAndStoreWorkers(urls) {
+  // Kill existing workers before opening new ones
+  for (const w of activeWorkers) {
+    try { process.kill(w.pid); console.log(`[Server] Killed worker ${w.pid} before relaunch`); } catch { }
+
+    // Attempt to forcefully clean up worker folders to prevent lock/busy issues
+    try {
+      const wDir = sessionManager.getSessionDir(w.sessionId);
+      if (fs.existsSync(wDir)) {
+        fs.rmSync(wDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
+      }
+    } catch (e) {
+      console.log(`[Server] Could not delete old worker dir: ${e.message}`);
+    }
+  }
+  activeWorkers = [];
+
+  // Quick wait for processes to exit
+  await new Promise(r => setTimeout(r, 1000));
+
+  const browserScript = path.resolve(__dirname, 'open-browser.js');
+  let startPort = 19222;
+  let x = 50, y = 50;
+
+  for (let i = 0; i < urls.length; i++) {
+    const url = urls[i];
+    const port = startPort + i;
+    const workerSessionId = `worker-${i}`;
+
+    // Auto clone session for worker
+    try {
+      if (sessionManager.exists(workerSessionId)) {
+        sessionManager.delete(workerSessionId);
+        await new Promise(r => setTimeout(r, 200));
+      }
+
+      // Clean up locks in the default profile before cloning so it doesn't carry over
+      const srcDataDir = sessionManager.getBrowserDataDir(PROFILE_ID);
+      try { fs.rmSync(path.join(srcDataDir, 'SingletonLock'), { force: true }); } catch { }
+      try { fs.rmSync(path.join(srcDataDir, 'SingletonCookie'), { force: true }); } catch { }
+      try { fs.rmSync(path.join(srcDataDir, 'SingletonSocket'), { force: true }); } catch { }
+
+      sessionManager.clone(PROFILE_ID, workerSessionId);
+
+      // Clean up locks in the cloned worker profile just in case
+      const destDataDir = sessionManager.getBrowserDataDir(workerSessionId);
+      try { fs.rmSync(path.join(destDataDir, 'SingletonLock'), { force: true }); } catch { }
+      try { fs.rmSync(path.join(destDataDir, 'SingletonCookie'), { force: true }); } catch { }
+      try { fs.rmSync(path.join(destDataDir, 'SingletonSocket'), { force: true }); } catch { }
+    } catch (e) {
+      console.error(`[Server] Failed to prepare session for ${workerSessionId}:`, e.message);
+    }
+
+    const child = spawn('node', [
+      browserScript,
+      `--session=${workerSessionId}`,
+      `--port=${port}`,
+      `--position=${x},${y}`,
+      url
+    ], {
+      cwd: path.resolve(__dirname, '..'),
+      env: { ...process.env, SESSION_ID: workerSessionId },
+      detached: true,
+      stdio: 'ignore', // Keep server clean
+    });
+
+    child.unref(); // Detach deeply
+    activeWorkers.push({ pid: child.pid, port, url, sessionId: workerSessionId, process: child });
+    console.log(`[Server] Worker ${i} opened on port ${port} for URL: ${url}`);
+    x += 50; y += 30; // Stagger UI
+
+    // Give browser time to spin up
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+
 // Open browser
-app.post('/api/profile/open-browser', auth, (req, res) => {
+app.post('/api/profile/open-browser', auth, async (req, res) => {
   const jobConfig = loadJobConfig();
   // Collect all URLs to pass to open-browser script
   let allUrls = ['about:blank'];
   if (jobConfig.url) {
-    const urls = jobConfig.url.split('\n').map(u => u.trim()).filter(Boolean);
-    if (urls.length > 0) allUrls = urls;
+    const urlPattern = /https?:\/\/[^\s]+/g;
+    const matches = jobConfig.url.match(urlPattern);
+    if (matches && matches.length > 0) {
+      allUrls = matches;
+    }
   }
-  const browserScript = path.resolve(__dirname, 'open-browser.js');
-  const child = spawn('node', [browserScript, `--session=${PROFILE_ID}`, ...allUrls], {
-    cwd: path.resolve(__dirname, '..'),
-    env: { ...process.env, SESSION_ID: PROFILE_ID },
-    detached: true,
-    stdio: 'ignore',
-  });
-  child.unref();
-  console.log(`[Server] Browser opened with ${allUrls.length} URL(s)`);
-  res.json({ message: 'Browser opened', pid: child.pid, tabs: allUrls.length });
+
+  await launchBrowsersAndStoreWorkers(allUrls);
+
+  res.json({ message: 'Browsers opened', tabs: allUrls.length });
 });
 
 // Clear session data (cookies, localStorage, browser-data)
 app.delete('/api/profile/session', auth, (req, res) => {
   try {
+    // Kill existing workers before clearing session data
+    for (const w of activeWorkers) {
+      try { process.kill(w.pid); console.log(`[Server] Killed worker ${w.pid} before clearing session`); } catch { }
+    }
+    activeWorkers = [];
+
     // Remove session.json
     const sessionFile = sessionManager.getSessionFilePath(PROFILE_ID);
     if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
@@ -709,16 +816,24 @@ app.delete('/api/profile/session', auth, (req, res) => {
 // Track which tab (by CDP targetId) is currently active for remote control
 let activeTargetId = null;
 
-// Helper: get all page targets from CDP
+// Helper: get all page targets from CDP across all active workers
 async function getCdpPageTargets() {
-  try {
-    const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
-    const targets = await targetsRes.json();
-    return targets.filter(t => t.type === 'page');
-  } catch (e) {
-    console.log(`[CDP] Failed to get page targets: ${e.message}`);
-    return [];
+  const allTargets = [];
+  for (const w of activeWorkers) {
+    try {
+      const targetsRes = await fetch(`http://127.0.0.1:${w.port}/json`);
+      const targets = await targetsRes.json();
+      const pages = targets.filter(t => t.type === 'page').map(t => ({
+        ...t,
+        port: w.port,
+        workerId: w.sessionId
+      }));
+      allTargets.push(...pages);
+    } catch (e) {
+      // Worker might not have booted yet, ignore
+    }
   }
+  return allTargets;
 }
 
 // Helper: get the active target (or fall back to first page)
@@ -737,11 +852,11 @@ async function getActiveTarget() {
 app.get('/api/browser/tabs', auth, async (_, res) => {
   try {
     const pages = await getCdpPageTargets();
-    const tabs = pages.map(t => ({
+    const tabs = pages.map((t, idx) => ({
       id: t.id,
-      title: t.title || 'Untitled',
+      title: `${t.workerId || 'Worker'} - ${t.title || 'Untitled'}`,
       url: t.url,
-      active: t.id === activeTargetId || (!activeTargetId && pages[0]?.id === t.id),
+      active: t.id === activeTargetId || (!activeTargetId && idx === 0),
     }));
     res.json({ tabs });
   } catch (e) {
@@ -758,8 +873,7 @@ app.post('/api/browser/tabs/switch', auth, async (req, res) => {
     const found = pages.find(t => t.id === targetId);
     if (!found) return res.status(404).json({ error: 'Tab not found' });
     activeTargetId = targetId;
-    // Activate the tab via CDP
-    await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/activate/${targetId}`);
+    await fetch(`http://127.0.0.1:${found.port}/json/activate/${targetId}`);
     res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
@@ -771,7 +885,8 @@ app.post('/api/browser/tabs/new', auth, async (req, res) => {
   const { url } = req.body;
   try {
     const targetUrl = url || 'about:blank';
-    const newRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/new?${encodeURIComponent(targetUrl)}`);
+    const port = activeWorkers.length > 0 ? activeWorkers[0].port : 19222;
+    const newRes = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(targetUrl)}`);
     const newTarget = await newRes.json();
     activeTargetId = newTarget.id;
     res.json({ ok: true, tab: { id: newTarget.id, title: newTarget.title || 'New Tab', url: newTarget.url } });
@@ -785,7 +900,11 @@ app.post('/api/browser/tabs/close', auth, async (req, res) => {
   const { targetId } = req.body;
   if (!targetId) return res.status(400).json({ error: 'targetId required' });
   try {
-    await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json/close/${targetId}`);
+    const pages = await getCdpPageTargets();
+    const found = pages.find(t => t.id === targetId);
+    if (found) {
+      await fetch(`http://127.0.0.1:${found.port}/json/close/${targetId}`);
+    }
     // If we closed the active tab, reset
     if (activeTargetId === targetId) {
       activeTargetId = null;
@@ -806,17 +925,18 @@ app.get('/api/browser/page-info', auth, async (_, res) => {
   }
 });
 
-// Screenshot via CDP directly (more reliable than Playwright)
+// Screenshot via CDP directly
 app.get('/api/browser/screenshot', auth, async (_, res) => {
   try {
     const target = await getActiveTarget();
     if (!target) return res.status(400).json({ error: 'No page found' });
 
+    const port = target.port || 19222;
     const chromium = await getPlaywright();
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
     const contexts = browser.contexts();
     if (contexts.length === 0) { await browser.close(); return res.status(400).json({ error: 'No context' }); }
-    // Find the page matching our active target
+
     const allPages = contexts[0].pages();
     const page = allPages.find(p => p.url() === target.url) || allPages[0];
     if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
@@ -824,14 +944,12 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
     const url = page.url();
     const title = await page.title().catch(() => '');
 
-    // Get actual viewport size and capture screenshot
     const cdp = await page.context().newCDPSession(page);
     const layoutMetrics = await cdp.send('Page.getLayoutMetrics');
     const cssViewport = layoutMetrics.cssVisualViewport || layoutMetrics.visualViewport || {};
     const cssWidth = cssViewport.clientWidth || 1920;
     const cssHeight = cssViewport.clientHeight || 1080;
 
-    // Capture screenshot clipped to CSS viewport to avoid DPR scaling issues
     const { data } = await cdp.send('Page.captureScreenshot', {
       format: 'jpeg',
       quality: 70,
@@ -855,12 +973,13 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
 async function getActivePage() {
   const target = await getActiveTarget();
   if (!target) throw new Error('No page');
+
+  const port = target.port || 19222;
   const chromium = await getPlaywright();
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${CHROME_DEBUG_PORT}`);
+  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
   const contexts = browser.contexts();
   if (contexts.length === 0) { await browser.close(); throw new Error('No context'); }
   const allPages = contexts[0].pages();
-  // Match by target URL or fall back to first
   const page = allPages.find(p => p.url() === target.url) || allPages[0];
   if (!page) { await browser.close(); throw new Error('No page'); }
   return { browser, page };
@@ -1248,47 +1367,12 @@ server.listen(PORT, '0.0.0.0', () => {
       return;
     }
     try {
-      const { default: Browser } = await import('./browser.js');
       const jobConfig = loadJobConfig();
-      const startUrl = jobConfig.url || 'https://www.youtube.com';
-      const config = { ...CONFIG, headless: false, sessionId: PROFILE_ID };
-      const browser = new Browser(config);
-      await browser.init();
+      const urlPattern = /https?:\/\/[^\s]+/g;
+      const startUrls = jobConfig.url ? jobConfig.url.match(urlPattern) || [] : [];
+      if (startUrls.length === 0) startUrls.push('https://www.youtube.com');
 
-      // Navigate via CDP HTTP directly (avoids Playwright crash)
-      try {
-        const targetsRes = await fetch(`http://127.0.0.1:${CHROME_DEBUG_PORT}/json`);
-        const targets = await targetsRes.json();
-        const pageTarget = targets.find(t => t.type === 'page');
-        if (pageTarget) {
-          const wsUrl = pageTarget.webSocketDebuggerUrl;
-          const { default: WebSocket } = await import('ws');
-          const navWs = new WebSocket(wsUrl);
-          await new Promise((resolve) => {
-            navWs.on('open', () => {
-              try {
-                navWs.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url: startUrl } }));
-              } catch { navWs.close(); resolve(); return; }
-              navWs.on('message', (data) => {
-                try {
-                  const msg = JSON.parse(data.toString());
-                  if (msg.id === 1) { navWs.close(); resolve(); }
-                } catch { }
-              });
-            });
-            navWs.on('error', () => resolve());
-            setTimeout(() => { try { navWs.close(); } catch { } resolve(); }, 10000);
-          });
-          console.log(`[Server] Browser navigated to: ${startUrl}`);
-        }
-      } catch (e) {
-        console.log(`[Server] Could not navigate: ${e.message}`);
-      }
-
-      console.log('[Server] Chrome started automatically');
-      browser.chromeProcess.on('exit', () => {
-        console.log('[Server] Chrome process exited');
-      });
+      await launchBrowsersAndStoreWorkers(startUrls);
     } catch (e) {
       console.error('[Server] Failed to auto-start browser:', e.message);
       console.log('[Server] Server continues without browser. Use admin panel to start it.');

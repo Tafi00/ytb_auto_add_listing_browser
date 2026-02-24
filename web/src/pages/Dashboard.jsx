@@ -108,6 +108,47 @@ function Dashboard({ user, onLogout }) {
     catch (err) { alert('Failed: ' + err.message); }
   };
 
+  const [testing, setTesting] = useState(false);
+  const handleTestConcurrency = async () => {
+    const testLinks = [
+      'https://s.shopee.vn/60LRrcK4ZW',
+      'https://vn.shp.ee/ENnQvy8',
+      'https://shopee.vn/a-i.1081175057.22956004192',
+      'https://shopee.vn/product/307491301/12961322188',
+      'https://www.lazada.vn/products/pdp-i246452966-s316699339.html',
+      'https://s.lazada.vn/s.6vrsK',
+      'https://s.lazada.vn/l.ZCUoB?cc'
+    ];
+    setTesting(true);
+
+    try {
+      const results = await Promise.allSettled(testLinks.map(async (link) => {
+        const res = await api.fetch('/api/get-affiliate', {
+          method: 'POST',
+          body: JSON.stringify({ productUrl: link, clientId: 'admin-test', bypassRateLimit: true }),
+        });
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
+        return data; // Contains affUrl or similar
+      }));
+
+      const summary = results.map((r, i) => {
+        if (r.status === 'fulfilled') {
+          return `Link ${i + 1}: OK (Thành công)`;
+        } else {
+          return `Link ${i + 1}: Lỗi - ${r.reason.message}`;
+        }
+      }).join('\n');
+
+      alert(`Kết quả test 7 link:\n\n${summary}`);
+    } catch (err) {
+      alert('Lỗi quá trình test: ' + err.message);
+    } finally {
+      setTesting(false);
+      loadHistoryStats();
+    }
+  };
+
   // Site config handlers
   const updateConfig = (key, value) => {
     setSiteConfig(prev => ({ ...prev, [key]: value }));
@@ -267,6 +308,9 @@ function Dashboard({ user, onLogout }) {
         <div className="card-header">
           <h2 className="card-title" style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
             <FiZap size={16} color="#60a5fa" /> Job Configuration (Nhiều luồng)</h2>
+          <button className="btn-session btn-session-open" onClick={handleTestConcurrency} disabled={testing} style={{ background: '#455a64', borderColor: '#455a64' }}>
+            {testing ? 'Đang test...' : 'Test 7 Link'}
+          </button>
         </div>
         <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
           <span style={{ color: '#94a3b8', fontSize: '13px', minWidth: '90px', marginTop: '10px' }}>Video URLs</span>

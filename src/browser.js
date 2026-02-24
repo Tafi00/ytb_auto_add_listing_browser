@@ -15,21 +15,27 @@ export class Browser {
     this.page = null;
     this.chromeProcess = null;
     this.sessionId = config.sessionId || null;
+    this.debuggingPort = config.debuggingPort || DEBUGGING_PORT;
     this.sessionManager = new SessionManager({ sessionsDir: config.sessionsDir || './sessions' });
   }
 
   async init() {
     log('[Browser] Starting...');
 
-    if (!this.sessionId) {
-      throw new Error('[Browser] sessionId is required.');
-    }
-    if (!this.sessionManager.exists(this.sessionId)) {
-      throw new Error(`[Browser] Session "${this.sessionId}" not found.`);
+    if (!this.sessionId && !this.config.userDataDir) {
+      throw new Error('[Browser] sessionId or userDataDir is required.');
     }
 
-    const userDataDir = this.sessionManager.getBrowserDataDir(this.sessionId);
-    log(`[Browser] Using session: ${this.sessionId}`);
+    let userDataDir = this.config.userDataDir;
+    if (!userDataDir) {
+      if (!this.sessionManager.exists(this.sessionId)) {
+        throw new Error(`[Browser] Session "${this.sessionId}" not found.`);
+      }
+      userDataDir = this.sessionManager.getBrowserDataDir(this.sessionId);
+      log(`[Browser] Using session: ${this.sessionId}`);
+    } else {
+      log(`[Browser] Using custom userDataDir: ${userDataDir}`);
+    }
 
     if (!fs.existsSync(userDataDir)) {
       fs.mkdirSync(userDataDir, { recursive: true });
@@ -44,7 +50,7 @@ export class Browser {
 
     const args = [
       `--user-data-dir=${userDataDir}`,
-      `--remote-debugging-port=${DEBUGGING_PORT}`,
+      `--remote-debugging-port=${this.debuggingPort}`,
       '--disable-features=IsolateOrigins,site-per-process,TranslateUI',
       '--disable-infobars',
       '--disable-background-timer-throttling',
@@ -61,7 +67,10 @@ export class Browser {
     if (this.config.headless) {
       args.push('--headless=new', '--disable-gpu');
     } else {
-      args.push('--window-size=1920,1080');
+      args.push('--window-size=1200,800');
+      if (this.config.windowPosition) {
+        args.push(`--window-position=${this.config.windowPosition.x},${this.config.windowPosition.y}`);
+      }
     }
 
     // Launch Chrome
@@ -73,7 +82,10 @@ export class Browser {
 
     this.chromeProcess.stderr.on('data', (data) => {
       const msg = data.toString().trim();
-      if (msg) log(`[Browser:stderr] ${msg}`);
+      // Lọc bỏ các cảnh báo không quan trọng từ Chrome như GCM endpoint
+      if (msg && !msg.includes('google_apis\\gcm') && !msg.includes('DEPRECATED_ENDPOINT')) {
+        log(`[Browser:stderr] ${msg}`);
+      }
     });
 
     this.chromeProcess.stdout.on('data', (data) => {
@@ -98,7 +110,7 @@ export class Browser {
    */
   async connectForExport() {
     try {
-      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${DEBUGGING_PORT}`);
+      const browser = await chromium.connectOverCDP(`http://127.0.0.1:${this.debuggingPort}`);
       const contexts = browser.contexts();
       if (contexts.length === 0) {
         await browser.close();
@@ -118,12 +130,12 @@ export class Browser {
     const start = Date.now();
     while (Date.now() - start < timeout) {
       try {
-        const res = await fetch(`http://127.0.0.1:${DEBUGGING_PORT}/json/version`);
+        const res = await fetch(`http://127.0.0.1:${this.debuggingPort}/json/version`);
         if (res.ok) return;
-      } catch {}
+      } catch { }
       await new Promise(r => setTimeout(r, 300));
     }
-    throw new Error(`Chrome debugging port ${DEBUGGING_PORT} not ready after ${timeout}ms`);
+    throw new Error(`Chrome debugging port ${this.debuggingPort} not ready after ${timeout}ms`);
   }
 
   _cleanLockFiles(userDataDir) {
@@ -135,12 +147,12 @@ export class Browser {
         if (stat.isSymbolicLink() || stat.isFile() || stat.isSocket()) {
           fs.unlinkSync(lockPath);
         }
-      } catch {}
+      } catch { }
     }
     const defaultDir = path.join(userDataDir, 'Default');
     if (fs.existsSync(defaultDir)) {
       for (const f of ['LOCK', 'lockfile']) {
-        try { fs.unlinkSync(path.join(defaultDir, f)); } catch {}
+        try { fs.unlinkSync(path.join(defaultDir, f)); } catch { }
       }
     }
   }
@@ -177,7 +189,7 @@ export class Browser {
         log(`[Browser] Using Playwright Chromium: ${execPath}`);
         return execPath;
       }
-    } catch {}
+    } catch { }
 
     // Manual search in common cache locations
     const searchDirs = [
@@ -206,7 +218,7 @@ export class Browser {
             return c;
           }
         }
-      } catch {}
+      } catch { }
     }
     return null;
   }
