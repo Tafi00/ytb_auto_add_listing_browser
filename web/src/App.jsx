@@ -52,14 +52,8 @@ const api = {
     return res.json();
   },
 
-  async openBrowser() {
-    const res = await this.fetch('/api/profile/open-browser', { method: 'POST' });
-    return res.json();
-  },
-
-
-  async clearSession() {
-    const res = await this.fetch('/api/profile/session', { method: 'DELETE' });
+  async getWorkerStatus() {
+    const res = await this.fetch('/api/worker-status');
     return res.json();
   },
 
@@ -76,10 +70,7 @@ const api = {
     return res.json();
   },
 
-  async getBrowserStatus() {
-    const res = await this.fetch('/api/browser-status');
-    return res.json();
-  },
+
 
   logout() {
     this.setToken(null);

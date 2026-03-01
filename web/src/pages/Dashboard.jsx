@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
-import { FiGlobe, FiZap, FiEdit3, FiFilm, FiAlertTriangle, FiList, FiMessageSquare, FiFileText, FiUpload, FiRefreshCw, FiTrash2, FiPlus, FiX, FiMonitor } from 'react-icons/fi';
+import { FiGlobe, FiZap, FiEdit3, FiFilm, FiAlertTriangle, FiList, FiFileText, FiPlus, FiX, FiTrash2, FiWifi, FiWifiOff } from 'react-icons/fi';
 import { api } from '../App';
-import RemoteBrowser from './RemoteBrowser';
 
 const BrowserIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="20" height="20">
@@ -20,10 +19,10 @@ const inputStyle = {
 
 function Dashboard({ user, onLogout }) {
   const [profile, setProfile] = useState(null);
-  const [opening, setOpening] = useState(false);
   const [jobUrl, setJobUrl] = useState('');
   const [jobSaved, setJobSaved] = useState(false);
-  const [browserRunning, setBrowserRunning] = useState(false);
+  const [workerConnected, setWorkerConnected] = useState(false);
+  const [workerInfo, setWorkerInfo] = useState([]);
   const [historyStats, setHistoryStats] = useState(null);
   const [clearing, setClearing] = useState(false);
 
@@ -31,7 +30,6 @@ function Dashboard({ user, onLogout }) {
   const [siteConfig, setSiteConfig] = useState(null);
   const [configSaved, setConfigSaved] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [showRemote, setShowRemote] = useState(false);
   const videoInputRef = useRef(null);
   const faviconInputRef = useRef(null);
 
@@ -40,8 +38,8 @@ function Dashboard({ user, onLogout }) {
     loadJobConfig();
     loadSiteConfig();
     loadHistoryStats();
-    checkBrowserStatus();
-    const interval = setInterval(checkBrowserStatus, 5000);
+    checkWorkerStatus();
+    const interval = setInterval(checkWorkerStatus, 5000);
     return () => clearInterval(interval);
   }, []);
 
@@ -77,34 +75,20 @@ function Dashboard({ user, onLogout }) {
     } catch { }
   };
 
-  const checkBrowserStatus = async () => {
-    try { setBrowserRunning((await api.getBrowserStatus()).running); }
-    catch { setBrowserRunning(false); }
-  };
-
-  const handleOpenBrowser = async () => {
-    setOpening(true);
+  const checkWorkerStatus = async () => {
     try {
-      await api.openBrowser();
-      setTimeout(async () => {
-        for (let i = 0; i < 10; i++) {
-          await checkBrowserStatus();
-          if (browserRunning) break;
-          await new Promise(r => setTimeout(r, 1000));
-        }
-      }, 2000);
-    } catch (err) { alert('Failed: ' + err.message); }
-    finally { setTimeout(() => setOpening(false), 2000); }
+      const res = await api.fetch('/api/worker-status');
+      const data = await res.json();
+      setWorkerConnected(data.connected);
+      setWorkerInfo(data.workers || []);
+    } catch {
+      setWorkerConnected(false);
+      setWorkerInfo([]);
+    }
   };
 
   const handleSaveJobConfig = async () => {
     try { await api.saveJobConfig(jobUrl); setJobSaved(true); setTimeout(() => setJobSaved(false), 2000); }
-    catch (err) { alert('Failed: ' + err.message); }
-  };
-
-  const handleClearSession = async () => {
-    if (!window.confirm('Clear all session data? This cannot be undone.')) return;
-    try { await api.clearSession(); loadProfile(); }
     catch (err) { alert('Failed: ' + err.message); }
   };
 
@@ -129,7 +113,7 @@ function Dashboard({ user, onLogout }) {
         });
         const data = await res.json();
         if (!res.ok) throw new Error(data.error || 'Request failed');
-        return data; // Contains affUrl or similar
+        return data;
       }));
 
       const summary = results.map((r, i) => {
@@ -201,7 +185,6 @@ function Dashboard({ user, onLogout }) {
       const data = await res.json();
       if (!res.ok) throw new Error(data.error);
       updateConfig('guideVideoUrl', data.videoUrl);
-      // Auto-save
       const saveRes = await api.fetch('/api/site-config', {
         method: 'PUT',
         body: JSON.stringify({ ...siteConfig, guideVideoUrl: data.videoUrl }),
@@ -267,40 +250,47 @@ function Dashboard({ user, onLogout }) {
         </div>
       </header>
 
-      {/* Chrome Profile */}
+      {/* Worker Status */}
       <div className="card">
         <div className="card-header">
           <h2 className="card-title" style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
-            <div style={{ width: '20px', height: '20px', color: '#60a5fa' }}><BrowserIcon /></div>
-            Chrome Profile
+            {workerConnected
+              ? <FiWifi size={18} color="#4ade80" />
+              : <FiWifiOff size={18} color="#f87171" />
+            }
+            Worker Status
           </h2>
         </div>
-        {profile ? (
-          <div className="profile-card">
-            <div className="profile-info">
-              <div className="profile-name">
-                <span className="session-dot" style={{
-                  background: browserRunning ? '#4ade80' : '#f87171',
-                  boxShadow: browserRunning ? '0 0 6px rgba(74,222,128,0.4)' : '0 0 6px rgba(248,113,113,0.4)'
-                }} />
-                {profile.id}
-                <span style={{ fontSize: '12px', color: browserRunning ? '#4ade80' : '#94a3b8', marginLeft: '8px' }}>
-                  {browserRunning ? 'Browser running' : 'Browser stopped'}
+        <div className="profile-card">
+          <div className="profile-info">
+            <div className="profile-name">
+              <span className="session-dot" style={{
+                background: workerConnected ? '#4ade80' : '#f87171',
+                boxShadow: workerConnected ? '0 0 6px rgba(74,222,128,0.4)' : '0 0 6px rgba(248,113,113,0.4)'
+              }} />
+              {workerConnected ? `${workerInfo.length} worker(s) kết nối` : 'Chưa có worker kết nối'}
+              <span style={{ fontSize: '12px', color: workerConnected ? '#4ade80' : '#94a3b8', marginLeft: '8px' }}>
+                {workerConnected ? 'Online' : 'Offline'}
+              </span>
+            </div>
+            {workerInfo.length > 0 && (
+              <div className="profile-meta">
+                {workerInfo.map((w, i) => (
+                  <span key={i} style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>
+                    Worker {i + 1}: {w.urls?.length || 0} tabs · Kết nối lúc {new Date(w.connectedAt).toLocaleTimeString()}
+                  </span>
+                ))}
+              </div>
+            )}
+            {!workerConnected && (
+              <div className="profile-meta" style={{ marginTop: '8px' }}>
+                <span style={{ color: '#f59e0b', fontSize: '12px' }}>
+                  💡 Chạy worker trên máy Windows: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>npm run worker</code>
                 </span>
               </div>
-              <div className="profile-meta">
-                {profile.description && <span>{profile.description} · </span>}
-                Created {new Date(profile.createdAt).toLocaleDateString()}
-              </div>
-            </div>
-            <div className="profile-actions">
-              <button className="btn-open-browser" onClick={handleOpenBrowser} disabled={opening}>
-                {opening ? 'Opening...' : 'Open Browser'}
-              </button>
-              <button className="btn-session btn-session-delete" onClick={handleClearSession}>Clear Session</button>
-            </div>
+            )}
           </div>
-        ) : <p className="empty">Loading...</p>}
+        </div>
       </div>
 
       {/* Job Config */}
@@ -315,7 +305,7 @@ function Dashboard({ user, onLogout }) {
         <div style={{ display: 'flex', gap: '8px', alignItems: 'flex-start' }}>
           <span style={{ color: '#94a3b8', fontSize: '13px', minWidth: '90px', marginTop: '10px' }}>Video URLs</span>
           <textarea value={jobUrl} onChange={(e) => setJobUrl(e.target.value)}
-            placeholder="https://studio.youtube.com/video/.../edit&#10;https://studio.youtube.com/video/.../edit&#10;(Mỗi link 1 dòng)"
+            placeholder={"https://studio.youtube.com/video/.../edit\nhttps://studio.youtube.com/video/.../edit\n(Mỗi link 1 dòng)"}
             style={{ ...inputStyle, flex: 1, resize: 'vertical', minHeight: '80px' }} />
           <button className="btn-session btn-session-open"
             style={{ borderColor: 'rgba(52,211,153,0.4)', color: '#34d399', whiteSpace: 'nowrap' }}
@@ -347,38 +337,6 @@ function Dashboard({ user, onLogout }) {
           )}
         </div>
       </div>
-
-      {/* Remote Browser Button */}
-      <div className="card" style={{ marginTop: '16px' }}>
-        <button className="btn-session btn-session-open" onClick={() => setShowRemote(true)}
-          style={{ width: '100%', padding: '14px', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: '8px', fontSize: '14px' }}>
-          <FiMonitor size={16} /> Mở Remote Browser
-        </button>
-      </div>
-
-      {/* Remote Browser Dialog */}
-      {showRemote && (
-        <div style={{
-          position: 'fixed', top: 0, left: 0, right: 0, bottom: 0, zIndex: 9999,
-          background: '#0a0a0a', display: 'flex', flexDirection: 'column', overflow: 'hidden',
-        }}>
-          <div style={{
-            padding: '8px 16px', borderBottom: '1px solid #252525', display: 'flex',
-            alignItems: 'center', justifyContent: 'space-between', flexShrink: 0,
-          }}>
-            <span style={{ color: '#ccc', fontSize: '14px', fontWeight: 600, display: 'flex', alignItems: 'center', gap: '8px' }}>
-              <FiMonitor size={16} color="#60a5fa" /> Remote Browser
-            </span>
-            <button className="btn-session btn-session-delete" onClick={() => setShowRemote(false)}
-              style={{ padding: '6px 14px', display: 'flex', alignItems: 'center', gap: '4px' }}>
-              <FiX size={14} /> Đóng
-            </button>
-          </div>
-          <div style={{ flex: 1, minHeight: 0, padding: '10px 16px 12px', display: 'flex', flexDirection: 'column' }}>
-            <RemoteBrowser />
-          </div>
-        </div>
-      )}
 
       {/* Site Config */}
       {siteConfig && (

@@ -1,4 +1,5 @@
 // Admin Dashboard - Single Profile Server
+// Architecture: Linux Server + Windows Worker
 
 // Prevent unhandled errors from crashing the entire server
 process.on('uncaughtException', (err) => {
@@ -14,7 +15,6 @@ import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import helmet from 'helmet';
 import jwt from 'jsonwebtoken';
-import { spawn } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -57,9 +57,6 @@ app.use(cors(allowedOrigins ? {
 // Giới hạn body size để chống abuse (10MB cho upload, 1MB cho JSON)
 app.use(express.json({ limit: '1mb' }));
 
-// Rate limit chỉ cho public API get-affiliate (chống spam)
-// Các API admin đã có auth bảo vệ, không cần rate limit
-
 // Rate limit riêng cho login (chặt hơn)
 const loginLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
@@ -67,16 +64,6 @@ const loginLimiter = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts, please try again later.' },
-});
-
-// Rate limit riêng cho public API get-affiliate (chống spam)
-const affiliateLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 phút
-  max: 5, // tối đa 5 request / IP / phút
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'Bạn gửi quá nhiều yêu cầu. Vui lòng đợi 1 phút.' },
-  keyGenerator: (req) => req.headers['x-forwarded-for'] || req.socket.remoteAddress,
 });
 
 // Serve static files from web/dist in production
@@ -89,6 +76,7 @@ const PORT = process.env.PORT || 3002;
 const JWT_SECRET = process.env.JWT_SECRET || 'default-secret-change-me';
 const ADMIN_USERNAME = process.env.ADMIN_USERNAME || 'admin';
 const ADMIN_PASSWORD = process.env.ADMIN_PASSWORD || 'admin123';
+const WORKER_AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN || 'default-worker-token';
 
 // Cảnh báo bảo mật khi dùng giá trị mặc định
 if (JWT_SECRET === 'default-secret-change-me') {
@@ -96,6 +84,9 @@ if (JWT_SECRET === 'default-secret-change-me') {
 }
 if (ADMIN_PASSWORD === 'admin123') {
   console.warn('⚠️  [Security] ADMIN_PASSWORD đang dùng giá trị mặc định. Hãy đổi trong .env!');
+}
+if (WORKER_AUTH_TOKEN === 'default-worker-token') {
+  console.warn('⚠️  [Security] WORKER_AUTH_TOKEN đang dùng giá trị mặc định. Hãy đổi trong .env!');
 }
 
 // Auth middleware
@@ -126,15 +117,17 @@ app.get('/api/verify', auth, (req, res) => {
   res.json({ valid: true, username: req.user.username });
 });
 
-// ==================== Job Queue & Core Logic ====================
+// ==================== Worker Management ====================
 
-// Simple sequential queue
+// Connected workers (Windows machines)
+const connectedWorkers = new Map(); // id -> { ws, info, busy }
+
+// Simple sequential queue per tab
 class JobQueue {
   constructor() {
     this.queue = [];
     this.running = false;
   }
-  // Total pending = running (0 or 1) + waiting in queue
   get pending() {
     return (this.running ? 1 : 0) + this.queue.length;
   }
@@ -155,25 +148,8 @@ class JobQueue {
 }
 
 // Use per-tab Job Queues to allow concurrent processing across tabs
-// while maintaining strict sequential execution within each tab
 const tabQueues = new Map();
 let globalJobCounter = 0;
-
-let activeWorkers = [];
-
-// Clean up dead workers
-setInterval(() => {
-  activeWorkers = activeWorkers.filter(w => {
-    try {
-      if (w.pid) {
-        process.kill(w.pid, 0); // Check if process is still running
-      }
-      return true;
-    } catch {
-      return false; // Process dead
-    }
-  });
-}, 5000);
 
 function getQueueForTab(targetUrl) {
   if (!tabQueues.has(targetUrl)) {
@@ -182,256 +158,42 @@ function getQueueForTab(targetUrl) {
   return tabQueues.get(targetUrl);
 }
 
-// Cache playwright module at top level for faster access
-let _playwrightChromium = null;
-async function getPlaywright() {
-  if (!_playwrightChromium) {
-    const pw = await import('playwright');
-    _playwrightChromium = pw.chromium;
+// Get an available worker
+function getAvailableWorker(targetUrl) {
+  // Try to find a worker that handles this specific URL
+  for (const [id, worker] of connectedWorkers) {
+    if (worker.info?.urls?.includes(targetUrl)) return worker;
   }
-  return _playwrightChromium;
+  // Fallback: return first connected worker
+  for (const [id, worker] of connectedWorkers) {
+    return worker;
+  }
+  return null;
 }
 
-// Connect to Chrome and get page
-async function getChromePage(targetUrl) {
-  const chromium = await getPlaywright();
+// Check if any worker is connected
+const isWorkerConnected = () => connectedWorkers.size > 0;
 
-  const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
-  let worker = targetUrl ? activeWorkers.find(w => w.url === targetUrl || w.url.startsWith(targetBase)) : null;
+// Send a job to worker and wait for result
+function sendJobToWorker(worker, jobId, targetUrl, productUrl) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      delete worker.pendingJobs[jobId];
+      reject(new Error('Worker timeout (120s)'));
+    }, 120000);
 
-  if (!worker) {
-    if (activeWorkers.length === 0) throw new Error('No browser running.');
-    worker = activeWorkers[0]; // fallback
-  }
+    worker.pendingJobs[jobId] = { resolve, reject, timeout };
 
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
-  const contexts = browser.contexts();
-  if (contexts.length === 0) {
-    await browser.close();
-    throw new Error(`No browser context found on port ${worker.port}. Reopen browser.`);
-  }
-  const context = contexts[0];
-  const pages = context.pages();
-
-  let page;
-  if (targetUrl) {
-    page = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetBase));
-  }
-
-  if (!page) {
-    page = pages[0]; // Since 1 worker = 1 target url, just return its first page
-  }
-  return { browser, context, page };
-}
-
-// Add product and save (auto-removes existing product before adding)
-// Returns a promise that resolves when save is complete
-async function addProduct(page, productUrl) {
-  // Wait for the Products row to at least be attached so we know the page has rendered
-  const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content)').filter({
-    hasText: /(Sản phẩm|Products|tagged product|sản phẩm đã gắn)/i
-  }).first();
-
-  // Give the page a moment to render in case the edit panel is already open
-  const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit');
-
-  // Try to wait for either the edit button or the products row to appear
-  try {
-    await Promise.race([
-      editBtn.waitFor({ state: 'attached', timeout: 8000 }),
-      btn.waitFor({ state: 'attached', timeout: 8000 })
-    ]);
-  } catch (e) {
-    // Ignore timeout, we'll let the individual checks handle it
-  }
-
-  const editVisible = await editBtn.isVisible().catch(() => false);
-  if (!editVisible) {
-    await btn.waitFor({ state: 'attached', timeout: 15000 });
-    await btn.evaluate(b => b.click()).catch(async () => {
-      await btn.click({ force: true }).catch(() => { });
-    });
-    console.log('[Job] Clicked Products row (matched by regex)');
-    // Wait for slide-in animation or UI update to settle before clicking edit
-    await page.waitForTimeout(800);
-  }
-
-  // Use state: 'attached' and evaluate click to completely bypass Playwright's visibility/overlap checks
-  await editBtn.waitFor({ state: 'attached', timeout: 10000 });
-  await editBtn.evaluate(b => b.click()).catch(async () => {
-    await editBtn.click({ force: true }).catch(() => { });
+    worker.ws.send(JSON.stringify({
+      type: 'execute-job',
+      jobId,
+      targetUrl,
+      productUrl,
+    }));
   });
-  console.log('[Job] Clicked edit button');
-
-  // Wait for product picker to fully load
-  const searchInput = page.locator('input#search-input.search-input');
-  await searchInput.waitFor({ state: 'visible', timeout: 10000 });
-
-  // Step 1: Fill search input and press Enter FIRST (start searching immediately)
-  await searchInput.click();
-  await searchInput.fill(productUrl);
-  console.log(`[Job] Filled product URL: ${productUrl}`);
-
-  await searchInput.press('Enter');
-  console.log('[Job] Pressed Enter to search');
-
-  // Step 2: While search is loading, remove existing products in parallel
-  try {
-    const allProducts = page.locator('ytshopping-product-picker-selected-product ytshopping-product');
-    let productCount = await allProducts.count().catch(() => 0);
-    if (productCount > 0) {
-      console.log(`[Job] Found ${productCount} existing product(s), removing while search loads...`);
-      // Remove products one by one from the first element (DOM updates after each removal)
-      while (productCount > 0) {
-        const product = allProducts.first();
-        const isVisible = await product.isVisible().catch(() => false);
-        if (!isVisible) break;
-        await product.hover();
-        const deleteBtn = page.locator('ytcp-icon-button.delete-product-button[aria-label="Delete"]').first();
-        await deleteBtn.waitFor({ state: 'visible', timeout: 10000 });
-        await deleteBtn.click();
-        console.log(`[Job] Removed product (${productCount} remaining before this removal)`);
-        // Wait briefly for DOM to update after removal
-        await page.waitForTimeout(300);
-        productCount = await allProducts.count().catch(() => 0);
-      }
-      console.log('[Job] All existing products removed');
-    }
-  } catch (e) {
-    console.log(`[Job] Warning: could not remove existing products: ${e.message}`);
-  }
-
-  // Step 3: Wait for search results (product tag button)
-  const tagBtn = page.locator('ytcp-icon-button.tag-product-button[aria-label="Tag"]').first();
-  try {
-    await tagBtn.waitFor({ state: 'visible', timeout: 8000 });
-  } catch {
-    console.log('[Job] Product not found within 8s, reloading page...');
-    await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
-    throw new Error('Sản phẩm này không gắn giỏ được.');
-  }
-
-  // Check if banner-title has error message (product not eligible for shopping cart)
-  const bannerText = await page.evaluate(() => {
-    const el = document.querySelector(".banner-title > ytcp-msg");
-    return el ? el.textContent : null;
-  }).catch(() => null);
-
-  if (bannerText !== null) {
-    console.log(`[Job] Banner message detected: "${bannerText}", product cannot be added to cart. Reloading...`);
-    await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
-    throw new Error('Sản phẩm này không gắn giỏ được.');
-  }
-
-  await tagBtn.click();
-  console.log('[Job] Clicked Tag button');
-
-  const nextBtn = page.locator('ytcp-button#picker-next-button button').first();
-  await nextBtn.waitFor({ state: 'visible', timeout: 10000 });
-  await nextBtn.click();
-  console.log('[Job] Clicked Next button');
-
-  const doneBtn = page.locator('button[aria-label="Done"]:has(div.ytcpButtonShapeImpl__button-text-content:text("Done"))').first();
-  await doneBtn.waitFor({ state: 'visible', timeout: 10000 });
-  await doneBtn.click();
-  console.log('[Job] Clicked Done button');
-
-  const saveBtn = page.locator('ytcp-button#save button').first();
-  await saveBtn.waitFor({ state: 'attached', timeout: 10000 });
-
-  // Give UI a moment to update button state
-  await page.waitForTimeout(500);
-
-  const isDisabled = await saveBtn.evaluate(el => el.disabled || el.getAttribute('aria-disabled') === 'true').catch(() => false);
-
-  if (isDisabled) {
-    console.log('[Job] Save button is disabled (no net changes made to products). Proceeding directly.');
-  } else {
-    // Normal scroll to view and click
-    await saveBtn.evaluate(b => b.scrollIntoView()).catch(() => { });
-    await saveBtn.click({ force: true }).catch(async () => {
-      await saveBtn.evaluate(b => b.click());
-    });
-    console.log('[Job] Clicked Save button');
-    // Wait 1.5s after save for YouTube to update public page
-    await page.waitForTimeout(1500);
-    console.log('[Job] Save clicked, proceeding to fetch after 1.5s');
-  }
-} // End addProduct
-
-// Decode unicode escapes helper (module-level for reuse)
-const decodeUnicode = (str) => str.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
-
-// Fetch affiliate URL from public YouTube page
-// Optimized: reduced retry delay, faster parsing
-async function fetchAffiliateUrl(videoUrl) {
-  const videoIdMatch = videoUrl.match(/\/video\/([^/]+)\//);
-  if (!videoIdMatch) throw new Error('Could not extract video ID from URL');
-  const videoId = videoIdMatch[1];
-  const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  console.log(`[Job] Fetching public video: ${publicUrl}`);
-
-  let affiliateUrl = null;
-  let metadata = { title: '', price: '', image: '' };
-
-  // Retry up to 3 times (first immediately, then 200ms delay)
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    if (attempt > 1) {
-      console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl retrying after 200ms...`);
-      await new Promise(r => setTimeout(r, 200));
-    }
-
-    const fetchStart = Date.now();
-    const response = await fetch(publicUrl, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Accept': 'text/html',
-      }
-    });
-    const pageContent = await response.text();
-    console.log(`[Job] Fetched page in ${Date.now() - fetchStart}ms (${(pageContent.length / 1024).toFixed(0)}KB)`);
-
-    // Extract affiliate URL (Shopee or Lazada links)
-    // Take FIRST match — old products are removed so first match is the correct one
-    const allUrlMatches = [...pageContent.matchAll(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/g)];
-    const urlMatch = allUrlMatches.length > 0 ? allUrlMatches[0] : null;
-    if (urlMatch) {
-      affiliateUrl = decodeUnicode(urlMatch[1]);
-
-      // Extract product metadata from productListItemRenderer
-      // Take FIRST product block — old products are removed so first is correct
-      const blockMarker = 'productListItemRenderer":{"title"';
-      const blockStart = pageContent.indexOf(blockMarker);
-      if (blockStart !== -1) {
-        const block = pageContent.substring(blockStart, blockStart + 5000);
-        console.log('[Job] Product block (first, 600 chars):', block.substring(0, 600));
-
-        const titleMatch = block.match(/simpleText":"([^"]+)"/);
-        if (titleMatch) metadata.title = decodeUnicode(titleMatch[1]);
-
-        const priceMatch = block.match(/([0-9][0-9.,]+)\s*₫/) || block.match(/₫\s*([0-9][0-9,.]+)/);
-        if (priceMatch) metadata.price = decodeUnicode(priceMatch[1]) + ' ₫';
-
-        const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
-          .map(m => decodeUnicode(m[1]));
-        if (thumbUrls.length > 0) metadata.image = thumbUrls[0];
-      }
-      break;
-    }
-
-    console.log(`[Job] Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link`);
-  }
-
-  console.log('[Job] Extracted metadata:', JSON.stringify(metadata));
-  return { affiliateUrl, metadata };
 }
 
-// removeProduct is no longer needed — removal is integrated into addProduct
-
-// ==================== Profile API ====================
-
-// History stats (now backed by SQLite via history-db.js)
+// ==================== Profile & Config API ====================
 
 // Job config file path
 const jobConfigPath = path.resolve(__dirname, '../config/job-config.json');
@@ -449,47 +211,54 @@ const saveJobConfig = (config) => {
   fs.writeFileSync(jobConfigPath, JSON.stringify(config, null, 2));
 };
 
-const CHROME_DEBUG_PORT = 19222;
-
-const isChromeRunning = async () => {
-  if (activeWorkers.length === 0) return false;
-  // Check if at least one worker is alive
-  for (const w of activeWorkers) {
-    try {
-      const res = await fetch(`http://127.0.0.1:${w.port}/json/version`, { signal: AbortSignal.timeout(1000) });
-      if (res.ok) return true;
-    } catch { }
-  }
-  return false;
-};
-
 // Get job config
 app.get('/api/job-config', auth, (_, res) => {
   res.json(loadJobConfig());
 });
 
-// Save job config
+// Save job config  
 app.put('/api/job-config', auth, async (req, res) => {
   const { url, productUrl } = req.body;
   if (!url) return res.status(400).json({ error: 'URL is required' });
   const config = { url, productUrl: productUrl || '', updatedAt: new Date().toISOString() };
   saveJobConfig(config);
 
+  // Notify all workers about new config
+  const urlPattern = /https?:\/\/[^\s]+/g;
+  const urls = url.match(urlPattern) || [];
+  for (const [id, worker] of connectedWorkers) {
+    try {
+      worker.ws.send(JSON.stringify({ type: 'config-update', urls }));
+    } catch { }
+  }
+
   res.json({ message: 'Config saved', ...config });
 });
 
-// Check browser status
-app.get('/api/browser-status', auth, async (_, res) => {
-  const running = await isChromeRunning();
-  res.json({ running });
+// Worker status (replaces browser-status)
+app.get('/api/worker-status', auth, async (_, res) => {
+  const workers = [];
+  for (const [id, worker] of connectedWorkers) {
+    workers.push({
+      id,
+      connectedAt: worker.connectedAt,
+      urls: worker.info?.urls || [],
+      busy: worker.busy || false,
+    });
+  }
+  res.json({ connected: connectedWorkers.size > 0, workers });
 });
 
-// History stats - get total count
+// Keep backward compatibility
+app.get('/api/browser-status', auth, async (_, res) => {
+  res.json({ running: isWorkerConnected() });
+});
+
+// History stats
 app.get('/api/history-stats', auth, (_, res) => {
   res.json({ totalLinks: getTotalLinks() });
 });
 
-// History stats - reset (delete all)
 app.delete('/api/history-stats', auth, (_, res) => {
   clearAllHistory();
   res.json({ message: 'Đã xóa toàn bộ lịch sử' });
@@ -532,31 +301,28 @@ function containsMultipleLinks(input) {
   return matches && matches.length > 1;
 }
 
-// Public API: get affiliate URL by product URL (uses Video URL from config)
+// Public API: get affiliate URL by product URL (via Worker)
 app.post('/api/get-affiliate', async (req, res) => {
   const { productUrl, clientId } = req.body;
   if (!productUrl || typeof productUrl !== 'string') return res.status(400).json({ error: 'productUrl is required' });
 
-  // Sanitize input - giới hạn độ dài
+  // Sanitize input
   const sanitizedUrl = productUrl.trim().slice(0, 2048);
   if (sanitizedUrl.length === 0) return res.status(400).json({ error: 'productUrl is required' });
 
-  // Validate clientId nếu có
   if (clientId && (typeof clientId !== 'string' || clientId.length > 128)) {
     return res.status(400).json({ error: 'clientId không hợp lệ' });
   }
 
-  // Check multiple links
   if (containsMultipleLinks(sanitizedUrl)) {
     return res.status(400).json({ error: 'Mỗi lần chỉ gửi 1 link' });
   }
 
-  // Validate URL format immediately
   if (!isValidProductUrl(sanitizedUrl)) {
     return res.status(400).json({ error: 'Link sản phẩm không hợp lệ. Vui lòng nhập link Shopee hoặc Lazada.' });
   }
 
-  // Rate limit by clientId + IP combo
+  // Rate limit
   const ip = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
   const rateLimitKey = clientId ? `${clientId}_${ip}` : ip;
   if (!req.body.bypassRateLimit) {
@@ -575,8 +341,7 @@ app.post('/api/get-affiliate', async (req, res) => {
   const urls = config.url.match(urlPattern) || [];
   if (urls.length === 0) return res.status(400).json({ error: 'No Video URL configured in admin' });
 
-  const running = await isChromeRunning();
-  if (!running) return res.status(400).json({ error: 'Browser is not running' });
+  if (!isWorkerConnected()) return res.status(400).json({ error: 'Worker chưa kết nối. Vui lòng chạy worker trên máy Windows.' });
 
   try {
     // Select the tab (URL) that currently has the shortest queue
@@ -591,8 +356,8 @@ app.post('/api/get-affiliate', async (req, res) => {
       }
     }
 
-    // We update the counter just for logging/tracking purposes if needed
     globalJobCounter++;
+    const jobId = `job-${globalJobCounter}-${Date.now()}`;
 
     const tabQueue = getQueueForTab(targetUrl);
     const queuePos = tabQueue.pending;
@@ -602,71 +367,43 @@ app.post('/api/get-affiliate', async (req, res) => {
     const result = await tabQueue.push(async () => {
       const jobStart = Date.now();
       console.log(`[API] Job START for product: ${sanitizedUrl} on tab: ${targetUrl}`);
-      const { browser, page } = await getChromePage(targetUrl);
-      try {
-        // CRITICAL: Bring the tab to the front so Chrome renders it properly
-        // This prevents "Element is not visible" errors for background tabs
-        await page.bringToFront().catch(() => { });
-        // Wait a tiny bit for the browser to paint the newly active tab
-        await page.waitForTimeout(300);
 
-        // addProduct now auto-removes existing product before adding
-        await addProduct(page, sanitizedUrl);
-        const addProductTime = Date.now() - jobStart;
-        console.log(`[API] addProduct took ${addProductTime}ms for product: ${sanitizedUrl}`);
+      const worker = getAvailableWorker(targetUrl);
+      if (!worker) throw new Error('Worker chưa kết nối');
 
-        // Start fetching affiliate URL
-        // After save is clicked and confirmed, the product is committed on YouTube's side.
-        // We can now fetch the public page to get the affiliate link.
-        const fetchStart = Date.now();
-        const data = await fetchAffiliateUrl(targetUrl);
-        console.log(`[API] fetchAffiliateUrl took ${Date.now() - fetchStart}ms for product: ${sanitizedUrl}`);
-        console.log(`[API] Total job time: ${Date.now() - jobStart}ms`);
-        console.log(`[API] Affiliate URL for ${sanitizedUrl}: ${data.affiliateUrl}`);
+      const data = await sendJobToWorker(worker, jobId, targetUrl, sanitizedUrl);
+      console.log(`[API] Total job time: ${Date.now() - jobStart}ms`);
+      console.log(`[API] Affiliate URL for ${sanitizedUrl}: ${data.affiliateUrl}`);
 
-        // Verify: ensure affiliate URL contains the expected product domain
-        if (data.affiliateUrl) {
-          const productDomain = sanitizedUrl.includes('shopee') ? 'shopee' :
-            sanitizedUrl.includes('lazada') ? 'lazada' : null;
-          if (productDomain && !data.affiliateUrl.toLowerCase().includes(productDomain)) {
-            console.warn(`[API] WARNING: Product domain mismatch! Expected ${productDomain} in affiliate URL but got: ${data.affiliateUrl}`);
-          }
+      // Verify domain match
+      if (data.affiliateUrl) {
+        const productDomain = sanitizedUrl.includes('shopee') ? 'shopee' :
+          sanitizedUrl.includes('lazada') ? 'lazada' : null;
+        if (productDomain && !data.affiliateUrl.toLowerCase().includes(productDomain)) {
+          console.warn(`[API] WARNING: Product domain mismatch! Expected ${productDomain} in affiliate URL but got: ${data.affiliateUrl}`);
         }
-
-        res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
-
-        // Save history to SQLite on success (fire-and-forget, don't block response)
-        if (data.affiliateUrl) {
-          try {
-            addHistory(clientId || 'anonymous', {
-              productUrl: sanitizedUrl,
-              affiliateUrl: data.affiliateUrl,
-              metadata: data.metadata || {},
-              createdAt: new Date().toISOString(),
-            });
-          } catch (histErr) {
-            console.log(`[API] History save error: ${histErr.message}`);
-          }
-        }
-
-        await browser.close().catch(() => { });
-        return data;
-      } catch (e) {
-        // Reload page to reset state after error
-        console.log(`[API] Error during job for product ${sanitizedUrl}: ${e.message}`);
-        try {
-          await page.reload({ waitUntil: 'commit', timeout: 15000 });
-          console.log('[API] Page reloaded after error');
-        } catch (reloadErr) {
-          console.log(`[API] Failed to reload page: ${reloadErr.message}`);
-        }
-        await browser.close().catch(() => { });
-        throw e;
       }
+
+      res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
+
+      // Save history to SQLite on success
+      if (data.affiliateUrl) {
+        try {
+          addHistory(clientId || 'anonymous', {
+            productUrl: sanitizedUrl,
+            affiliateUrl: data.affiliateUrl,
+            metadata: data.metadata || {},
+            createdAt: new Date().toISOString(),
+          });
+        } catch (histErr) {
+          console.log(`[API] History save error: ${histErr.message}`);
+        }
+      }
+
+      return data;
     });
   } catch (e) {
     if (!res.headersSent) {
-      // Không leak internal error ra ngoài cho public API ngoại trừ các lỗi đã biết
       console.error(`[API] get-affiliate error: ${e.message}`);
       const safeMessage = e.message.includes('không gắn giỏ')
         ? e.message
@@ -684,404 +421,6 @@ app.get('/api/profile', auth, (_, res) => {
     const meta = sessionManager.getMetadata(PROFILE_ID);
     if (!meta) return res.status(404).json({ error: 'Profile not found' });
     res.json(meta);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-async function launchBrowsersAndStoreWorkers(urls) {
-  // Kill existing workers before opening new ones
-  for (const w of activeWorkers) {
-    try { process.kill(w.pid); console.log(`[Server] Killed worker ${w.pid} before relaunch`); } catch { }
-
-    // Attempt to forcefully clean up worker folders to prevent lock/busy issues
-    try {
-      const wDir = sessionManager.getSessionDir(w.sessionId);
-      if (fs.existsSync(wDir)) {
-        fs.rmSync(wDir, { recursive: true, force: true, maxRetries: 3, retryDelay: 100 });
-      }
-    } catch (e) {
-      console.log(`[Server] Could not delete old worker dir: ${e.message}`);
-    }
-  }
-  activeWorkers = [];
-
-  // Quick wait for processes to exit
-  await new Promise(r => setTimeout(r, 1000));
-
-  const browserScript = path.resolve(__dirname, 'open-browser.js');
-  let startPort = 19222;
-  let x = 50, y = 50;
-
-  for (let i = 0; i < urls.length; i++) {
-    const url = urls[i];
-    const port = startPort + i;
-    const workerSessionId = `worker-${i}`;
-
-    // Auto clone session for worker
-    try {
-      if (sessionManager.exists(workerSessionId)) {
-        sessionManager.delete(workerSessionId);
-        await new Promise(r => setTimeout(r, 200));
-      }
-
-      // Clean up locks in the default profile before cloning so it doesn't carry over
-      const srcDataDir = sessionManager.getBrowserDataDir(PROFILE_ID);
-      try { fs.rmSync(path.join(srcDataDir, 'SingletonLock'), { force: true }); } catch { }
-      try { fs.rmSync(path.join(srcDataDir, 'SingletonCookie'), { force: true }); } catch { }
-      try { fs.rmSync(path.join(srcDataDir, 'SingletonSocket'), { force: true }); } catch { }
-
-      sessionManager.clone(PROFILE_ID, workerSessionId);
-
-      // Clean up locks in the cloned worker profile just in case
-      const destDataDir = sessionManager.getBrowserDataDir(workerSessionId);
-      try { fs.rmSync(path.join(destDataDir, 'SingletonLock'), { force: true }); } catch { }
-      try { fs.rmSync(path.join(destDataDir, 'SingletonCookie'), { force: true }); } catch { }
-      try { fs.rmSync(path.join(destDataDir, 'SingletonSocket'), { force: true }); } catch { }
-    } catch (e) {
-      console.error(`[Server] Failed to prepare session for ${workerSessionId}:`, e.message);
-    }
-
-    const child = spawn('node', [
-      browserScript,
-      `--session=${workerSessionId}`,
-      `--port=${port}`,
-      `--position=${x},${y}`,
-      url
-    ], {
-      cwd: path.resolve(__dirname, '..'),
-      env: { ...process.env, SESSION_ID: workerSessionId },
-      detached: true,
-      stdio: 'ignore', // Keep server clean
-    });
-
-    child.unref(); // Detach deeply
-    activeWorkers.push({ pid: child.pid, port, url, sessionId: workerSessionId, process: child });
-    console.log(`[Server] Worker ${i} opened on port ${port} for URL: ${url}`);
-    x += 50; y += 30; // Stagger UI
-
-    // Give browser time to spin up
-    await new Promise(r => setTimeout(r, 500));
-  }
-}
-
-// Open browser
-app.post('/api/profile/open-browser', auth, async (req, res) => {
-  const jobConfig = loadJobConfig();
-  // Collect all URLs to pass to open-browser script
-  let allUrls = ['about:blank'];
-  if (jobConfig.url) {
-    const urlPattern = /https?:\/\/[^\s]+/g;
-    const matches = jobConfig.url.match(urlPattern);
-    if (matches && matches.length > 0) {
-      allUrls = matches;
-    }
-  }
-
-  await launchBrowsersAndStoreWorkers(allUrls);
-
-  res.json({ message: 'Browsers opened', tabs: allUrls.length });
-});
-
-// Clear session data (cookies, localStorage, browser-data)
-app.delete('/api/profile/session', auth, (req, res) => {
-  try {
-    // Kill existing workers before clearing session data
-    for (const w of activeWorkers) {
-      try { process.kill(w.pid); console.log(`[Server] Killed worker ${w.pid} before clearing session`); } catch { }
-    }
-    activeWorkers = [];
-
-    // Remove session.json
-    const sessionFile = sessionManager.getSessionFilePath(PROFILE_ID);
-    if (fs.existsSync(sessionFile)) fs.unlinkSync(sessionFile);
-
-    // Remove browser-data
-    const browserDataDir = sessionManager.getBrowserDataDir(PROFILE_ID);
-    if (fs.existsSync(browserDataDir)) {
-      fs.rmSync(browserDataDir, { recursive: true, force: true });
-      fs.mkdirSync(browserDataDir, { recursive: true });
-    }
-
-    sessionManager.updateMetadata(PROFILE_ID, { lastUsedAt: null });
-    res.json({ message: 'Session cleared' });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// ==================== Remote Browser Control ====================
-
-// Lightweight page info (URL + title only, no screenshot)
-// Track which tab (by CDP targetId) is currently active for remote control
-let activeTargetId = null;
-
-// Helper: get all page targets from CDP across all active workers
-async function getCdpPageTargets() {
-  const allTargets = [];
-  for (const w of activeWorkers) {
-    try {
-      const targetsRes = await fetch(`http://127.0.0.1:${w.port}/json`);
-      const targets = await targetsRes.json();
-      const pages = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type)).map(t => ({
-        ...t,
-        port: w.port,
-        workerId: w.sessionId
-      }));
-      allTargets.push(...pages);
-    } catch (e) {
-      // Worker might not have booted yet, ignore
-    }
-  }
-  return allTargets;
-}
-
-// Helper: get the active target (or fall back to first page)
-async function getActiveTarget() {
-  const pages = await getCdpPageTargets();
-  if (pages.length === 0) return null;
-  if (activeTargetId) {
-    const found = pages.find(t => t.id === activeTargetId);
-    if (found) return found;
-  }
-  activeTargetId = pages[0].id;
-  return pages[0];
-}
-
-// List all tabs
-app.get('/api/browser/tabs', auth, async (_, res) => {
-  try {
-    const pages = await getCdpPageTargets();
-    const tabs = pages.map((t, idx) => ({
-      id: t.id,
-      title: `${t.workerId || 'Worker'} - ${t.title || 'Untitled'}`,
-      url: t.url,
-      active: t.id === activeTargetId || (!activeTargetId && idx === 0),
-    }));
-    res.json({ tabs });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Switch active tab
-app.post('/api/browser/tabs/switch', auth, async (req, res) => {
-  const { targetId } = req.body;
-  if (!targetId) return res.status(400).json({ error: 'targetId required' });
-  try {
-    const pages = await getCdpPageTargets();
-    const found = pages.find(t => t.id === targetId);
-    if (!found) return res.status(404).json({ error: 'Tab not found' });
-    activeTargetId = targetId;
-    await fetch(`http://127.0.0.1:${found.port}/json/activate/${targetId}`);
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Create new tab
-app.post('/api/browser/tabs/new', auth, async (req, res) => {
-  const { url } = req.body;
-  try {
-    const targetUrl = url || 'about:blank';
-    const port = activeWorkers.length > 0 ? activeWorkers[0].port : 19222;
-    const newRes = await fetch(`http://127.0.0.1:${port}/json/new?${encodeURIComponent(targetUrl)}`);
-    const newTarget = await newRes.json();
-    activeTargetId = newTarget.id;
-    res.json({ ok: true, tab: { id: newTarget.id, title: newTarget.title || 'New Tab', url: newTarget.url } });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Close a tab
-app.post('/api/browser/tabs/close', auth, async (req, res) => {
-  const { targetId } = req.body;
-  if (!targetId) return res.status(400).json({ error: 'targetId required' });
-  try {
-    const pages = await getCdpPageTargets();
-    const found = pages.find(t => t.id === targetId);
-    if (found) {
-      await fetch(`http://127.0.0.1:${found.port}/json/close/${targetId}`);
-    }
-    // If we closed the active tab, reset
-    if (activeTargetId === targetId) {
-      activeTargetId = null;
-    }
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-app.get('/api/browser/page-info', auth, async (_, res) => {
-  try {
-    const target = await getActiveTarget();
-    if (!target) return res.status(400).json({ error: 'No page' });
-    res.json({ url: target.url, title: target.title || '', targetId: target.id });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Robustly find the Playwright page that matches the CDP target
-function findMatchingPage(allPages, target) {
-  // 1. Exact match
-  let page = allPages.find(p => p.url() === target.url);
-  if (page) return page;
-
-  // 2. Base URL match (ignore queries/hashes that change during redirects)
-  const targetBase = target.url.split('?')[0].split('#')[0];
-  page = allPages.find(p => p.url().startsWith(targetBase));
-  if (page) return page;
-
-  // 3. Hostname match (very reliable for distinguishing popups like accounts.google.com)
-  try {
-    const targetHost = new URL(target.url).hostname;
-    const sameHostPages = allPages.filter(p => {
-      try { return new URL(p.url()).hostname === targetHost; } catch { return false; }
-    });
-    // If exactly one page has this hostname, it's our target!
-    if (sameHostPages.length === 1) return sameHostPages[0];
-  } catch { }
-
-  // 4. If we know it's a popup (it's not the main page), guess the last opened one
-  if (allPages.length > 1 && allPages[0].url() !== target.url) {
-    return allPages[allPages.length - 1]; // Popups are appended
-  }
-
-  // Fallback
-  return allPages[0];
-}
-
-// Screenshot via CDP directly
-app.get('/api/browser/screenshot', auth, async (_, res) => {
-  try {
-    const target = await getActiveTarget();
-    if (!target) return res.status(400).json({ error: 'No page found' });
-
-    const port = target.port || 19222;
-    const chromium = await getPlaywright();
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-    const contexts = browser.contexts();
-    if (contexts.length === 0) { await browser.close(); return res.status(400).json({ error: 'No context' }); }
-
-    const allPages = contexts[0].pages();
-    const page = findMatchingPage(allPages, target);
-    if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
-
-    const url = page.url();
-    const title = await page.title().catch(() => '');
-
-    const cdp = await page.context().newCDPSession(page);
-    const layoutMetrics = await cdp.send('Page.getLayoutMetrics');
-    const cssViewport = layoutMetrics.cssVisualViewport || layoutMetrics.visualViewport || {};
-    const cssWidth = cssViewport.clientWidth || 1920;
-    const cssHeight = cssViewport.clientHeight || 1080;
-
-    const { data } = await cdp.send('Page.captureScreenshot', {
-      format: 'jpeg',
-      quality: 70,
-      clip: { x: 0, y: 0, width: cssWidth, height: cssHeight, scale: 1 },
-    });
-    await cdp.detach();
-    await browser.close();
-
-    res.json({
-      image: `data:image/jpeg;base64,${data}`,
-      url,
-      title,
-      viewport: { width: cssWidth, height: cssHeight },
-    });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Helper: get Playwright page for the active target
-async function getActivePage() {
-  const target = await getActiveTarget();
-  if (!target) throw new Error('No page');
-
-  const port = target.port || 19222;
-  const chromium = await getPlaywright();
-  const browser = await chromium.connectOverCDP(`http://127.0.0.1:${port}`);
-  const contexts = browser.contexts();
-  if (contexts.length === 0) { await browser.close(); throw new Error('No context'); }
-  const allPages = contexts[0].pages();
-  const page = findMatchingPage(allPages, target);
-  if (!page) { await browser.close(); throw new Error('No page'); }
-  return { browser, page };
-}
-
-// Navigate
-app.post('/api/browser/navigate', auth, async (req, res) => {
-  const { url } = req.body;
-  if (!url) return res.status(400).json({ error: 'url required' });
-  try {
-    const { browser, page } = await getActivePage();
-    await page.goto(url, { waitUntil: 'commit', timeout: 15000 });
-    await browser.close();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Click at coordinates via CDP (more accurate)
-app.post('/api/browser/click', auth, async (req, res) => {
-  const { x, y } = req.body;
-  try {
-    const { browser, page } = await getActivePage();
-    const cdp = await page.context().newCDPSession(page);
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-    await cdp.detach();
-    await new Promise(r => setTimeout(r, 500));
-    await browser.close();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Type text
-app.post('/api/browser/type', auth, async (req, res) => {
-  const { text } = req.body;
-  try {
-    const { browser, page } = await getActivePage();
-    await page.keyboard.type(text, { delay: 50 });
-    await browser.close();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Scroll
-app.post('/api/browser/scroll', auth, async (req, res) => {
-  const { x, y, deltaX = 0, deltaY = 0 } = req.body;
-  try {
-    const { browser, page } = await getActivePage();
-    const cdp = await page.context().newCDPSession(page);
-    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX, deltaY });
-    await cdp.detach();
-    await browser.close();
-    res.json({ ok: true });
-  } catch (e) {
-    res.status(500).json({ error: e.message });
-  }
-});
-
-// Press key (Enter, Tab, Backspace, etc.)
-app.post('/api/browser/key', auth, async (req, res) => {
-  const { key } = req.body;
-  try {
-    const { browser, page } = await getActivePage();
-    await page.keyboard.press(key);
-    await browser.close();
-    res.json({ ok: true });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
@@ -1153,7 +492,6 @@ app.post('/api/upload-video', auth, (req, res) => {
   const filename = `guide-video${ext}`;
   const filepath = path.join(uploadsDir, filename);
 
-  // Chống path traversal
   if (!filepath.startsWith(uploadsDir)) {
     return res.status(400).json({ error: 'Invalid file path' });
   }
@@ -1196,7 +534,6 @@ app.post('/api/upload-favicon', auth, (req, res) => {
   const filename = `favicon${ext}`;
   const filepath = path.join(uploadsDir, filename);
 
-  // Chống path traversal
   if (!filepath.startsWith(uploadsDir)) {
     return res.status(400).json({ error: 'Invalid file path' });
   }
@@ -1237,301 +574,93 @@ app.get('*', (_, res) => {
 
 const server = http.createServer(app);
 
-// ==================== WebSocket Screencast ====================
-const wss = new WebSocketServer({ server, path: '/ws/screencast' });
+// ==================== Worker WebSocket ====================
+const workerWss = new WebSocketServer({ server, path: '/ws/worker' });
 
-wss.on('connection', async (ws, req) => {
-  // Verify JWT from query string
+workerWss.on('connection', (ws, req) => {
+  // Verify worker auth token from query string
   const url = new URL(req.url, `http://${req.headers.host}`);
   const token = url.searchParams.get('token');
-  try {
-    jwt.verify(token, JWT_SECRET);
-  } catch {
+
+  if (token !== WORKER_AUTH_TOKEN) {
+    console.log('[Worker WS] Rejected connection: invalid token');
     ws.close(4001, 'Unauthorized');
     return;
   }
 
-  console.log('[Screencast] Client connected');
-  let cdpWs = null;
-  let sessionId = null;
-  let alive = true;
-  let cmdId = 1;
-  let currentTargetId = null;
-  let switchingTab = false;
-  let knownTargetIds = new Set();
-  let newTabPollTimer = null;
-  let currentPort = null;
+  const workerId = `worker-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
+  const worker = {
+    ws,
+    info: {},
+    connectedAt: new Date().toISOString(),
+    busy: false,
+    pendingJobs: {}, // jobId -> { resolve, reject, timeout }
+  };
 
-  // Debug logging - sends to console AND frontend WS
-  function debugLog(msg) {
-    console.log(`[Screencast] ${msg}`);
-    try {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: 'debug', message: msg }));
-      }
-    } catch { }
-  }
+  connectedWorkers.set(workerId, worker);
+  console.log(`[Worker WS] Worker connected: ${workerId} (total: ${connectedWorkers.size})`);
 
-  ws.on('close', () => {
-    alive = false;
-    console.log('[Screencast] Client disconnected');
-    stopScreencast();
-    stopNewTabPoll();
-  });
-
-  ws.on('error', () => {
-    alive = false;
-    stopScreencast();
-    stopNewTabPoll();
-  });
-
-  // Handle input commands from client (click, scroll, switchTab) via the same CDP connection
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
-      if (msg.type === 'switchTab') {
-        // Client wants to switch to a different tab
-        activeTargetId = msg.targetId;
-        connectToTarget(msg.targetId).catch(() => { });
-        return;
-      }
-      const currentCdp = cdpWs; // snapshot to avoid race
-      if (!currentCdp || currentCdp.readyState !== currentCdp.OPEN) return;
-      try {
-        if (msg.type === 'click') {
-          const { x, y } = msg;
-          currentCdp.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } }));
-          currentCdp.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } }));
-        } else if (msg.type === 'scroll') {
-          const { x, y, deltaX, deltaY } = msg;
-          currentCdp.send(JSON.stringify({ id: cmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX: deltaX || 0, deltaY: deltaY || 0 } }));
+
+      if (msg.type === 'register') {
+        // Worker reports its info (URLs it handles, etc.)
+        worker.info = { urls: msg.urls || [], hostname: msg.hostname || '' };
+        console.log(`[Worker WS] Worker ${workerId} registered: ${msg.urls?.length || 0} URLs, host: ${msg.hostname || 'unknown'}`);
+
+      } else if (msg.type === 'job-result') {
+        // Worker completed a job
+        const pending = worker.pendingJobs[msg.jobId];
+        if (pending) {
+          clearTimeout(pending.timeout);
+          delete worker.pendingJobs[msg.jobId];
+
+          if (msg.success) {
+            pending.resolve({
+              affiliateUrl: msg.affiliateUrl,
+              metadata: msg.metadata || {},
+            });
+          } else {
+            pending.reject(new Error(msg.error || 'Worker job failed'));
+          }
         }
-      } catch (sendErr) {
-        console.log(`[Screencast] Error sending input command: ${sendErr.message}`);
+
+      } else if (msg.type === 'heartbeat') {
+        ws.send(JSON.stringify({ type: 'heartbeat-ack' }));
+
+      } else if (msg.type === 'log') {
+        // Worker sends log messages
+        console.log(`[Worker ${workerId}] ${msg.message}`);
       }
-    } catch { }
+    } catch (e) {
+      console.error(`[Worker WS] Error parsing message from ${workerId}:`, e.message);
+    }
   });
 
-  async function stopScreencast() {
-    if (cdpWs && cdpWs.readyState === cdpWs.OPEN) {
-      try {
-        cdpWs.send(JSON.stringify({ id: 999, method: 'Page.stopScreencast' }));
-      } catch { }
-      setTimeout(() => { try { cdpWs.close(); } catch { } }, 200);
+  ws.on('close', () => {
+    // Reject all pending jobs
+    for (const [jobId, pending] of Object.entries(worker.pendingJobs)) {
+      clearTimeout(pending.timeout);
+      pending.reject(new Error('Worker disconnected'));
     }
-    cdpWs = null;
-  }
+    connectedWorkers.delete(workerId);
+    console.log(`[Worker WS] Worker disconnected: ${workerId} (total: ${connectedWorkers.size})`);
+  });
 
-  function stopNewTabPoll() {
-    if (newTabPollTimer) { clearInterval(newTabPollTimer); newTabPollTimer = null; }
-  }
+  ws.on('error', (err) => {
+    console.error(`[Worker WS] Error from ${workerId}:`, err.message);
+  });
 
-  // Centralized auto-switch with /json/activate
-  async function autoSwitchToTab(newTargetId, source) {
-    if (!alive || switchingTab || newTargetId === currentTargetId) return;
-    switchingTab = true;
-    debugLog(`Auto-switching to ${newTargetId} (via ${source})`);
-    try {
-      // Activate the tab in Chrome so it becomes foreground
-      if (currentPort) {
-        try { await fetch(`http://127.0.0.1:${currentPort}/json/activate/${newTargetId}`); } catch { }
-      }
-      activeTargetId = newTargetId;
-      await connectToTarget(newTargetId);
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: 'tabChanged', targetId: newTargetId }));
-      }
-      debugLog(`Switched to ${newTargetId} OK`);
-    } catch (e) {
-      debugLog(`Switch failed: ${e.message}`);
-    }
-    switchingTab = false;
-  }
-
-  // Poll /json every 1 second to detect new tabs
-  function startNewTabPoll(port) {
-    stopNewTabPoll();
-    currentPort = port;
-    debugLog(`Poll started on port ${port}, known: [${[...knownTargetIds].join(', ')}]`);
-
-    newTabPollTimer = setInterval(async () => {
-      if (!alive || switchingTab) return;
-      try {
-        const res = await fetch(`http://127.0.0.1:${port}/json`);
-        const targets = await res.json();
-        const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
-
-        for (const t of pageTargets) {
-          if (!knownTargetIds.has(t.id)) {
-            knownTargetIds.add(t.id);
-            if (t.id !== currentTargetId) {
-              debugLog(`Poll: new tab ${t.id} (${t.url})`);
-              await autoSwitchToTab(t.id, 'polling');
-              break;
-            }
-          }
-        }
-
-        // Clean stale IDs
-        const currentIds = new Set(pageTargets.map(t => t.id));
-        for (const id of knownTargetIds) {
-          if (!currentIds.has(id)) knownTargetIds.delete(id);
-        }
-      } catch { }
-    }, 1000);
-  }
-
-  // Handle Page.windowOpen: immediate new tab detection
-  async function handleNewWindowOpened(port) {
-    if (!alive || switchingTab) return;
-    debugLog('Page.windowOpen detected!');
-    await new Promise(r => setTimeout(r, 800));
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/json`);
-      const targets = await res.json();
-      const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
-      const newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
-      if (newTab) {
-        knownTargetIds.add(newTab.id);
-        await autoSwitchToTab(newTab.id, 'Page.windowOpen');
-      } else {
-        for (const t of pageTargets) knownTargetIds.add(t.id);
-        debugLog('windowOpen: no new tab found in /json');
-      }
-    } catch (e) {
-      debugLog(`windowOpen error: ${e.message}`);
-    }
-  }
-
-  async function connectToTarget(targetId) {
-    await stopScreencast();
-    cmdId = 1;
-
-    try {
-      const pages = await getCdpPageTargets();
-      debugLog(`connectToTarget(${targetId || 'null'}): ${pages.length} pages [${pages.map(p => p.id).join(', ')}]`);
-
-      const target = targetId ? pages.find(t => t.id === targetId) : pages[0];
-      if (!target || !target.webSocketDebuggerUrl) {
-        debugLog(`Target ${targetId} not found`);
-        if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', error: 'No browser page found' }));
-        return;
-      }
-      currentTargetId = target.id;
-      const targetPort = target.port || 19222;
-      currentPort = targetPort;
-
-      // Activate the tab in Chrome
-      try { await fetch(`http://127.0.0.1:${targetPort}/json/activate/${target.id}`); } catch { }
-
-      // Update known targets to prevent falsely detecting existing tabs as new
-      for (const p of pages) knownTargetIds.add(p.id);
-
-      // Start polling if not already running
-      if (!newTabPollTimer) {
-        startNewTabPoll(targetPort);
-      }
-
-      const { default: WebSocket } = await import('ws');
-      const newCdpWs = new WebSocket(target.webSocketDebuggerUrl);
-      cdpWs = newCdpWs;
-
-      newCdpWs.on('open', () => {
-        // Check if this connection is still the active one (race condition guard)
-        if (cdpWs !== newCdpWs || !alive) {
-          try { newCdpWs.close(); } catch { }
-          return;
-        }
-        try {
-          newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.enable' }));
-          // Enable Target domain for targetCreated events
-          newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Target.setDiscoverTargets', params: { discover: true } }));
-          newCdpWs.send(JSON.stringify({
-            id: cmdId++,
-            method: 'Page.startScreencast',
-            params: { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 }
-          }));
-          debugLog(`Screencast started for ${target.id} (${target.url})`);
-        } catch (e) {
-          debugLog(`Error starting screencast: ${e.message}`);
-        }
-      });
-
-      newCdpWs.on('message', (data) => {
-        if (!alive || cdpWs !== newCdpWs) return;
-        try {
-          const msg = JSON.parse(data.toString());
-          if (msg.method === 'Page.screencastFrame') {
-            const { data: frameData, metadata, sessionId: sid } = msg.params;
-            sessionId = sid;
-            if (newCdpWs.readyState === newCdpWs.OPEN) {
-              newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
-            }
-            if (ws.readyState === ws.OPEN) {
-              ws.send(JSON.stringify({
-                type: 'frame',
-                image: `data:image/jpeg;base64,${frameData}`,
-                metadata
-              }));
-            }
-          } else if (msg.method === 'Page.windowOpen') {
-            debugLog(`Page.windowOpen: url=${msg.params?.url}`);
-            handleNewWindowOpened(targetPort).catch(() => { });
-          } else if (msg.method === 'Target.targetCreated') {
-            const info = msg.params?.targetInfo;
-            if (info && !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(info.type) && info.targetId !== currentTargetId) {
-              if (!knownTargetIds.has(info.targetId)) {
-                debugLog(`Target.targetCreated: ${info.targetId} (${info.url} - ${info.type})`);
-                knownTargetIds.add(info.targetId);
-                setTimeout(() => autoSwitchToTab(info.targetId, 'Target.targetCreated').catch(() => { }), 500);
-              }
-            }
-          }
-        } catch { }
-      });
-
-      newCdpWs.on('close', () => {
-        if (alive && ws.readyState === ws.OPEN && cdpWs === newCdpWs) {
-          ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
-        }
-      });
-
-      newCdpWs.on('error', (err) => {
-        console.log(`[Screencast] CDP error: ${err.message}`);
-      });
-
-    } catch (e) {
-      console.log(`[Screencast] Error: ${e.message}`);
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({ type: 'error', error: e.message }));
-      }
-    }
-  }
-
-  // Initial connection — use active target
-  connectToTarget(activeTargetId);
+  // Send current config to worker
+  const jobConfig = loadJobConfig();
+  const urlPattern = /https?:\/\/[^\s]+/g;
+  const configUrls = jobConfig.url ? jobConfig.url.match(urlPattern) || [] : [];
+  ws.send(JSON.stringify({ type: 'config-update', urls: configUrls }));
 });
 
 server.listen(PORT, '0.0.0.0', () => {
   console.log(`Admin Dashboard running on http://localhost:${PORT}`);
-
-  // Auto-launch browser on startup (non-blocking)
-  (async () => {
-    const running = await isChromeRunning();
-    if (running) {
-      console.log('[Server] Chrome already running');
-      return;
-    }
-    try {
-      const jobConfig = loadJobConfig();
-      const urlPattern = /https?:\/\/[^\s]+/g;
-      const startUrls = jobConfig.url ? jobConfig.url.match(urlPattern) || [] : [];
-      if (startUrls.length === 0) startUrls.push('https://www.youtube.com');
-
-      await launchBrowsersAndStoreWorkers(startUrls);
-    } catch (e) {
-      console.error('[Server] Failed to auto-start browser:', e.message);
-      console.log('[Server] Server continues without browser. Use admin panel to start it.');
-    }
-  })();
+  console.log(`[Server] Chờ Worker kết nối qua WebSocket tại /ws/worker`);
+  console.log(`[Server] Chạy worker trên máy Windows: npm run worker`);
 });

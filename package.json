@@ -10,7 +10,7 @@
     "dev": "concurrently \"npm run server\" \"npm run dev:web\"",
     "server": "node src/server.js",
     "dev:web": "npm run dev:client --prefix web",
-    "browser": "node src/open-browser.js"
+    "worker": "node src/worker.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
