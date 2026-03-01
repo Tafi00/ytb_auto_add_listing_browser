@@ -823,7 +823,7 @@ async function getCdpPageTargets() {
     try {
       const targetsRes = await fetch(`http://127.0.0.1:${w.port}/json`);
       const targets = await targetsRes.json();
-      const pages = targets.filter(t => t.type === 'page').map(t => ({
+      const pages = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type)).map(t => ({
         ...t,
         port: w.port,
         workerId: w.sessionId
@@ -1359,7 +1359,7 @@ wss.on('connection', async (ws, req) => {
       try {
         const res = await fetch(`http://127.0.0.1:${port}/json`);
         const targets = await res.json();
-        const pageTargets = targets.filter(t => t.type === 'page');
+        const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
 
         for (const t of pageTargets) {
           if (!knownTargetIds.has(t.id)) {
@@ -1389,7 +1389,7 @@ wss.on('connection', async (ws, req) => {
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json`);
       const targets = await res.json();
-      const pageTargets = targets.filter(t => t.type === 'page');
+      const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
       const newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
       if (newTab) {
         knownTargetIds.add(newTab.id);
@@ -1478,8 +1478,8 @@ wss.on('connection', async (ws, req) => {
             handleNewWindowOpened(targetPort).catch(() => { });
           } else if (msg.method === 'Target.targetCreated') {
             const info = msg.params?.targetInfo;
-            if (info && info.type === 'page' && info.targetId !== currentTargetId) {
-              debugLog(`Target.targetCreated: ${info.targetId} (${info.url})`);
+            if (info && !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(info.type) && info.targetId !== currentTargetId) {
+              debugLog(`Target.targetCreated: ${info.targetId} (${info.url} - ${info.type})`);
               knownTargetIds.add(info.targetId);
               setTimeout(() => autoSwitchToTab(info.targetId, 'Target.targetCreated').catch(() => { }), 500);
             }
