@@ -1223,20 +1223,24 @@ wss.on('connection', async (ws, req) => {
 
   console.log('[Screencast] Client connected');
   let cdpWs = null;
+  let browserCdpWs = null; // Browser-level CDP for detecting new tabs
   let sessionId = null;
   let alive = true;
   let cmdId = 1;
   let currentTargetId = null;
+  let switchingTab = false; // Guard against rapid re-entrant switches
 
   ws.on('close', () => {
     alive = false;
     console.log('[Screencast] Client disconnected');
     stopScreencast();
+    stopBrowserCdp();
   });
 
   ws.on('error', () => {
     alive = false;
     stopScreencast();
+    stopBrowserCdp();
   });
 
   // Handle input commands from client (click, scroll, switchTab) via the same CDP connection
@@ -1276,6 +1280,73 @@ wss.on('connection', async (ws, req) => {
     cdpWs = null;
   }
 
+  function stopBrowserCdp() {
+    if (browserCdpWs && browserCdpWs.readyState !== 3 /* CLOSED */) {
+      try { browserCdpWs.close(); } catch { }
+    }
+    browserCdpWs = null;
+  }
+
+  // Connect a browser-level CDP WebSocket to detect new tabs being created
+  async function setupNewTabDetection(port) {
+    stopBrowserCdp();
+    try {
+      // Get the browser-level WebSocket URL
+      const versionRes = await fetch(`http://127.0.0.1:${port}/json/version`);
+      const versionInfo = await versionRes.json();
+      if (!versionInfo.webSocketDebuggerUrl) return;
+
+      const { default: WebSocket } = await import('ws');
+      const bws = new WebSocket(versionInfo.webSocketDebuggerUrl);
+      browserCdpWs = bws;
+      let bCmdId = 1;
+
+      bws.on('open', () => {
+        if (!alive) { try { bws.close(); } catch { } return; }
+        // Enable target discovery to get notified about new tabs
+        bws.send(JSON.stringify({ id: bCmdId++, method: 'Target.setDiscoverTargets', params: { discover: true } }));
+        console.log(`[Screencast] Browser-level CDP connected for new tab detection on port ${port}`);
+      });
+
+      bws.on('message', (data) => {
+        if (!alive) return;
+        try {
+          const msg = JSON.parse(data.toString());
+          // When a new page target is created, auto-switch to it
+          if (msg.method === 'Target.targetCreated') {
+            const targetInfo = msg.params.targetInfo;
+            if (targetInfo && targetInfo.type === 'page' && targetInfo.targetId !== currentTargetId) {
+              console.log(`[Screencast] New tab detected: ${targetInfo.targetId} (url: ${targetInfo.url})`);
+              // Small delay to let the new tab initialize
+              setTimeout(() => {
+                if (!alive || switchingTab) return;
+                switchingTab = true;
+                const newTargetId = targetInfo.targetId;
+                activeTargetId = newTargetId;
+                connectToTarget(newTargetId).then(() => {
+                  // Notify frontend about the tab change
+                  if (ws.readyState === ws.OPEN) {
+                    ws.send(JSON.stringify({ type: 'tabChanged', targetId: newTargetId }));
+                  }
+                }).catch(() => { }).finally(() => { switchingTab = false; });
+              }, 500);
+            }
+          }
+        } catch { }
+      });
+
+      bws.on('close', () => {
+        if (browserCdpWs === bws) browserCdpWs = null;
+      });
+
+      bws.on('error', (err) => {
+        console.log(`[Screencast] Browser CDP error: ${err.message}`);
+      });
+    } catch (e) {
+      console.log(`[Screencast] Failed to setup new tab detection: ${e.message}`);
+    }
+  }
+
   async function connectToTarget(targetId) {
     // Stop existing screencast first
     await stopScreencast();
@@ -1289,6 +1360,12 @@ wss.on('connection', async (ws, req) => {
         return;
       }
       currentTargetId = target.id;
+
+      // Setup browser-level new tab detection if not already connected
+      const targetPort = target.port || 19222;
+      if (!browserCdpWs || browserCdpWs.readyState !== 1 /* OPEN */) {
+        setupNewTabDetection(targetPort).catch(() => { });
+      }
 
       const { default: WebSocket } = await import('ws');
       const newCdpWs = new WebSocket(target.webSocketDebuggerUrl);

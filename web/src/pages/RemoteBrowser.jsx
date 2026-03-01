@@ -34,7 +34,7 @@ function RemoteBrowser() {
         const active = data.tabs.find(t => t.active);
         if (active) setActiveTabId(active.id);
       }
-    } catch {}
+    } catch { }
   }, []);
 
   // Switch tab
@@ -47,7 +47,7 @@ function RemoteBrowser() {
         wsRef.current.send(JSON.stringify({ type: 'switchTab', targetId }));
       }
       fetchTabs();
-    } catch {}
+    } catch { }
   }, [fetchTabs]);
 
   // New tab
@@ -62,7 +62,7 @@ function RemoteBrowser() {
         }
       }
       fetchTabs();
-    } catch {}
+    } catch { }
   }, [fetchTabs]);
 
   // Close tab
@@ -85,7 +85,7 @@ function RemoteBrowser() {
           }
         }, 300);
       }
-    } catch {}
+    } catch { }
   }, [activeTabId, fetchTabs]);
 
   // Fetch tabs periodically
@@ -115,7 +115,7 @@ function RemoteBrowser() {
   // Connect WebSocket for live screencast
   const connectScreencast = useCallback(() => {
     if (wsRef.current) {
-      try { wsRef.current.close(); } catch {}
+      try { wsRef.current.close(); } catch { }
     }
 
     const ws = new WebSocket(getWsUrl());
@@ -137,10 +137,16 @@ function RemoteBrowser() {
               setScreencastSize({ width: deviceWidth, height: deviceHeight, offsetTop: offsetTop || 0 });
             }
           }
+        } else if (msg.type === 'tabChanged') {
+          // Server auto-switched to a new tab (e.g., popup opened)
+          if (msg.targetId) {
+            setActiveTabId(msg.targetId);
+            fetchTabs();
+          }
         } else if (msg.type === 'error') {
           setError(msg.error);
         }
-      } catch {}
+      } catch { }
     };
 
     ws.onclose = () => {
@@ -163,7 +169,7 @@ function RemoteBrowser() {
       reconnectTimer.current = null;
     }
     if (wsRef.current) {
-      try { wsRef.current.close(); } catch {}
+      try { wsRef.current.close(); } catch { }
       wsRef.current = null;
     }
     setWsConnected(false);
@@ -213,7 +219,7 @@ function RemoteBrowser() {
           setNavUrl(data.url);
           navUrlRef.current = data.url;
         }
-      } catch {}
+      } catch { }
     };
     fetchInfo();
     const interval = setInterval(fetchInfo, 5000);
@@ -288,7 +294,7 @@ function RemoteBrowser() {
           await fetchScreenshot();
         }
       }
-    } catch {}
+    } catch { }
     setLoading(false);
   };
 
@@ -313,7 +319,7 @@ function RemoteBrowser() {
         body: JSON.stringify({ x: coords.x, y: coords.y, deltaX: 0, deltaY }),
       });
       if (!liveMode) setTimeout(fetchScreenshot, 400);
-    } catch {}
+    } catch { }
   };
 
   const handleNavigate = async (e) => {
@@ -326,7 +332,7 @@ function RemoteBrowser() {
         await new Promise(r => setTimeout(r, 1500));
         await fetchScreenshot();
       }
-    } catch {}
+    } catch { }
     setLoading(false);
   };
 
@@ -341,7 +347,7 @@ function RemoteBrowser() {
         await new Promise(r => setTimeout(r, 500));
         await fetchScreenshot();
       }
-    } catch {}
+    } catch { }
     setLoading(false);
   };
 
@@ -353,7 +359,7 @@ function RemoteBrowser() {
         await new Promise(r => setTimeout(r, 500));
         await fetchScreenshot();
       }
-    } catch {}
+    } catch { }
     setLoading(false);
   };
 
@@ -368,7 +374,7 @@ function RemoteBrowser() {
         body: JSON.stringify({ x: cx, y: cy, deltaX: 0, deltaY }),
       });
       if (!liveMode) setTimeout(fetchScreenshot, 400);
-    } catch {}
+    } catch { }
   };
 
   return (
