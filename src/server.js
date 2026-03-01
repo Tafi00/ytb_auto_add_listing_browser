@@ -1424,12 +1424,13 @@ wss.on('connection', async (ws, req) => {
       // Activate the tab in Chrome
       try { await fetch(`http://127.0.0.1:${targetPort}/json/activate/${target.id}`); } catch { }
 
+      // Update known targets to prevent falsely detecting existing tabs as new
+      for (const p of pages) knownTargetIds.add(p.id);
+
       // Start polling if not already running
       if (!newTabPollTimer) {
-        for (const p of pages) knownTargetIds.add(p.id);
         startNewTabPoll(targetPort);
       }
-      knownTargetIds.add(target.id);
 
       const { default: WebSocket } = await import('ws');
       const newCdpWs = new WebSocket(target.webSocketDebuggerUrl);
@@ -1479,9 +1480,11 @@ wss.on('connection', async (ws, req) => {
           } else if (msg.method === 'Target.targetCreated') {
             const info = msg.params?.targetInfo;
             if (info && !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(info.type) && info.targetId !== currentTargetId) {
-              debugLog(`Target.targetCreated: ${info.targetId} (${info.url} - ${info.type})`);
-              knownTargetIds.add(info.targetId);
-              setTimeout(() => autoSwitchToTab(info.targetId, 'Target.targetCreated').catch(() => { }), 500);
+              if (!knownTargetIds.has(info.targetId)) {
+                debugLog(`Target.targetCreated: ${info.targetId} (${info.url} - ${info.type})`);
+                knownTargetIds.add(info.targetId);
+                setTimeout(() => autoSwitchToTab(info.targetId, 'Target.targetCreated').catch(() => { }), 500);
+              }
             }
           }
         } catch { }
