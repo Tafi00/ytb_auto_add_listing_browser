@@ -1447,16 +1447,24 @@ wss.on('connection', async (ws, req) => {
   }
 
   // Handle Page.windowOpen: open popup screencast dialog instead of switching tabs
+  let _windowOpenLock = 0; // dedup guard
   async function handleNewWindowOpened(port, popupUrl) {
     if (!alive) return;
+    // Dedup: skip if already handling a windowOpen or popup is already open
+    const now = Date.now();
+    if (now - _windowOpenLock < 3000 || popupTargetId) {
+      debugLog(`windowOpen: skipped (dedup or popup already open)`);
+      return;
+    }
+    _windowOpenLock = now;
     debugLog(`Page.windowOpen detected! url=${popupUrl}`);
 
     // Snapshot known IDs before waiting — so poll timer can't race ahead
     const snapshotKnown = new Set(knownTargetIds);
 
     // Retry multiple times to give Chrome time to create the popup target
-    for (let attempt = 1; attempt <= 5; attempt++) {
-      await new Promise(r => setTimeout(r, 500));
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      await new Promise(r => setTimeout(r, 600));
       if (!alive) return;
 
       try {
@@ -1464,10 +1472,13 @@ wss.on('connection', async (ws, req) => {
         const targets = await res.json();
         const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
 
-        // Strategy 1: Find target NOT in our pre-wait snapshot (ideal case)
+        // Debug: log all current targets
+        debugLog(`windowOpen attempt ${attempt}/3: ${pageTargets.length} targets: [${pageTargets.map(t => `${t.id}(${t.url.substring(0, 50)})`).join(', ')}]`);
+
+        // Strategy 1: Find target NOT in our pre-wait snapshot
         let newTab = pageTargets.find(t => !snapshotKnown.has(t.id) && t.id !== currentTargetId);
 
-        // Strategy 2: URL-based matching (fallback if poll already added it to knownTargetIds)
+        // Strategy 2: URL hostname matching
         if (!newTab && popupUrl) {
           try {
             const popupHost = new URL(popupUrl).hostname;
@@ -1478,7 +1489,7 @@ wss.on('connection', async (ws, req) => {
           } catch { }
         }
 
-        // Strategy 3: If there are more targets than in our snapshot, pick the newest unknown
+        // Strategy 3: Pick newest unknown
         if (!newTab) {
           newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
         }
@@ -1489,15 +1500,82 @@ wss.on('connection', async (ws, req) => {
           await startPopupScreencast(newTab, port);
           return;
         }
-
-        debugLog(`windowOpen attempt ${attempt}/5: no popup target yet...`);
       } catch (e) {
         debugLog(`windowOpen attempt ${attempt} error: ${e.message}`);
       }
     }
 
-    // All attempts failed
-    debugLog('windowOpen: popup target not found after 5 attempts. Chrome may have blocked the popup.');
+    // Fallback: Chrome likely blocked the popup — force-create a new target via CDP
+    debugLog('windowOpen: popup not found via polling. Using CDP Target.createTarget fallback...');
+    if (popupUrl) {
+      try {
+        const popupTargetInfo = await forceCreatePopupTarget(port, popupUrl);
+        if (popupTargetInfo) {
+          knownTargetIds.add(popupTargetInfo.id);
+          debugLog(`Popup force-created: ${popupTargetInfo.id} (${popupTargetInfo.url})`);
+          await startPopupScreencast(popupTargetInfo, port);
+          return;
+        }
+      } catch (e) {
+        debugLog(`Force-create popup failed: ${e.message}`);
+      }
+    }
+    debugLog('windowOpen: all strategies exhausted, popup could not be opened.');
+  }
+
+  // Force-create a popup target using CDP browser-level Target.createTarget
+  async function forceCreatePopupTarget(port, url) {
+    debugLog(`forceCreatePopupTarget: connecting to browser WS on port ${port}...`);
+    const versionRes = await fetch(`http://127.0.0.1:${port}/json/version`);
+    const versionInfo = await versionRes.json();
+    const browserWsUrl = versionInfo.webSocketDebuggerUrl;
+    if (!browserWsUrl) throw new Error('No browser WebSocket URL from /json/version');
+
+    const { default: WebSocket } = await import('ws');
+
+    return new Promise((resolve, reject) => {
+      const bws = new WebSocket(browserWsUrl);
+      const timeout = setTimeout(() => { try { bws.close(); } catch { } reject(new Error('Timeout creating target')); }, 8000);
+
+      bws.on('open', () => {
+        debugLog('forceCreatePopupTarget: browser WS connected, sending Target.createTarget...');
+        bws.send(JSON.stringify({
+          id: 1,
+          method: 'Target.createTarget',
+          params: { url, newWindow: true, width: 500, height: 600 }
+        }));
+      });
+
+      bws.on('message', async (data) => {
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.id === 1) {
+            clearTimeout(timeout);
+            bws.close();
+            if (msg.result && msg.result.targetId) {
+              const newTargetId = msg.result.targetId;
+              debugLog(`forceCreatePopupTarget: target created with id=${newTargetId}`);
+              // Fetch full target info from /json
+              await new Promise(r => setTimeout(r, 500));
+              const targetsRes = await fetch(`http://127.0.0.1:${port}/json`);
+              const targets = await targetsRes.json();
+              const targetInfo = targets.find(t => t.id === newTargetId);
+              if (targetInfo) {
+                resolve(targetInfo);
+              } else {
+                reject(new Error(`Target ${newTargetId} created but not found in /json`));
+              }
+            } else {
+              reject(new Error(`Target.createTarget failed: ${JSON.stringify(msg.error || msg)}`));
+            }
+          }
+        } catch (e) {
+          reject(e);
+        }
+      });
+
+      bws.on('error', (err) => { clearTimeout(timeout); reject(err); });
+    });
   }
 
   // Start a secondary CDP screencast for the popup target
