@@ -1381,25 +1381,38 @@ wss.on('connection', async (ws, req) => {
     }, 1000);
   }
 
-  // Handle Page.windowOpen: immediate new tab detection
-  async function handleNewWindowOpened(port) {
-    if (!alive || switchingTab) return;
-    debugLog('Page.windowOpen detected!');
+  // Handle Page.windowOpen: navigate current tab to the URL instead of opening a new tab
+  async function handleNewWindowOpened(port, openedUrl) {
+    if (!alive) return;
+    debugLog(`Page.windowOpen detected! url=${openedUrl}`);
+
+    // Step 1: Navigate the current tab to the opened URL via CDP
+    if (openedUrl && cdpWs && cdpWs.readyState === cdpWs.OPEN) {
+      try {
+        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.navigate', params: { url: openedUrl } }));
+        debugLog(`windowOpen: navigated current tab to ${openedUrl}`);
+      } catch (e) {
+        debugLog(`windowOpen: failed to navigate current tab: ${e.message}`);
+      }
+    }
+
+    // Step 2: Close any new tab that Chrome may have created
     await new Promise(r => setTimeout(r, 800));
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json`);
       const targets = await res.json();
       const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
-      const newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
-      if (newTab) {
-        knownTargetIds.add(newTab.id);
-        await autoSwitchToTab(newTab.id, 'Page.windowOpen');
-      } else {
-        for (const t of pageTargets) knownTargetIds.add(t.id);
-        debugLog('windowOpen: no new tab found in /json');
+      for (const t of pageTargets) {
+        if (!knownTargetIds.has(t.id) && t.id !== currentTargetId) {
+          debugLog(`windowOpen: closing new tab ${t.id} (${t.url})`);
+          try {
+            await fetch(`http://127.0.0.1:${port}/json/close/${t.id}`);
+          } catch { }
+        }
+        knownTargetIds.add(t.id);
       }
     } catch (e) {
-      debugLog(`windowOpen error: ${e.message}`);
+      debugLog(`windowOpen cleanup error: ${e.message}`);
     }
   }
 
@@ -1476,7 +1489,7 @@ wss.on('connection', async (ws, req) => {
             }
           } else if (msg.method === 'Page.windowOpen') {
             debugLog(`Page.windowOpen: url=${msg.params?.url}`);
-            handleNewWindowOpened(targetPort).catch(() => { });
+            handleNewWindowOpened(targetPort, msg.params?.url).catch(() => { });
           } else if (msg.method === 'Target.targetCreated') {
             const info = msg.params?.targetInfo;
             if (info && !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(info.type) && info.targetId !== currentTargetId) {
