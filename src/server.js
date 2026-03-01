@@ -1261,8 +1261,11 @@ wss.on('connection', async (ws, req) => {
   let knownTargetIds = new Set();
   let newTabPollTimer = null;
   let currentPort = null;
-  let lastFrameTime = Date.now();
-  let browserCdpWs = null;
+
+  // Popup tracking — secondary CDP screencast for popup windows
+  let popupCdpWs = null;
+  let popupTargetId = null;
+  let popupCmdId = 5000; // separate cmd ID range to avoid collisions
 
   // Debug logging - sends to console AND frontend WS
   function debugLog(msg) {
@@ -1278,18 +1281,18 @@ wss.on('connection', async (ws, req) => {
     alive = false;
     console.log('[Screencast] Client disconnected');
     stopScreencast();
+    stopPopupScreencast();
     stopNewTabPoll();
-    stopBrowserCdp();
   });
 
   ws.on('error', () => {
     alive = false;
     stopScreencast();
+    stopPopupScreencast();
     stopNewTabPoll();
-    stopBrowserCdp();
   });
 
-  // Handle input commands from client (click, scroll, switchTab) via the same CDP connection
+  // Handle input commands from client (click, scroll, switchTab, popup*) via the same CDP connection
   ws.on('message', (data) => {
     try {
       const msg = JSON.parse(data.toString());
@@ -1299,6 +1302,46 @@ wss.on('connection', async (ws, req) => {
         connectToTarget(msg.targetId).catch(() => { });
         return;
       }
+
+      // === Popup input commands — route to the popup CDP session ===
+      if (msg.type === 'popupClick' || msg.type === 'popupScroll' || msg.type === 'popupType' || msg.type === 'popupKey') {
+        const pCdp = popupCdpWs;
+        if (!pCdp || pCdp.readyState !== pCdp.OPEN) return;
+        try {
+          if (msg.type === 'popupClick') {
+            const { x, y } = msg;
+            pCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mousePressed', x, y, button: 'left', clickCount: 1 } }));
+            pCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 } }));
+          } else if (msg.type === 'popupScroll') {
+            const { x, y, deltaX, deltaY } = msg;
+            pCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Input.dispatchMouseEvent', params: { type: 'mouseWheel', x: x || 0, y: y || 0, deltaX: deltaX || 0, deltaY: deltaY || 0 } }));
+          } else if (msg.type === 'popupType') {
+            const { text } = msg;
+            for (const char of text) {
+              pCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', text: char, key: char, code: `Key${char.toUpperCase()}` } }));
+              pCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key: char, code: `Key${char.toUpperCase()}` } }));
+            }
+          } else if (msg.type === 'popupKey') {
+            const { key } = msg;
+            pCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Input.dispatchKeyEvent', params: { type: 'keyDown', key, code: key } }));
+            pCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Input.dispatchKeyEvent', params: { type: 'keyUp', key, code: key } }));
+          }
+        } catch (e) {
+          debugLog(`Popup input error: ${e.message}`);
+        }
+        return;
+      }
+
+      if (msg.type === 'closePopup') {
+        // Client requests closing the popup
+        if (popupTargetId && currentPort) {
+          fetch(`http://127.0.0.1:${currentPort}/json/close/${popupTargetId}`).catch(() => { });
+        }
+        stopPopupScreencast();
+        return;
+      }
+
+      // === Main page input commands ===
       const currentCdp = cdpWs; // snapshot to avoid race
       if (!currentCdp || currentCdp.readyState !== currentCdp.OPEN) return;
       try {
@@ -1326,70 +1369,25 @@ wss.on('connection', async (ws, req) => {
     cdpWs = null;
   }
 
+  function stopPopupScreencast() {
+    if (popupCdpWs && popupCdpWs.readyState === popupCdpWs.OPEN) {
+      try {
+        popupCdpWs.send(JSON.stringify({ id: 9999, method: 'Page.stopScreencast' }));
+      } catch { }
+      setTimeout(() => { try { popupCdpWs.close(); } catch { } }, 200);
+    }
+    popupCdpWs = null;
+    popupTargetId = null;
+    // Notify frontend that popup is closed
+    try {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: 'popupClosed' }));
+      }
+    } catch { }
+  }
+
   function stopNewTabPoll() {
     if (newTabPollTimer) { clearInterval(newTabPollTimer); newTabPollTimer = null; }
-  }
-
-  function stopBrowserCdp() {
-    if (browserCdpWs) {
-      try { browserCdpWs.close(); } catch { }
-      browserCdpWs = null;
-    }
-  }
-
-  // Connect to browser-level CDP to detect tab activation
-  async function startBrowserCdpMonitor(port) {
-    stopBrowserCdp();
-    try {
-      const versionRes = await fetch(`http://127.0.0.1:${port}/json/version`);
-      const versionInfo = await versionRes.json();
-      const browserWsUrl = versionInfo.webSocketDebuggerUrl;
-      if (!browserWsUrl) {
-        debugLog('No browser webSocketDebuggerUrl found');
-        return;
-      }
-
-      const { default: WebSocket } = await import('ws');
-      const bws = new WebSocket(browserWsUrl);
-      browserCdpWs = bws;
-
-      bws.on('open', () => {
-        if (!alive) { try { bws.close(); } catch { } return; }
-        // Enable target discovery on browser level
-        bws.send(JSON.stringify({ id: 1, method: 'Target.setDiscoverTargets', params: { discover: true } }));
-        debugLog('Browser CDP connected, monitoring tab switches');
-      });
-
-      bws.on('message', (data) => {
-        if (!alive || browserCdpWs !== bws) return;
-        try {
-          const msg = JSON.parse(data.toString());
-          // Target.targetInfoChanged fires when tab visibility/url changes
-          if (msg.method === 'Target.targetInfoChanged') {
-            const info = msg.params?.targetInfo;
-            // Only handle page targets that become visible and are different from current
-            if (info && info.type === 'page' && info.targetId !== currentTargetId) {
-              // Check if this target just became the foreground tab
-              // We detect this via frame staleness — if current tab has no frames,
-              // any targetInfoChanged on another page means user likely switched to it
-              const frameStaleSec = (Date.now() - lastFrameTime) / 1000;
-              if (frameStaleSec > 1.5) {
-                debugLog(`Browser CDP: tab ${info.targetId} changed while current tab stale (${frameStaleSec.toFixed(1)}s). Switching...`);
-                autoSwitchToTab(info.targetId, 'Browser.targetInfoChanged').catch(() => { });
-              }
-            }
-          }
-        } catch { }
-      });
-
-      bws.on('close', () => {
-        if (browserCdpWs === bws) browserCdpWs = null;
-      });
-      bws.on('error', () => { });
-
-    } catch (e) {
-      debugLog(`Browser CDP monitor error: ${e.message}`);
-    }
   }
 
   // Centralized auto-switch with /json/activate
@@ -1427,27 +1425,15 @@ wss.on('connection', async (ws, req) => {
         const targets = await res.json();
         const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
 
-        // Detect new tabs
         for (const t of pageTargets) {
           if (!knownTargetIds.has(t.id)) {
             knownTargetIds.add(t.id);
-            if (t.id !== currentTargetId) {
+            // Don't auto-switch to popup targets or when a popup is already active
+            if (t.id !== currentTargetId && t.id !== popupTargetId && !popupTargetId) {
               debugLog(`Poll: new tab ${t.id} (${t.url})`);
               await autoSwitchToTab(t.id, 'polling');
               break;
             }
-          }
-        }
-
-        // Detect stale frames — if no screencast frame for 3s, user likely switched tabs in Chrome
-        const frameStaleSec = (Date.now() - lastFrameTime) / 1000;
-        if (frameStaleSec > 3 && pageTargets.length > 1) {
-          // Try to find the foreground tab by checking which tab is NOT the current one
-          // Chrome puts the active tab first in /json in most cases
-          const otherTab = pageTargets.find(t => t.id !== currentTargetId);
-          if (otherTab) {
-            debugLog(`Poll: frames stale for ${frameStaleSec.toFixed(1)}s, switching to ${otherTab.id} (${otherTab.url})`);
-            await autoSwitchToTab(otherTab.id, 'stale-frame-poll');
           }
         }
 
@@ -1460,38 +1446,125 @@ wss.on('connection', async (ws, req) => {
     }, 1000);
   }
 
-  // Handle Page.windowOpen: navigate current tab to the URL instead of opening a new tab
-  async function handleNewWindowOpened(port, openedUrl) {
+  // Handle Page.windowOpen: open popup screencast dialog instead of switching tabs
+  async function handleNewWindowOpened(port, popupUrl) {
     if (!alive) return;
-    debugLog(`Page.windowOpen detected! url=${openedUrl}`);
-
-    // Step 1: Navigate the current tab to the opened URL via CDP
-    if (openedUrl && cdpWs && cdpWs.readyState === cdpWs.OPEN) {
-      try {
-        cdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.navigate', params: { url: openedUrl } }));
-        debugLog(`windowOpen: navigated current tab to ${openedUrl}`);
-      } catch (e) {
-        debugLog(`windowOpen: failed to navigate current tab: ${e.message}`);
-      }
-    }
-
-    // Step 2: Close any new tab that Chrome may have created
-    await new Promise(r => setTimeout(r, 800));
+    debugLog(`Page.windowOpen detected! url=${popupUrl}`);
+    await new Promise(r => setTimeout(r, 1000));
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json`);
       const targets = await res.json();
       const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
-      for (const t of pageTargets) {
-        if (!knownTargetIds.has(t.id) && t.id !== currentTargetId) {
-          debugLog(`windowOpen: closing new tab ${t.id} (${t.url})`);
-          try {
-            await fetch(`http://127.0.0.1:${port}/json/close/${t.id}`);
-          } catch { }
-        }
-        knownTargetIds.add(t.id);
+      const newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
+      if (newTab) {
+        knownTargetIds.add(newTab.id);
+        debugLog(`Popup found: ${newTab.id} (${newTab.url})`);
+        // Start secondary popup screencast instead of switching main view
+        await startPopupScreencast(newTab, port);
+      } else {
+        for (const t of pageTargets) knownTargetIds.add(t.id);
+        debugLog('windowOpen: no new tab found in /json');
       }
     } catch (e) {
-      debugLog(`windowOpen cleanup error: ${e.message}`);
+      debugLog(`windowOpen error: ${e.message}`);
+    }
+  }
+
+  // Start a secondary CDP screencast for the popup target
+  async function startPopupScreencast(popupTarget, port) {
+    // Stop any existing popup screencast first
+    stopPopupScreencast();
+    popupTargetId = popupTarget.id;
+
+    debugLog(`Starting popup screencast for ${popupTarget.id} (${popupTarget.url})`);
+
+    try {
+      const { default: WebSocket } = await import('ws');
+      const newPopupCdp = new WebSocket(popupTarget.webSocketDebuggerUrl);
+      popupCdpWs = newPopupCdp;
+
+      newPopupCdp.on('open', () => {
+        if (popupCdpWs !== newPopupCdp || !alive) {
+          try { newPopupCdp.close(); } catch { }
+          return;
+        }
+        try {
+          newPopupCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Page.enable' }));
+          newPopupCdp.send(JSON.stringify({
+            id: popupCmdId++,
+            method: 'Page.startScreencast',
+            params: { format: 'jpeg', quality: 60, maxWidth: 800, maxHeight: 600, everyNthFrame: 1 }
+          }));
+          debugLog(`Popup screencast started for ${popupTarget.id}`);
+          // Notify frontend that popup is opened
+          if (ws.readyState === ws.OPEN) {
+            ws.send(JSON.stringify({
+              type: 'popupOpened',
+              targetId: popupTarget.id,
+              url: popupTarget.url,
+              title: popupTarget.title || 'Popup',
+            }));
+          }
+        } catch (e) {
+          debugLog(`Error starting popup screencast: ${e.message}`);
+        }
+      });
+
+      newPopupCdp.on('message', (data) => {
+        if (!alive || popupCdpWs !== newPopupCdp) return;
+        try {
+          const msg = JSON.parse(data.toString());
+          if (msg.method === 'Page.screencastFrame') {
+            const { data: frameData, metadata, sessionId: sid } = msg.params;
+            if (newPopupCdp.readyState === newPopupCdp.OPEN) {
+              newPopupCdp.send(JSON.stringify({ id: popupCmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
+            }
+            // Send popup frames with type='popupFrame' so frontend can display them in the dialog
+            if (ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({
+                type: 'popupFrame',
+                image: `data:image/jpeg;base64,${frameData}`,
+                metadata,
+              }));
+            }
+          } else if (msg.method === 'Page.frameNavigated') {
+            // Update popup URL in frontend
+            const url = msg.params?.frame?.url;
+            if (url && ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ type: 'popupNavigated', url }));
+            }
+          }
+        } catch { }
+      });
+
+      newPopupCdp.on('close', () => {
+        debugLog(`Popup CDP closed for ${popupTarget.id}`);
+        if (popupCdpWs === newPopupCdp) {
+          stopPopupScreencast();
+        }
+      });
+
+      newPopupCdp.on('error', (err) => {
+        debugLog(`Popup CDP error: ${err.message}`);
+      });
+
+      // Monitor when popup tab is closed (poll)
+      const popupMonitor = setInterval(async () => {
+        if (!alive || !popupTargetId) { clearInterval(popupMonitor); return; }
+        try {
+          const res = await fetch(`http://127.0.0.1:${port}/json`);
+          const targets = await res.json();
+          const stillExists = targets.some(t => t.id === popupTargetId);
+          if (!stillExists) {
+            debugLog(`Popup ${popupTargetId} closed (detected by poll)`);
+            clearInterval(popupMonitor);
+            stopPopupScreencast();
+          }
+        } catch { }
+      }, 1500);
+
+    } catch (e) {
+      debugLog(`Failed to start popup screencast: ${e.message}`);
     }
   }
 
@@ -1523,14 +1596,6 @@ wss.on('connection', async (ws, req) => {
       if (!newTabPollTimer) {
         startNewTabPoll(targetPort);
       }
-
-      // Start browser-level CDP monitor for tab activation detection
-      if (!browserCdpWs) {
-        startBrowserCdpMonitor(targetPort).catch(() => { });
-      }
-
-      // Reset frame time on new connection
-      lastFrameTime = Date.now();
 
       const { default: WebSocket } = await import('ws');
       const newCdpWs = new WebSocket(target.webSocketDebuggerUrl);
@@ -1564,7 +1629,6 @@ wss.on('connection', async (ws, req) => {
           if (msg.method === 'Page.screencastFrame') {
             const { data: frameData, metadata, sessionId: sid } = msg.params;
             sessionId = sid;
-            lastFrameTime = Date.now();
             if (newCdpWs.readyState === newCdpWs.OPEN) {
               newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
             }
@@ -1584,7 +1648,10 @@ wss.on('connection', async (ws, req) => {
               if (!knownTargetIds.has(info.targetId)) {
                 debugLog(`Target.targetCreated: ${info.targetId} (${info.url} - ${info.type})`);
                 knownTargetIds.add(info.targetId);
-                setTimeout(() => autoSwitchToTab(info.targetId, 'Target.targetCreated').catch(() => { }), 500);
+                // Don't auto-switch if this target is already being handled as a popup
+                if (info.targetId !== popupTargetId) {
+                  setTimeout(() => autoSwitchToTab(info.targetId, 'Target.targetCreated').catch(() => { }), 500);
+                }
               }
             }
           }
@@ -1592,27 +1659,8 @@ wss.on('connection', async (ws, req) => {
       });
 
       newCdpWs.on('close', () => {
-        if (alive && cdpWs === newCdpWs) {
-          debugLog('CDP connection closed, attempting auto-reconnect...');
-          // Auto-reconnect: find another available tab
-          setTimeout(async () => {
-            if (!alive || switchingTab) return;
-            try {
-              const pages = await getCdpPageTargets();
-              const pageTargets = pages.filter(t => t.id !== currentTargetId);
-              if (pageTargets.length > 0) {
-                await autoSwitchToTab(pageTargets[0].id, 'cdp-close-reconnect');
-              } else if (pages.length > 0) {
-                // Reconnect to the same tab (it might have been replaced)
-                await connectToTarget(pages[0].id);
-              }
-            } catch (e) {
-              debugLog(`Auto-reconnect failed: ${e.message}`);
-              if (ws.readyState === ws.OPEN) {
-                ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
-              }
-            }
-          }, 500);
+        if (alive && ws.readyState === ws.OPEN && cdpWs === newCdpWs) {
+          ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
         }
       });
 

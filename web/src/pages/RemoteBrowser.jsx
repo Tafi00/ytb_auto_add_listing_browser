@@ -1,5 +1,5 @@
 import { useState, useEffect, useRef, useCallback } from 'react';
-import { FiRefreshCw, FiNavigation, FiType, FiCornerDownLeft, FiArrowLeft, FiArrowRight, FiDelete, FiArrowUp, FiArrowDown, FiZap, FiZapOff, FiPlus, FiX } from 'react-icons/fi';
+import { FiRefreshCw, FiNavigation, FiType, FiCornerDownLeft, FiArrowLeft, FiArrowRight, FiDelete, FiArrowUp, FiArrowDown, FiZap, FiZapOff, FiPlus, FiX, FiExternalLink } from 'react-icons/fi';
 import { api } from '../App';
 
 function RemoteBrowser() {
@@ -23,6 +23,19 @@ function RemoteBrowser() {
   const wsRef = useRef(null);
   const reconnectTimer = useRef(null);
   const scrollThrottleRef = useRef(null);
+
+  // Popup dialog state
+  const [popupOpen, setPopupOpen] = useState(false);
+  const [popupImage, setPopupImage] = useState(null);
+  const [popupUrl, setPopupUrl] = useState('');
+  const [popupTitle, setPopupTitle] = useState('Popup');
+  const [popupScreencastSize, setPopupScreencastSize] = useState(null);
+  const [popupTypeText, setPopupTypeText] = useState('');
+  const popupImgRef = useRef(null);
+  const popupScrollThrottleRef = useRef(null);
+  const popupDragRef = useRef({ dragging: false, startX: 0, startY: 0, startLeft: 0, startTop: 0 });
+  const [popupPos, setPopupPos] = useState({ x: -1, y: -1 }); // -1 means auto-center
+  const popupDialogRef = useRef(null);
 
   // Fetch tabs list
   const fetchTabs = useCallback(async () => {
@@ -143,6 +156,27 @@ function RemoteBrowser() {
             setActiveTabId(msg.targetId);
             fetchTabs();
           }
+        } else if (msg.type === 'popupOpened') {
+          // A popup window was detected — show the floating dialog
+          setPopupOpen(true);
+          setPopupUrl(msg.url || '');
+          setPopupTitle(msg.title || 'Popup');
+          setPopupImage(null);
+          setPopupPos({ x: -1, y: -1 }); // auto-center on first open
+        } else if (msg.type === 'popupFrame') {
+          setPopupImage(msg.image);
+          if (msg.metadata) {
+            const { deviceWidth, deviceHeight } = msg.metadata;
+            if (deviceWidth && deviceHeight) {
+              setPopupScreencastSize({ width: deviceWidth, height: deviceHeight });
+            }
+          }
+        } else if (msg.type === 'popupNavigated') {
+          setPopupUrl(msg.url || '');
+        } else if (msg.type === 'popupClosed') {
+          setPopupOpen(false);
+          setPopupImage(null);
+          setPopupUrl('');
         } else if (msg.type === 'debug') {
           console.log('[RemoteBrowser Debug]', msg.message);
         } else if (msg.type === 'error') {
@@ -379,6 +413,109 @@ function RemoteBrowser() {
     } catch { }
   };
 
+  // === Popup interaction handlers ===
+  const getPopupCoords = useCallback((e) => {
+    const img = popupImgRef.current;
+    if (!img) return null;
+    const rect = img.getBoundingClientRect();
+    const naturalW = img.naturalWidth;
+    const naturalH = img.naturalHeight;
+    if (!naturalW || !naturalH) return null;
+
+    const elemAspect = rect.width / rect.height;
+    const imgAspect = naturalW / naturalH;
+    let renderedW, renderedH, offsetX, offsetY;
+    if (imgAspect > elemAspect) {
+      renderedW = rect.width;
+      renderedH = rect.width / imgAspect;
+      offsetX = 0;
+      offsetY = (rect.height - renderedH) / 2;
+    } else {
+      renderedH = rect.height;
+      renderedW = rect.height * imgAspect;
+      offsetX = (rect.width - renderedW) / 2;
+      offsetY = 0;
+    }
+    const relX = e.clientX - rect.left - offsetX;
+    const relY = e.clientY - rect.top - offsetY;
+    if (relX < 0 || relY < 0 || relX > renderedW || relY > renderedH) return null;
+    const targetW = popupScreencastSize ? popupScreencastSize.width : 800;
+    const targetH = popupScreencastSize ? popupScreencastSize.height : 600;
+    return {
+      x: Math.round((relX / renderedW) * targetW),
+      y: Math.round((relY / renderedH) * targetH),
+    };
+  }, [popupScreencastSize]);
+
+  const handlePopupClick = (e) => {
+    const coords = getPopupCoords(e);
+    if (!coords) return;
+    wsSend({ type: 'popupClick', ...coords });
+  };
+
+  const handlePopupScroll = (e) => {
+    e.preventDefault();
+    const coords = getPopupCoords(e);
+    if (!coords) return;
+    const deltaY = e.deltaY > 0 ? 300 : -300;
+    if (popupScrollThrottleRef.current) return;
+    popupScrollThrottleRef.current = true;
+    setTimeout(() => { popupScrollThrottleRef.current = false; }, 80);
+    wsSend({ type: 'popupScroll', x: coords.x, y: coords.y, deltaX: 0, deltaY });
+  };
+
+  const handlePopupType = (e) => {
+    e.preventDefault();
+    if (!popupTypeText) return;
+    wsSend({ type: 'popupType', text: popupTypeText });
+    setPopupTypeText('');
+  };
+
+  const handlePopupKey = (key) => {
+    wsSend({ type: 'popupKey', key });
+  };
+
+  const handleClosePopup = () => {
+    wsSend({ type: 'closePopup' });
+    setPopupOpen(false);
+    setPopupImage(null);
+  };
+
+  // Popup drag handlers
+  const handlePopupDragStart = (e) => {
+    const dialogEl = popupDialogRef.current;
+    if (!dialogEl) return;
+    const rect = dialogEl.getBoundingClientRect();
+    popupDragRef.current = {
+      dragging: true,
+      startX: e.clientX,
+      startY: e.clientY,
+      startLeft: rect.left,
+      startTop: rect.top,
+    };
+    e.preventDefault();
+  };
+
+  useEffect(() => {
+    const handleMouseMove = (e) => {
+      if (!popupDragRef.current.dragging) return;
+      const { startX, startY, startLeft, startTop } = popupDragRef.current;
+      setPopupPos({
+        x: startLeft + (e.clientX - startX),
+        y: startTop + (e.clientY - startY),
+      });
+    };
+    const handleMouseUp = () => {
+      popupDragRef.current.dragging = false;
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
       {/* Tab bar */}
@@ -534,6 +671,144 @@ function RemoteBrowser() {
         <button className="btn-session btn-session-open" onClick={() => handleScrollBtn('up')} style={{ padding: '6px 10px' }}><FiArrowUp size={12} /></button>
         <button className="btn-session btn-session-open" onClick={() => handleScrollBtn('down')} style={{ padding: '6px 10px' }}><FiArrowDown size={12} /></button>
       </div>
+
+      {/* Popup dialog overlay */}
+      {popupOpen && (
+        <div
+          ref={popupDialogRef}
+          style={{
+            position: 'fixed',
+            left: popupPos.x >= 0 ? `${popupPos.x}px` : '50%',
+            top: popupPos.y >= 0 ? `${popupPos.y}px` : '50%',
+            transform: popupPos.x >= 0 ? 'none' : 'translate(-50%, -50%)',
+            width: '560px',
+            maxWidth: '90vw',
+            maxHeight: '85vh',
+            zIndex: 10000,
+            display: 'flex',
+            flexDirection: 'column',
+            borderRadius: '12px',
+            overflow: 'hidden',
+            background: '#141414',
+            border: '1px solid rgba(168, 85, 247, 0.4)',
+            boxShadow: '0 20px 60px rgba(0,0,0,0.7), 0 0 30px rgba(168, 85, 247, 0.15)',
+          }}
+        >
+          {/* Popup title bar - draggable */}
+          <div
+            onMouseDown={handlePopupDragStart}
+            style={{
+              display: 'flex', alignItems: 'center', gap: '8px',
+              padding: '8px 12px',
+              background: 'linear-gradient(135deg, rgba(168, 85, 247, 0.2) 0%, rgba(59, 130, 246, 0.15) 100%)',
+              borderBottom: '1px solid rgba(168, 85, 247, 0.3)',
+              cursor: 'grab', userSelect: 'none',
+            }}
+          >
+            <FiExternalLink size={14} style={{ color: '#a855f7', flexShrink: 0 }} />
+            <span style={{
+              flex: 1, fontSize: '12px', fontWeight: 600, color: '#e2e8f0',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+            }}>
+              Popup — {popupTitle}
+            </span>
+            <button
+              onClick={handleClosePopup}
+              style={{
+                display: 'flex', alignItems: 'center', justifyContent: 'center',
+                width: '22px', height: '22px', borderRadius: '6px',
+                background: 'rgba(239, 68, 68, 0.15)', border: '1px solid rgba(239, 68, 68, 0.3)',
+                color: '#f87171', cursor: 'pointer', flexShrink: 0,
+              }}
+              title="Close popup"
+            >
+              <FiX size={12} />
+            </button>
+          </div>
+
+          {/* Popup URL */}
+          {popupUrl && (
+            <div style={{
+              padding: '4px 12px', fontSize: '11px', color: '#888',
+              overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+              background: '#0c0c0c', borderBottom: '1px solid #222',
+            }}>
+              {popupUrl}
+            </div>
+          )}
+
+          {/* Popup screencast */}
+          <div style={{
+            flex: 1, minHeight: '200px', maxHeight: '55vh', position: 'relative',
+            background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}>
+            {popupImage ? (
+              <img
+                ref={popupImgRef}
+                src={popupImage}
+                alt="Popup"
+                onClick={handlePopupClick}
+                onWheel={handlePopupScroll}
+                style={{
+                  maxWidth: '100%', maxHeight: '100%', display: 'block',
+                  cursor: 'crosshair', objectFit: 'contain',
+                }}
+                draggable={false}
+              />
+            ) : (
+              <div style={{ padding: '40px', textAlign: 'center', color: '#555', fontSize: '13px' }}>
+                Đang tải popup...
+              </div>
+            )}
+            {/* Live indicator for popup */}
+            <div style={{
+              position: 'absolute', top: '6px', right: '6px',
+              padding: '2px 6px', borderRadius: '4px', fontSize: '10px', fontWeight: 500,
+              background: 'rgba(168, 85, 247, 0.2)', color: '#c084fc',
+              border: '1px solid rgba(168, 85, 247, 0.3)',
+              display: 'flex', alignItems: 'center', gap: '3px',
+            }}>
+              <span style={{
+                width: '5px', height: '5px', borderRadius: '50%',
+                background: '#c084fc', animation: 'pulse 2s infinite',
+              }} />
+              POPUP
+            </div>
+          </div>
+
+          {/* Popup input controls */}
+          <div style={{
+            padding: '8px 10px', borderTop: '1px solid #222',
+            display: 'flex', gap: '4px', flexWrap: 'wrap', alignItems: 'center',
+            background: '#0c0c0c',
+          }}>
+            <form onSubmit={handlePopupType} style={{ display: 'flex', gap: '4px', flex: 1, minWidth: '140px' }}>
+              <input
+                type="text"
+                value={popupTypeText}
+                onChange={(e) => setPopupTypeText(e.target.value)}
+                placeholder="Type..."
+                style={{
+                  flex: 1, padding: '5px 8px', borderRadius: '5px', fontSize: '12px',
+                  border: '1px solid #333', background: '#0a0a0a', color: '#fff', outline: 'none',
+                  minWidth: '80px',
+                }}
+                onClick={(e) => e.stopPropagation()}
+              />
+              <button type="submit" className="btn-session btn-session-open" disabled={!popupTypeText}
+                style={{ padding: '4px 8px', fontSize: '11px' }}><FiType size={10} /></button>
+            </form>
+            <button className="btn-session btn-session-open" onClick={() => handlePopupKey('Enter')}
+              style={{ padding: '4px 8px', fontSize: '11px' }}><FiCornerDownLeft size={10} /></button>
+            <button className="btn-session btn-session-open" onClick={() => handlePopupKey('Tab')}
+              style={{ padding: '4px 8px', fontSize: '11px' }}>Tab</button>
+            <button className="btn-session btn-session-open" onClick={() => handlePopupKey('Backspace')}
+              style={{ padding: '4px 8px', fontSize: '11px' }}><FiDelete size={10} /></button>
+            <button className="btn-session btn-session-open" onClick={() => handlePopupKey('Escape')}
+              style={{ padding: '4px 8px', fontSize: '11px' }}>Esc</button>
+          </div>
+        </div>
+      )}
 
       <style>{`
         @keyframes pulse {
