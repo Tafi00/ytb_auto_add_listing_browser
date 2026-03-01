@@ -1227,10 +1227,20 @@ wss.on('connection', async (ws, req) => {
   let alive = true;
   let cmdId = 1;
   let currentTargetId = null;
-  let switchingTab = false; // Guard against rapid re-entrant switches
-  let knownTargetIds = new Set(); // Track known tabs to detect new ones
-  let newTabPollTimer = null; // Periodic poll for new tabs
-  let currentPort = null; // Port of the current worker
+  let switchingTab = false;
+  let knownTargetIds = new Set();
+  let newTabPollTimer = null;
+  let currentPort = null;
+
+  // Debug logging - sends to console AND frontend WS
+  function debugLog(msg) {
+    console.log(`[Screencast] ${msg}`);
+    try {
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: 'debug', message: msg }));
+      }
+    } catch { }
+  }
 
   ws.on('close', () => {
     alive = false;
@@ -1283,16 +1293,36 @@ wss.on('connection', async (ws, req) => {
   }
 
   function stopNewTabPoll() {
-    if (newTabPollTimer) {
-      clearInterval(newTabPollTimer);
-      newTabPollTimer = null;
-    }
+    if (newTabPollTimer) { clearInterval(newTabPollTimer); newTabPollTimer = null; }
   }
 
-  // Poll /json periodically to detect new tabs
+  // Centralized auto-switch with /json/activate
+  async function autoSwitchToTab(newTargetId, source) {
+    if (!alive || switchingTab || newTargetId === currentTargetId) return;
+    switchingTab = true;
+    debugLog(`Auto-switching to ${newTargetId} (via ${source})`);
+    try {
+      // Activate the tab in Chrome so it becomes foreground
+      if (currentPort) {
+        try { await fetch(`http://127.0.0.1:${currentPort}/json/activate/${newTargetId}`); } catch { }
+      }
+      activeTargetId = newTargetId;
+      await connectToTarget(newTargetId);
+      if (ws.readyState === ws.OPEN) {
+        ws.send(JSON.stringify({ type: 'tabChanged', targetId: newTargetId }));
+      }
+      debugLog(`Switched to ${newTargetId} OK`);
+    } catch (e) {
+      debugLog(`Switch failed: ${e.message}`);
+    }
+    switchingTab = false;
+  }
+
+  // Poll /json every 1 second to detect new tabs
   function startNewTabPoll(port) {
     stopNewTabPoll();
     currentPort = port;
+    debugLog(`Poll started on port ${port}, known: [${[...knownTargetIds].join(', ')}]`);
 
     newTabPollTimer = setInterval(async () => {
       if (!alive || switchingTab) return;
@@ -1301,95 +1331,75 @@ wss.on('connection', async (ws, req) => {
         const targets = await res.json();
         const pageTargets = targets.filter(t => t.type === 'page');
 
-        // Check for new targets not in our known set
         for (const t of pageTargets) {
-          if (!knownTargetIds.has(t.id) && t.id !== currentTargetId) {
-            console.log(`[Screencast] New tab detected via polling: ${t.id} (url: ${t.url})`);
+          if (!knownTargetIds.has(t.id)) {
             knownTargetIds.add(t.id);
-
-            // Auto-switch to the new tab
-            if (!switchingTab) {
-              switchingTab = true;
-              activeTargetId = t.id;
-              try {
-                await connectToTarget(t.id);
-                if (ws.readyState === ws.OPEN) {
-                  ws.send(JSON.stringify({ type: 'tabChanged', targetId: t.id }));
-                }
-              } catch { }
-              switchingTab = false;
+            if (t.id !== currentTargetId) {
+              debugLog(`Poll: new tab ${t.id} (${t.url})`);
+              await autoSwitchToTab(t.id, 'polling');
+              break;
             }
-            break; // Only handle one new tab at a time
           }
         }
 
-        // Also update knownTargetIds with all current targets
+        // Clean stale IDs
         const currentIds = new Set(pageTargets.map(t => t.id));
-        // Remove targets that no longer exist
         for (const id of knownTargetIds) {
           if (!currentIds.has(id)) knownTargetIds.delete(id);
         }
       } catch { }
-    }, 2000);
+    }, 1000);
   }
 
-  // Handle new window opening detected via Page.windowOpen CDP event
+  // Handle Page.windowOpen: immediate new tab detection
   async function handleNewWindowOpened(port) {
     if (!alive || switchingTab) return;
-    console.log('[Screencast] Page.windowOpen detected, looking for new tab...');
-
-    // Wait for the new tab to be registered in Chrome
-    await new Promise(r => setTimeout(r, 1000));
-
+    debugLog('Page.windowOpen detected!');
+    await new Promise(r => setTimeout(r, 800));
     try {
       const res = await fetch(`http://127.0.0.1:${port}/json`);
       const targets = await res.json();
       const pageTargets = targets.filter(t => t.type === 'page');
-
-      // Find the new tab (one not in our known set)
       const newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
       if (newTab) {
-        console.log(`[Screencast] New tab found: ${newTab.id} (url: ${newTab.url})`);
         knownTargetIds.add(newTab.id);
-        switchingTab = true;
-        activeTargetId = newTab.id;
-        try {
-          await connectToTarget(newTab.id);
-          if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify({ type: 'tabChanged', targetId: newTab.id }));
-          }
-        } catch { }
-        switchingTab = false;
+        await autoSwitchToTab(newTab.id, 'Page.windowOpen');
       } else {
-        // Maybe the tab existed already; refresh known IDs
         for (const t of pageTargets) knownTargetIds.add(t.id);
+        debugLog('windowOpen: no new tab found in /json');
       }
     } catch (e) {
-      console.log(`[Screencast] Error finding new tab: ${e.message}`);
+      debugLog(`windowOpen error: ${e.message}`);
     }
   }
 
   async function connectToTarget(targetId) {
-    // Stop existing screencast first
     await stopScreencast();
     cmdId = 1;
 
     try {
       const pages = await getCdpPageTargets();
+      debugLog(`connectToTarget(${targetId || 'null'}): ${pages.length} pages [${pages.map(p => p.id).join(', ')}]`);
+
       const target = targetId ? pages.find(t => t.id === targetId) : pages[0];
       if (!target || !target.webSocketDebuggerUrl) {
+        debugLog(`Target ${targetId} not found`);
         if (ws.readyState === ws.OPEN) ws.send(JSON.stringify({ type: 'error', error: 'No browser page found' }));
         return;
       }
       currentTargetId = target.id;
       const targetPort = target.port || 19222;
+      currentPort = targetPort;
 
-      // Initialize known targets and start polling if not already running
+      // Activate the tab in Chrome
+      try { await fetch(`http://127.0.0.1:${targetPort}/json/activate/${target.id}`); } catch { }
+
+      // Start polling if not already running
       if (!newTabPollTimer) {
-        // Seed known target IDs with all current page targets
         for (const p of pages) knownTargetIds.add(p.id);
         startNewTabPoll(targetPort);
       }
+      knownTargetIds.add(target.id);
 
       const { default: WebSocket } = await import('ws');
       const newCdpWs = new WebSocket(target.webSocketDebuggerUrl);
@@ -1403,14 +1413,16 @@ wss.on('connection', async (ws, req) => {
         }
         try {
           newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.enable' }));
+          // Enable Target domain for targetCreated events
+          newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Target.setDiscoverTargets', params: { discover: true } }));
           newCdpWs.send(JSON.stringify({
             id: cmdId++,
             method: 'Page.startScreencast',
             params: { format: 'jpeg', quality: 60, maxWidth: 1280, maxHeight: 720, everyNthFrame: 1 }
           }));
-          console.log(`[Screencast] CDP screencast started for target ${target.id}`);
+          debugLog(`Screencast started for ${target.id} (${target.url})`);
         } catch (e) {
-          console.log(`[Screencast] Error starting screencast: ${e.message}`);
+          debugLog(`Error starting screencast: ${e.message}`);
         }
       });
 
@@ -1432,8 +1444,15 @@ wss.on('connection', async (ws, req) => {
               }));
             }
           } else if (msg.method === 'Page.windowOpen') {
-            // Current page opened a new window/tab — detect and switch to it
+            debugLog(`Page.windowOpen: url=${msg.params?.url}`);
             handleNewWindowOpened(targetPort).catch(() => { });
+          } else if (msg.method === 'Target.targetCreated') {
+            const info = msg.params?.targetInfo;
+            if (info && info.type === 'page' && info.targetId !== currentTargetId) {
+              debugLog(`Target.targetCreated: ${info.targetId} (${info.url})`);
+              knownTargetIds.add(info.targetId);
+              setTimeout(() => autoSwitchToTab(info.targetId, 'Target.targetCreated').catch(() => { }), 500);
+            }
           }
         } catch { }
       });

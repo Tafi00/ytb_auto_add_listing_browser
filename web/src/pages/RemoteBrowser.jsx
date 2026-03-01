@@ -91,7 +91,7 @@ function RemoteBrowser() {
   // Fetch tabs periodically
   useEffect(() => {
     fetchTabs();
-    const interval = setInterval(fetchTabs, 5000);
+    const interval = setInterval(fetchTabs, 2000);
     return () => clearInterval(interval);
   }, [fetchTabs]);
 
@@ -143,6 +143,8 @@ function RemoteBrowser() {
             setActiveTabId(msg.targetId);
             fetchTabs();
           }
+        } else if (msg.type === 'debug') {
+          console.log('[RemoteBrowser Debug]', msg.message);
         } else if (msg.type === 'error') {
           setError(msg.error);
         }
