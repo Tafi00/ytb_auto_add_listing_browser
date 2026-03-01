@@ -1261,6 +1261,8 @@ wss.on('connection', async (ws, req) => {
   let knownTargetIds = new Set();
   let newTabPollTimer = null;
   let currentPort = null;
+  let lastFrameTime = Date.now();
+  let browserCdpWs = null;
 
   // Debug logging - sends to console AND frontend WS
   function debugLog(msg) {
@@ -1277,12 +1279,14 @@ wss.on('connection', async (ws, req) => {
     console.log('[Screencast] Client disconnected');
     stopScreencast();
     stopNewTabPoll();
+    stopBrowserCdp();
   });
 
   ws.on('error', () => {
     alive = false;
     stopScreencast();
     stopNewTabPoll();
+    stopBrowserCdp();
   });
 
   // Handle input commands from client (click, scroll, switchTab) via the same CDP connection
@@ -1326,6 +1330,68 @@ wss.on('connection', async (ws, req) => {
     if (newTabPollTimer) { clearInterval(newTabPollTimer); newTabPollTimer = null; }
   }
 
+  function stopBrowserCdp() {
+    if (browserCdpWs) {
+      try { browserCdpWs.close(); } catch { }
+      browserCdpWs = null;
+    }
+  }
+
+  // Connect to browser-level CDP to detect tab activation
+  async function startBrowserCdpMonitor(port) {
+    stopBrowserCdp();
+    try {
+      const versionRes = await fetch(`http://127.0.0.1:${port}/json/version`);
+      const versionInfo = await versionRes.json();
+      const browserWsUrl = versionInfo.webSocketDebuggerUrl;
+      if (!browserWsUrl) {
+        debugLog('No browser webSocketDebuggerUrl found');
+        return;
+      }
+
+      const { default: WebSocket } = await import('ws');
+      const bws = new WebSocket(browserWsUrl);
+      browserCdpWs = bws;
+
+      bws.on('open', () => {
+        if (!alive) { try { bws.close(); } catch { } return; }
+        // Enable target discovery on browser level
+        bws.send(JSON.stringify({ id: 1, method: 'Target.setDiscoverTargets', params: { discover: true } }));
+        debugLog('Browser CDP connected, monitoring tab switches');
+      });
+
+      bws.on('message', (data) => {
+        if (!alive || browserCdpWs !== bws) return;
+        try {
+          const msg = JSON.parse(data.toString());
+          // Target.targetInfoChanged fires when tab visibility/url changes
+          if (msg.method === 'Target.targetInfoChanged') {
+            const info = msg.params?.targetInfo;
+            // Only handle page targets that become visible and are different from current
+            if (info && info.type === 'page' && info.targetId !== currentTargetId) {
+              // Check if this target just became the foreground tab
+              // We detect this via frame staleness — if current tab has no frames,
+              // any targetInfoChanged on another page means user likely switched to it
+              const frameStaleSec = (Date.now() - lastFrameTime) / 1000;
+              if (frameStaleSec > 1.5) {
+                debugLog(`Browser CDP: tab ${info.targetId} changed while current tab stale (${frameStaleSec.toFixed(1)}s). Switching...`);
+                autoSwitchToTab(info.targetId, 'Browser.targetInfoChanged').catch(() => { });
+              }
+            }
+          }
+        } catch { }
+      });
+
+      bws.on('close', () => {
+        if (browserCdpWs === bws) browserCdpWs = null;
+      });
+      bws.on('error', () => { });
+
+    } catch (e) {
+      debugLog(`Browser CDP monitor error: ${e.message}`);
+    }
+  }
+
   // Centralized auto-switch with /json/activate
   async function autoSwitchToTab(newTargetId, source) {
     if (!alive || switchingTab || newTargetId === currentTargetId) return;
@@ -1361,6 +1427,7 @@ wss.on('connection', async (ws, req) => {
         const targets = await res.json();
         const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
 
+        // Detect new tabs
         for (const t of pageTargets) {
           if (!knownTargetIds.has(t.id)) {
             knownTargetIds.add(t.id);
@@ -1369,6 +1436,18 @@ wss.on('connection', async (ws, req) => {
               await autoSwitchToTab(t.id, 'polling');
               break;
             }
+          }
+        }
+
+        // Detect stale frames — if no screencast frame for 3s, user likely switched tabs in Chrome
+        const frameStaleSec = (Date.now() - lastFrameTime) / 1000;
+        if (frameStaleSec > 3 && pageTargets.length > 1) {
+          // Try to find the foreground tab by checking which tab is NOT the current one
+          // Chrome puts the active tab first in /json in most cases
+          const otherTab = pageTargets.find(t => t.id !== currentTargetId);
+          if (otherTab) {
+            debugLog(`Poll: frames stale for ${frameStaleSec.toFixed(1)}s, switching to ${otherTab.id} (${otherTab.url})`);
+            await autoSwitchToTab(otherTab.id, 'stale-frame-poll');
           }
         }
 
@@ -1445,6 +1524,14 @@ wss.on('connection', async (ws, req) => {
         startNewTabPoll(targetPort);
       }
 
+      // Start browser-level CDP monitor for tab activation detection
+      if (!browserCdpWs) {
+        startBrowserCdpMonitor(targetPort).catch(() => { });
+      }
+
+      // Reset frame time on new connection
+      lastFrameTime = Date.now();
+
       const { default: WebSocket } = await import('ws');
       const newCdpWs = new WebSocket(target.webSocketDebuggerUrl);
       cdpWs = newCdpWs;
@@ -1477,6 +1564,7 @@ wss.on('connection', async (ws, req) => {
           if (msg.method === 'Page.screencastFrame') {
             const { data: frameData, metadata, sessionId: sid } = msg.params;
             sessionId = sid;
+            lastFrameTime = Date.now();
             if (newCdpWs.readyState === newCdpWs.OPEN) {
               newCdpWs.send(JSON.stringify({ id: cmdId++, method: 'Page.screencastFrameAck', params: { sessionId: sid } }));
             }
@@ -1504,8 +1592,27 @@ wss.on('connection', async (ws, req) => {
       });
 
       newCdpWs.on('close', () => {
-        if (alive && ws.readyState === ws.OPEN && cdpWs === newCdpWs) {
-          ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
+        if (alive && cdpWs === newCdpWs) {
+          debugLog('CDP connection closed, attempting auto-reconnect...');
+          // Auto-reconnect: find another available tab
+          setTimeout(async () => {
+            if (!alive || switchingTab) return;
+            try {
+              const pages = await getCdpPageTargets();
+              const pageTargets = pages.filter(t => t.id !== currentTargetId);
+              if (pageTargets.length > 0) {
+                await autoSwitchToTab(pageTargets[0].id, 'cdp-close-reconnect');
+              } else if (pages.length > 0) {
+                // Reconnect to the same tab (it might have been replaced)
+                await connectToTarget(pages[0].id);
+              }
+            } catch (e) {
+              debugLog(`Auto-reconnect failed: ${e.message}`);
+              if (ws.readyState === ws.OPEN) {
+                ws.send(JSON.stringify({ type: 'error', error: 'CDP connection closed' }));
+              }
+            }
+          }, 500);
         }
       });
 
