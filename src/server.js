@@ -1637,9 +1637,49 @@ wss.on('connection', async (ws, req) => {
             }
           } else if (msg.method === 'Page.frameNavigated') {
             // Update popup URL in frontend
-            const url = msg.params?.frame?.url;
-            if (url && ws.readyState === ws.OPEN) {
-              ws.send(JSON.stringify({ type: 'popupNavigated', url }));
+            const navUrl = msg.params?.frame?.url;
+            if (navUrl && ws.readyState === ws.OPEN) {
+              ws.send(JSON.stringify({ type: 'popupNavigated', url: navUrl }));
+            }
+            // Auto-detect auth completion: popup navigated away from accounts.google.com
+            // to the redirect URL (e.g. youtube.com/signin?action_handle_signin=true)
+            // This means auth is done but popup is stuck because window.opener is null
+            if (navUrl && popupTarget.url) {
+              try {
+                const origHost = new URL(popupTarget.url).hostname;
+                const newHost = new URL(navUrl).hostname;
+                const isAuthRedirect = (
+                  origHost.includes('accounts.google.com') &&
+                  !newHost.includes('accounts.google.com') &&
+                  (navUrl.includes('signin') || navUrl.includes('reauth') || navUrl.includes('action_handle_signin'))
+                );
+                if (isAuthRedirect) {
+                  debugLog(`Popup auth completed! Redirect detected: ${navUrl}`);
+                  // Wait for cookies/session to settle
+                  setTimeout(async () => {
+                    debugLog('Auto-closing popup and reloading main page...');
+                    // Close popup
+                    if (popupTargetId && currentPort) {
+                      try { await fetch(`http://127.0.0.1:${currentPort}/json/close/${popupTargetId}`); } catch { }
+                    }
+                    stopPopupScreencast();
+                    // Reload the main page via CDP to pick up fresh auth
+                    try {
+                      const mainCdp = cdpWs;
+                      if (mainCdp && mainCdp.readyState === mainCdp.OPEN) {
+                        mainCdp.send(JSON.stringify({ id: cmdId++, method: 'Page.reload' }));
+                        debugLog('Main page reloaded after auth completion');
+                      }
+                    } catch (reloadErr) {
+                      debugLog(`Failed to reload main page: ${reloadErr.message}`);
+                    }
+                    // Notify frontend
+                    if (ws.readyState === ws.OPEN) {
+                      ws.send(JSON.stringify({ type: 'popupAuthComplete' }));
+                    }
+                  }, 2000);
+                }
+              } catch { }
             }
           }
         } catch { }

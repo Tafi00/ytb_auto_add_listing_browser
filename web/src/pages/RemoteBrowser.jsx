@@ -177,6 +177,13 @@ function RemoteBrowser() {
           setPopupOpen(false);
           setPopupImage(null);
           setPopupUrl('');
+        } else if (msg.type === 'popupAuthComplete') {
+          setPopupOpen(false);
+          setPopupImage(null);
+          setPopupUrl('');
+          setError('');
+          // Brief notification
+          console.log('[RemoteBrowser] Auth completed, page reloading...');
         } else if (msg.type === 'debug') {
           console.log('[RemoteBrowser Debug]', msg.message);
         } else if (msg.type === 'error') {
