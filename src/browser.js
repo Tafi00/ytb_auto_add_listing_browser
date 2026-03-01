@@ -62,6 +62,7 @@ export class Browser {
       '--disable-dev-shm-usage',
       '--disable-logging',
       '--disable-extensions',
+      '--disable-popup-blocking',
     ];
 
     if (this.config.headless) {

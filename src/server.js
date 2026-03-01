@@ -1450,24 +1450,54 @@ wss.on('connection', async (ws, req) => {
   async function handleNewWindowOpened(port, popupUrl) {
     if (!alive) return;
     debugLog(`Page.windowOpen detected! url=${popupUrl}`);
-    await new Promise(r => setTimeout(r, 1000));
-    try {
-      const res = await fetch(`http://127.0.0.1:${port}/json`);
-      const targets = await res.json();
-      const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
-      const newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
-      if (newTab) {
-        knownTargetIds.add(newTab.id);
-        debugLog(`Popup found: ${newTab.id} (${newTab.url})`);
-        // Start secondary popup screencast instead of switching main view
-        await startPopupScreencast(newTab, port);
-      } else {
-        for (const t of pageTargets) knownTargetIds.add(t.id);
-        debugLog('windowOpen: no new tab found in /json');
+
+    // Snapshot known IDs before waiting — so poll timer can't race ahead
+    const snapshotKnown = new Set(knownTargetIds);
+
+    // Retry multiple times to give Chrome time to create the popup target
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      await new Promise(r => setTimeout(r, 500));
+      if (!alive) return;
+
+      try {
+        const res = await fetch(`http://127.0.0.1:${port}/json`);
+        const targets = await res.json();
+        const pageTargets = targets.filter(t => !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(t.type));
+
+        // Strategy 1: Find target NOT in our pre-wait snapshot (ideal case)
+        let newTab = pageTargets.find(t => !snapshotKnown.has(t.id) && t.id !== currentTargetId);
+
+        // Strategy 2: URL-based matching (fallback if poll already added it to knownTargetIds)
+        if (!newTab && popupUrl) {
+          try {
+            const popupHost = new URL(popupUrl).hostname;
+            newTab = pageTargets.find(t => {
+              if (t.id === currentTargetId) return false;
+              try { return new URL(t.url).hostname === popupHost; } catch { return false; }
+            });
+          } catch { }
+        }
+
+        // Strategy 3: If there are more targets than in our snapshot, pick the newest unknown
+        if (!newTab) {
+          newTab = pageTargets.find(t => !knownTargetIds.has(t.id) && t.id !== currentTargetId);
+        }
+
+        if (newTab) {
+          knownTargetIds.add(newTab.id);
+          debugLog(`Popup found (attempt ${attempt}): ${newTab.id} (${newTab.url})`);
+          await startPopupScreencast(newTab, port);
+          return;
+        }
+
+        debugLog(`windowOpen attempt ${attempt}/5: no popup target yet...`);
+      } catch (e) {
+        debugLog(`windowOpen attempt ${attempt} error: ${e.message}`);
       }
-    } catch (e) {
-      debugLog(`windowOpen error: ${e.message}`);
     }
+
+    // All attempts failed
+    debugLog('windowOpen: popup target not found after 5 attempts. Chrome may have blocked the popup.');
   }
 
   // Start a secondary CDP screencast for the popup target
@@ -1640,8 +1670,15 @@ wss.on('connection', async (ws, req) => {
               }));
             }
           } else if (msg.method === 'Page.windowOpen') {
-            debugLog(`Page.windowOpen: url=${msg.params?.url}`);
-            handleNewWindowOpened(targetPort, msg.params?.url).catch(() => { });
+            const woParams = msg.params || {};
+            debugLog(`Page.windowOpen: url=${woParams.url} windowName=${woParams.windowName || '(none)'} features=${woParams.windowFeatures || '(none)'}`);
+            // Skip if opening in the same window (not a real popup)
+            const wName = (woParams.windowName || '').toLowerCase();
+            if (wName === '_self' || wName === '_top' || wName === '_parent') {
+              debugLog('windowOpen: same-window navigation, skipping popup handler');
+            } else {
+              handleNewWindowOpened(targetPort, woParams.url).catch(() => { });
+            }
           } else if (msg.method === 'Target.targetCreated') {
             const info = msg.params?.targetInfo;
             if (info && !['browser', 'background_page', 'service_worker', 'shared_worker'].includes(info.type) && info.targetId !== currentTargetId) {
