@@ -925,6 +925,36 @@ app.get('/api/browser/page-info', auth, async (_, res) => {
   }
 });
 
+// Robustly find the Playwright page that matches the CDP target
+function findMatchingPage(allPages, target) {
+  // 1. Exact match
+  let page = allPages.find(p => p.url() === target.url);
+  if (page) return page;
+
+  // 2. Base URL match (ignore queries/hashes that change during redirects)
+  const targetBase = target.url.split('?')[0].split('#')[0];
+  page = allPages.find(p => p.url().startsWith(targetBase));
+  if (page) return page;
+
+  // 3. Hostname match (very reliable for distinguishing popups like accounts.google.com)
+  try {
+    const targetHost = new URL(target.url).hostname;
+    const sameHostPages = allPages.filter(p => {
+      try { return new URL(p.url()).hostname === targetHost; } catch { return false; }
+    });
+    // If exactly one page has this hostname, it's our target!
+    if (sameHostPages.length === 1) return sameHostPages[0];
+  } catch { }
+
+  // 4. If we know it's a popup (it's not the main page), guess the last opened one
+  if (allPages.length > 1 && allPages[0].url() !== target.url) {
+    return allPages[allPages.length - 1]; // Popups are appended
+  }
+
+  // Fallback
+  return allPages[0];
+}
+
 // Screenshot via CDP directly
 app.get('/api/browser/screenshot', auth, async (_, res) => {
   try {
@@ -938,7 +968,7 @@ app.get('/api/browser/screenshot', auth, async (_, res) => {
     if (contexts.length === 0) { await browser.close(); return res.status(400).json({ error: 'No context' }); }
 
     const allPages = contexts[0].pages();
-    const page = allPages.find(p => p.url() === target.url) || allPages[0];
+    const page = findMatchingPage(allPages, target);
     if (!page) { await browser.close(); return res.status(400).json({ error: 'No page' }); }
 
     const url = page.url();
@@ -980,7 +1010,7 @@ async function getActivePage() {
   const contexts = browser.contexts();
   if (contexts.length === 0) { await browser.close(); throw new Error('No context'); }
   const allPages = contexts[0].pages();
-  const page = allPages.find(p => p.url() === target.url) || allPages[0];
+  const page = findMatchingPage(allPages, target);
   if (!page) { await browser.close(); throw new Error('No page'); }
   return { browser, page };
 }
