@@ -5,3 +5,5 @@ web/node_modules/
 .env
 config/
 data/
+dist/
+*.exe

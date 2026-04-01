@@ -283,6 +283,49 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000);
 
+// ==================== Redirect Resolver ====================
+
+// Các domain rút gọn cần resolve
+const SHORT_URL_HOSTS = ['s.lazada.vn', 'c.lazada.vn', 's.shopee.vn', 'shp.ee', 'vn.shp.ee'];
+
+function isShortUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return SHORT_URL_HOSTS.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
+  } catch { return false; }
+}
+
+async function resolveRedirects(startUrl, maxHops = 10) {
+  let currentUrl = startUrl;
+  for (let i = 0; i < maxHops; i++) {
+    const res = await fetch(currentUrl, {
+      method: 'GET',
+      redirect: 'manual',
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      },
+    });
+    if (res.status >= 300 && res.status < 400) {
+      const location = res.headers.get('location');
+      if (!location) break;
+      currentUrl = new URL(location, currentUrl).href;
+    } else {
+      // Check meta refresh
+      const ct = res.headers.get('content-type') || '';
+      if (ct.includes('text/html')) {
+        const body = await res.text();
+        const match = body.match(/<meta[^>]+http-equiv=["']refresh["'][^>]+content=["']\d+;\s*url=([^"']+)["']/i);
+        if (match) {
+          currentUrl = new URL(match[1], currentUrl).href;
+          continue;
+        }
+      }
+      break;
+    }
+  }
+  return currentUrl;
+}
+
 // Validate product URL format
 function isValidProductUrl(url) {
   try {
@@ -320,6 +363,23 @@ app.post('/api/get-affiliate', async (req, res) => {
 
   if (!isValidProductUrl(sanitizedUrl)) {
     return res.status(400).json({ error: 'Link sản phẩm không hợp lệ. Vui lòng nhập link Shopee hoặc Lazada.' });
+  }
+
+  // Resolve short URL → full URL trước khi gửi cho worker
+  let finalProductUrl = sanitizedUrl;
+  if (isShortUrl(sanitizedUrl)) {
+    try {
+      console.log(`[API] Resolving short URL: ${sanitizedUrl}`);
+      finalProductUrl = await resolveRedirects(sanitizedUrl);
+      console.log(`[API] Resolved to: ${finalProductUrl}`);
+      // Validate lại URL sau khi resolve
+      if (!isValidProductUrl(finalProductUrl)) {
+        return res.status(400).json({ error: 'Link sau khi chuyển hướng không hợp lệ.' });
+      }
+    } catch (e) {
+      console.error(`[API] Failed to resolve short URL: ${e.message}`);
+      return res.status(400).json({ error: 'Không thể xử lý link rút gọn. Vui lòng dùng link đầy đủ.' });
+    }
   }
 
   // Rate limit
@@ -362,23 +422,23 @@ app.post('/api/get-affiliate', async (req, res) => {
     const tabQueue = getQueueForTab(targetUrl);
     const queuePos = tabQueue.pending;
     console.log(`[API] Tab queue pending: ${queuePos}`);
-    console.log(`[API] Assigned to: ${targetUrl} (position ${queuePos}), product: ${sanitizedUrl}`);
+    console.log(`[API] Assigned to: ${targetUrl} (position ${queuePos}), product: ${finalProductUrl}`);
 
     const result = await tabQueue.push(async () => {
       const jobStart = Date.now();
-      console.log(`[API] Job START for product: ${sanitizedUrl} on tab: ${targetUrl}`);
+      console.log(`[API] Job START for product: ${finalProductUrl} on tab: ${targetUrl}`);
 
       const worker = getAvailableWorker(targetUrl);
       if (!worker) throw new Error('Worker chưa kết nối');
 
-      const data = await sendJobToWorker(worker, jobId, targetUrl, sanitizedUrl);
+      const data = await sendJobToWorker(worker, jobId, targetUrl, finalProductUrl);
       console.log(`[API] Total job time: ${Date.now() - jobStart}ms`);
-      console.log(`[API] Affiliate URL for ${sanitizedUrl}: ${data.affiliateUrl}`);
+      console.log(`[API] Affiliate URL for ${finalProductUrl}: ${data.affiliateUrl}`);
 
       // Verify domain match
       if (data.affiliateUrl) {
-        const productDomain = sanitizedUrl.includes('shopee') ? 'shopee' :
-          sanitizedUrl.includes('lazada') ? 'lazada' : null;
+        const productDomain = finalProductUrl.includes('shopee') ? 'shopee' :
+          finalProductUrl.includes('lazada') ? 'lazada' : null;
         if (productDomain && !data.affiliateUrl.toLowerCase().includes(productDomain)) {
           console.warn(`[API] WARNING: Product domain mismatch! Expected ${productDomain} in affiliate URL but got: ${data.affiliateUrl}`);
         }
