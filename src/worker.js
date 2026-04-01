@@ -7,6 +7,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
+import http from 'http';
 import WebSocket from 'ws';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -15,14 +16,19 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.WORKER_SERVER_URL || 'ws://localhost:3002';
 const WORKER_AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN || 'default-worker-token';
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
+let headlessMode = process.env.HEADLESS === 'true';
+const CONTROL_PANEL_PORT = parseInt(process.env.CONTROL_PANEL_PORT || '19200');
 
 // State
 let ws = null;
 let reconnectTimer = null;
 let reconnectDelay = 1000;
+let connectionEnabled = true; // Bật/tắt kết nối server
 let currentUrls = [];
 let activeWorkers = []; // Chrome process workers
 let _playwrightChromium = null;
+let recentLogs = []; // Keep last 100 logs for control panel
+let jobStats = { total: 0, success: 0, failed: 0 };
 
 // ==================== Playwright & Chrome ====================
 
@@ -80,6 +86,17 @@ async function launchBrowser(url, port, sessionDir) {
         '--disable-extensions',
         '--window-size=1200,800',
     ];
+
+    if (headlessMode) {
+        args.push(
+            '--headless=new',                     // New headless - cùng engine render như headed
+            '--disable-gpu',                      // Tránh lỗi GPU trong headless
+            '--no-sandbox',                       // Cần cho headless trên một số môi trường
+            '--disable-blink-features=AutomationControlled', // Ẩn flag webdriver
+            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        );
+        log('Running in HEADLESS mode (--headless=new)');
+    }
 
     const child = spawn(chromePath, args, {
         detached: false,
@@ -211,7 +228,7 @@ async function addProduct(page, productUrl) {
                 const isVisible = await product.isVisible().catch(() => false);
                 if (!isVisible) break;
                 await product.hover();
-                const deleteBtn = page.locator('ytcp-icon-button.delete-product-button[aria-label="Delete"]').first();
+                const deleteBtn = page.locator('ytcp-icon-button.delete-product-button').first();
                 await deleteBtn.waitFor({ state: 'visible', timeout: 10000 });
                 await deleteBtn.click();
                 await page.waitForTimeout(300);
@@ -224,7 +241,7 @@ async function addProduct(page, productUrl) {
     }
 
     // Wait for search results
-    const tagBtn = page.locator('ytcp-icon-button.tag-product-button[aria-label="Tag"]').first();
+    const tagBtn = page.locator('ytcp-icon-button.tag-product-button').first();
     try {
         await tagBtn.waitFor({ state: 'visible', timeout: 8000 });
     } catch {
@@ -253,7 +270,7 @@ async function addProduct(page, productUrl) {
     await nextBtn.click();
     log('Clicked Next button');
 
-    const doneBtn = page.locator('button[aria-label="Done"]:has(div.ytcpButtonShapeImpl__button-text-content:text("Done"))').first();
+    const doneBtn = page.locator('ytcp-button#picker-done-button button, button[aria-label="Done"], button[aria-label="Xong"]').first();
     await doneBtn.waitFor({ state: 'visible', timeout: 10000 });
     await doneBtn.click();
     log('Clicked Done button');
@@ -384,12 +401,33 @@ async function openBrowsers(urls) {
     await new Promise(r => setTimeout(r, 500));
 
     const sessionsDir = path.resolve(__dirname, '..', SESSIONS_DIR);
+    const defaultDataDir = path.join(sessionsDir, 'default', 'browser-data');
     let startPort = 19222;
+
+    // Dirs to skip when cloning (cache = large & unnecessary)
+    const SKIP_DIRS = ['Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'GrShaderCache',
+        'ShaderCache', 'Service Worker', 'ScriptCache', 'component_crx_cache'];
 
     for (let i = 0; i < urls.length; i++) {
         const url = urls[i];
         const port = startPort + i;
         const sessionDir = path.join(sessionsDir, `worker-${i}`);
+        const browserDataDir = path.join(sessionDir, 'browser-data');
+
+        // Auto-clone from default profile if this worker has no session data
+        if (!fs.existsSync(path.join(browserDataDir, 'Local State')) && fs.existsSync(path.join(defaultDataDir, 'Local State'))) {
+            try {
+                if (fs.existsSync(browserDataDir)) fs.rmSync(browserDataDir, { recursive: true, force: true });
+                fs.cpSync(defaultDataDir, browserDataDir, {
+                    recursive: true,
+                    filter: (src) => !SKIP_DIRS.includes(path.basename(src)),
+                });
+                cleanLockFiles(browserDataDir);
+                log(`📋 Auto-clone session → worker-${i}`);
+            } catch (e) {
+                log(`⚠️ Lỗi auto-clone worker-${i}: ${e.message}`);
+            }
+        }
 
         // Prepare session directory
         if (!fs.existsSync(sessionDir)) {
@@ -412,7 +450,12 @@ async function openBrowsers(urls) {
 
 function log(msg) {
     const timestamp = new Date().toISOString().slice(11, 19);
-    console.log(`[Worker ${timestamp}] ${msg}`);
+    const logEntry = `[Worker ${timestamp}] ${msg}`;
+    console.log(logEntry);
+
+    // Keep recent logs for control panel
+    recentLogs.push({ time: timestamp, message: msg });
+    if (recentLogs.length > 100) recentLogs.shift();
 
     // Also send log to server
     if (ws && ws.readyState === WebSocket.OPEN) {
@@ -482,7 +525,9 @@ function connect() {
                 const { jobId, targetUrl, productUrl } = msg;
                 log(`Nhận job: ${jobId} - ${productUrl}`);
 
+                jobStats.total++;
                 const result = await executeJob(jobId, targetUrl, productUrl);
+                if (result.success) jobStats.success++; else jobStats.failed++;
 
                 if (ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({
@@ -501,8 +546,12 @@ function connect() {
     });
 
     ws.on('close', () => {
-        log(`Mất kết nối. Thử lại sau ${reconnectDelay / 1000}s...`);
-        scheduleReconnect();
+        if (connectionEnabled) {
+            log(`Mất kết nối. Thử lại sau ${reconnectDelay / 1000}s...`);
+            scheduleReconnect();
+        } else {
+            log('Đã ngắt kết nối server.');
+        }
     });
 
     ws.on('error', (err) => {
@@ -510,7 +559,18 @@ function connect() {
     });
 }
 
+function disconnect() {
+    connectionEnabled = false;
+    if (reconnectTimer) { clearTimeout(reconnectTimer); reconnectTimer = null; }
+    if (ws) {
+        try { ws.close(); } catch { }
+        ws = null;
+    }
+    log('🔌 Đã ngắt kết nối server');
+}
+
 function scheduleReconnect() {
+    if (!connectionEnabled) return;
     if (reconnectTimer) clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(() => {
         reconnectDelay = Math.min(reconnectDelay * 2, 30000); // Max 30s
@@ -547,6 +607,535 @@ process.on('SIGINT', () => {
     process.exit(0);
 });
 
+// ==================== Control Panel HTTP Server ====================
+
+async function restartBrowsers() {
+    if (currentUrls.length > 0) {
+        log(`Đang restart browsers (mode: ${headlessMode ? 'headless' : 'headed'})...`);
+        await openBrowsers(currentUrls);
+
+        // Re-register with server
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'register',
+                urls: activeWorkers.map(w => w.url),
+                hostname: os.hostname(),
+            }));
+        }
+        log('Restart browsers hoàn tất!');
+    } else {
+        log('Không có URL nào để mở browser.');
+    }
+}
+
+function getControlPanelHTML() {
+    return `<!DOCTYPE html>
+<html lang="vi">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Worker Control Panel</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0f0f1a;
+            color: #e0e0e0;
+            min-height: 100vh;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 24px 16px;
+        }
+        .header {
+            text-align: center;
+            margin-bottom: 28px;
+        }
+        .header h1 {
+            font-size: 22px;
+            font-weight: 700;
+            background: linear-gradient(135deg, #6366f1, #a855f7);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            margin-bottom: 6px;
+        }
+        .header p {
+            font-size: 13px;
+            color: #888;
+        }
+        .card {
+            background: #1a1a2e;
+            border: 1px solid #2a2a4a;
+            border-radius: 14px;
+            padding: 20px;
+            margin-bottom: 16px;
+        }
+        .card-title {
+            font-size: 13px;
+            font-weight: 600;
+            color: #888;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 14px;
+        }
+        .status-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+            gap: 12px;
+        }
+        .stat {
+            background: #12122a;
+            border-radius: 10px;
+            padding: 14px;
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 26px;
+            font-weight: 700;
+            color: #fff;
+        }
+        .stat-value.green { color: #22c55e; }
+        .stat-value.red { color: #ef4444; }
+        .stat-value.blue { color: #6366f1; }
+        .stat-value.yellow { color: #eab308; }
+        .stat-label {
+            font-size: 11px;
+            color: #777;
+            margin-top: 4px;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+        .toggle-section {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            flex-wrap: wrap;
+            gap: 12px;
+        }
+        .toggle-info {
+            flex: 1;
+            min-width: 200px;
+        }
+        .toggle-info h3 {
+            font-size: 15px;
+            font-weight: 600;
+            color: #e0e0e0;
+            margin-bottom: 4px;
+        }
+        .toggle-info p {
+            font-size: 12px;
+            color: #777;
+        }
+        .mode-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 20px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .mode-badge.headless {
+            background: rgba(234, 179, 8, 0.15);
+            color: #eab308;
+            border: 1px solid rgba(234, 179, 8, 0.3);
+        }
+        .mode-badge.headed {
+            background: rgba(34, 197, 94, 0.15);
+            color: #22c55e;
+            border: 1px solid rgba(34, 197, 94, 0.3);
+        }
+        .btn {
+            padding: 10px 24px;
+            border: none;
+            border-radius: 10px;
+            font-family: 'Inter', sans-serif;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all 0.2s;
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+        }
+        .btn:active { transform: scale(0.97); }
+        .btn:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+            transform: none;
+        }
+        .btn-primary {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: #fff;
+            box-shadow: 0 4px 15px rgba(99, 102, 241, 0.3);
+        }
+        .btn-primary:hover:not(:disabled) {
+            box-shadow: 0 4px 20px rgba(99, 102, 241, 0.5);
+        }
+        .btn-secondary {
+            background: #2a2a4a;
+            color: #e0e0e0;
+        }
+        .btn-secondary:hover:not(:disabled) {
+            background: #3a3a5a;
+        }
+        .btn-danger {
+            background: linear-gradient(135deg, #dc2626, #ef4444);
+            color: #fff;
+        }
+        .actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .browser-list {
+            list-style: none;
+        }
+        .browser-item {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            padding: 10px 12px;
+            background: #12122a;
+            border-radius: 8px;
+            margin-bottom: 6px;
+            font-size: 13px;
+        }
+        .browser-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #22c55e;
+            flex-shrink: 0;
+        }
+        .browser-port {
+            color: #6366f1;
+            font-weight: 600;
+            font-size: 12px;
+            flex-shrink: 0;
+        }
+        .browser-url {
+            color: #aaa;
+            font-size: 12px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .log-box {
+            background: #0a0a18;
+            border: 1px solid #1a1a3a;
+            border-radius: 8px;
+            padding: 12px;
+            max-height: 300px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 11px;
+            line-height: 1.7;
+        }
+        .log-line {
+            color: #888;
+        }
+        .log-line .time {
+            color: #555;
+            margin-right: 6px;
+        }
+        .log-line .msg { color: #bbb; }
+        .empty-state {
+            text-align: center;
+            padding: 20px;
+            color: #555;
+            font-size: 13px;
+        }
+        .spinner {
+            display: inline-block;
+            width: 14px;
+            height: 14px;
+            border: 2px solid rgba(255,255,255,0.3);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin 0.6s linear infinite;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+        .toast {
+            position: fixed;
+            bottom: 20px;
+            right: 20px;
+            padding: 12px 20px;
+            border-radius: 10px;
+            font-size: 13px;
+            font-weight: 500;
+            z-index: 1000;
+            transform: translateY(100px);
+            opacity: 0;
+            transition: all 0.3s;
+        }
+        .toast.show {
+            transform: translateY(0);
+            opacity: 1;
+        }
+        .toast.success {
+            background: rgba(34, 197, 94, 0.15);
+            border: 1px solid rgba(34, 197, 94, 0.3);
+            color: #22c55e;
+        }
+        .toast.error {
+            background: rgba(239, 68, 68, 0.15);
+            border: 1px solid rgba(239, 68, 68, 0.3);
+            color: #ef4444;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>⚙️ Worker Control Panel</h1>
+            <p id="hostname">Loading...</p>
+        </div>
+
+        <!-- Status -->
+        <div class="card">
+            <div class="card-title">Trạng thái</div>
+            <div class="status-grid">
+                <div class="stat">
+                    <div class="stat-value" id="serverStatus">-</div>
+                    <div class="stat-label">Server</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value blue" id="browserCount">0</div>
+                    <div class="stat-label">Browsers</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value green" id="jobSuccess">0</div>
+                    <div class="stat-label">Thành công</div>
+                </div>
+                <div class="stat">
+                    <div class="stat-value red" id="jobFailed">0</div>
+                    <div class="stat-label">Thất bại</div>
+                </div>
+            </div>
+        </div>
+
+        <!-- Browser Mode -->
+        <div class="card">
+            <div class="card-title">Chế độ Browser</div>
+            <div class="toggle-section">
+                <div class="toggle-info">
+                    <h3>Hiển thị Browser <span class="mode-badge" id="modeBadge">...</span></h3>
+                    <p>Khi tắt, browser chạy ngầm (headless). Khi bật, browser hiển thị cửa sổ.</p>
+                </div>
+                <div class="actions">
+                    <button class="btn btn-primary" id="toggleBtn" onclick="toggleHeadless()">
+                        🔄 Đang tải...
+                    </button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Extra Actions -->
+        <div class="card">
+            <div class="card-title">Hành động</div>
+            <div class="actions">
+                <button class="btn btn-secondary" onclick="restartBrowsers()">🔄 Restart Browsers</button>
+            </div>
+        </div>
+
+        <!-- Active Browsers -->
+        <div class="card">
+            <div class="card-title">Browsers đang chạy</div>
+            <ul class="browser-list" id="browserList">
+                <li class="empty-state">Chưa có browser nào</li>
+            </ul>
+        </div>
+
+        <!-- Logs -->
+        <div class="card">
+            <div class="card-title">Logs gần đây</div>
+            <div class="log-box" id="logBox">
+                <div class="empty-state">Chưa có log</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        let refreshTimer;
+
+        function showToast(msg, type = 'success') {
+            const t = document.getElementById('toast');
+            t.textContent = msg;
+            t.className = 'toast ' + type + ' show';
+            setTimeout(() => t.classList.remove('show'), 3000);
+        }
+
+        async function fetchStatus() {
+            try {
+                const res = await fetch('/api/status');
+                const data = await res.json();
+
+                document.getElementById('hostname').textContent = data.hostname + ' • ' + data.serverUrl;
+                document.getElementById('serverStatus').textContent = data.wsConnected ? '🟢' : '🔴';
+                document.getElementById('serverStatus').className = 'stat-value';
+                document.getElementById('browserCount').textContent = data.browsers.length;
+                document.getElementById('jobSuccess').textContent = data.jobStats.success;
+                document.getElementById('jobFailed').textContent = data.jobStats.failed;
+
+                // Mode badge
+                const badge = document.getElementById('modeBadge');
+                if (data.headless) {
+                    badge.textContent = 'TẮT';
+                    badge.className = 'mode-badge headless';
+                } else {
+                    badge.textContent = 'BẬT';
+                    badge.className = 'mode-badge headed';
+                }
+
+                // Toggle button
+                const btn = document.getElementById('toggleBtn');
+                if (data.headless) {
+                    btn.innerHTML = '👁️ Bật hiển thị';
+                } else {
+                    btn.innerHTML = '🙈 Tắt hiển thị';
+                }
+
+                // Browser list
+                const list = document.getElementById('browserList');
+                if (data.browsers.length === 0) {
+                    list.innerHTML = '<li class="empty-state">Chưa có browser nào</li>';
+                } else {
+                    list.innerHTML = data.browsers.map(b =>
+                        '<li class="browser-item">' +
+                        '<span class="browser-dot"></span>' +
+                        '<span class="browser-port">:' + b.port + '</span>' +
+                        '<span class="browser-url">' + b.url + '</span>' +
+                        '</li>'
+                    ).join('');
+                }
+
+                // Logs
+                const logBox = document.getElementById('logBox');
+                if (data.logs.length === 0) {
+                    logBox.innerHTML = '<div class="empty-state">Chưa có log</div>';
+                } else {
+                    logBox.innerHTML = data.logs.map(l =>
+                        '<div class="log-line"><span class="time">' + l.time + '</span><span class="msg">' +
+                        l.message.replace(/</g, '&lt;').replace(/>/g, '&gt;') + '</span></div>'
+                    ).join('');
+                    logBox.scrollTop = logBox.scrollHeight;
+                }
+            } catch (e) {
+                console.error('Fetch status error:', e);
+            }
+        }
+
+        async function toggleHeadless() {
+            const btn = document.getElementById('toggleBtn');
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span> Đang chuyển...';
+            try {
+                const res = await fetch('/api/toggle-headless', { method: 'POST' });
+                const data = await res.json();
+                showToast(data.headless ? '🙈 Đã chuyển sang headless' : '👁️ Đã bật hiển thị browser');
+                await fetchStatus();
+            } catch (e) {
+                showToast('Lỗi: ' + e.message, 'error');
+            }
+            btn.disabled = false;
+        }
+
+        async function restartBrowsers() {
+            if (!confirm('Restart tất cả browsers?')) return;
+            showToast('Đang restart...');
+            try {
+                const res = await fetch('/api/restart-browsers', { method: 'POST' });
+                const data = await res.json();
+                showToast('✅ ' + data.message);
+                await fetchStatus();
+            } catch (e) {
+                showToast('Lỗi: ' + e.message, 'error');
+            }
+        }
+
+        // Auto refresh every 2s
+        fetchStatus();
+        refreshTimer = setInterval(fetchStatus, 2000);
+    </script>
+</body>
+</html>`;
+}
+
+function startControlPanel() {
+    const server = http.createServer(async (req, res) => {
+        // CORS
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+        res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+        if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
+
+        const url = new URL(req.url, `http://localhost:${CONTROL_PANEL_PORT}`);
+
+        if (url.pathname === '/' || url.pathname === '/index.html') {
+            res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+            res.end(getControlPanelHTML());
+        } else if (url.pathname === '/api/status') {
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({
+                hostname: os.hostname(),
+                serverUrl: SERVER_URL,
+                headless: headlessMode,
+                connectionEnabled,
+                wsConnected: ws && ws.readyState === WebSocket.OPEN,
+                browsers: activeWorkers.map(w => ({ port: w.port, url: w.url })),
+                jobStats,
+                logs: recentLogs.slice(-50),
+            }));
+        } else if (url.pathname === '/api/toggle-headless' && req.method === 'POST') {
+            headlessMode = !headlessMode;
+            log(`Chuyển sang mode: ${headlessMode ? 'HEADLESS' : 'HEADED'}`);
+            // Restart browsers with new mode
+            await restartBrowsers().catch(e => log(`Lỗi restart: ${e.message}`));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ headless: headlessMode, message: 'OK' }));
+        } else if (url.pathname === '/api/restart-browsers' && req.method === 'POST') {
+            await restartBrowsers().catch(e => log(`Lỗi restart: ${e.message}`));
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ message: `Đã restart ${activeWorkers.length} browser(s)` }));
+        } else if (url.pathname === '/api/toggle-connection' && req.method === 'POST') {
+            if (connectionEnabled) {
+                disconnect();
+            } else {
+                connectionEnabled = true;
+                reconnectDelay = 1000;
+                connect();
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ connectionEnabled, message: 'OK' }));
+        } else {
+            res.writeHead(404);
+            res.end('Not Found');
+        }
+    });
+
+    let tryPort = CONTROL_PANEL_PORT;
+    const maxRetries = 5;
+
+    server.on('error', (err) => {
+        if (err.code === 'EADDRINUSE' && tryPort < CONTROL_PANEL_PORT + maxRetries) {
+            tryPort++;
+            log(`⚠️ Port ${tryPort - 1} đang bị chiếm, thử port ${tryPort}...`);
+            server.listen(tryPort);
+        } else if (err.code === 'EADDRINUSE') {
+            log(`⚠️ Không tìm được port trống cho Control Panel. Worker vẫn chạy bình thường.`);
+        } else {
+            log(`⚠️ Lỗi Control Panel: ${err.message}`);
+        }
+    });
+
+    server.listen(tryPort, () => {
+        log(`🎛️ Control Panel: http://localhost:${tryPort}`);
+    });
+}
+
 // ==================== Main ====================
 
 async function main() {
@@ -555,8 +1144,11 @@ async function main() {
     console.log('═══════════════════════════════════════════');
     console.log(`  Server URL: ${SERVER_URL}`);
     console.log(`  Hostname: ${os.hostname()}`);
+    console.log(`  Headless: ${headlessMode ? 'YES (--headless=new)' : 'NO (headed)'}`);
+    console.log(`  Control Panel: http://localhost:${CONTROL_PANEL_PORT}`);
     console.log('');
 
+    startControlPanel();
     connect();
 }
 

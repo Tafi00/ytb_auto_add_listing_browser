@@ -1,8 +1,8 @@
 {
-  "name": "profile-manager",
+  "name": "yt-worker-launcher",
   "version": "1.0.0",
-  "description": "Admin Dashboard - Browser Profile Manager",
-  "main": "src/server.js",
+  "description": "YouTube Auto Listing - Worker Launcher",
+  "main": "src/launcher.js",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
@@ -10,7 +10,9 @@
     "dev": "concurrently \"npm run server\" \"npm run dev:web\"",
     "server": "node src/server.js",
     "dev:web": "npm run dev:client --prefix web",
-    "worker": "node src/worker.js"
+    "worker": "node src/worker.js",
+    "launcher": "electron src/launcher.js",
+    "build-launcher": "electron-builder --win portable"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
@@ -26,7 +28,31 @@
     "ws": "^8.19.0"
   },
   "devDependencies": {
-    "concurrently": "^8.2.2"
+    "concurrently": "^8.2.2",
+    "electron": "^33.4.11",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.ytauto.worker-launcher",
+    "productName": "YT Worker Launcher",
+    "asar": false,
+    "win": {
+      "target": "portable"
+    },
+    "files": [
+      "src/launcher.js",
+      "src/launcher.html",
+      "src/worker.js",
+      "src/config.js",
+      "src/logger.js",
+      "package.json"
+    ],
+    "extraResources": [
+      {
+        "from": ".env",
+        "to": "../.env"
+      }
+    ]
   },
   "engines": {
     "node": ">=22"

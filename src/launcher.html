@@ -1,0 +1,605 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <title>YT Worker Launcher</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box
+        }
+
+        body {
+            font-family: 'Inter', sans-serif;
+            background: #0c0c18;
+            color: #e0e0e0;
+            min-height: 100vh;
+            overflow-x: hidden
+        }
+
+        .app {
+            max-width: 520px;
+            margin: 0 auto;
+            padding: 20px 16px 30px
+        }
+
+        .header {
+            text-align: center;
+            margin-bottom: 24px;
+            padding-top: 6px
+        }
+
+        .header h1 {
+            font-size: 20px;
+            font-weight: 800;
+            background: linear-gradient(135deg, #818cf8, #c084fc);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent
+        }
+
+        .header .sub {
+            font-size: 11px;
+            color: #555;
+            margin-top: 4px;
+            letter-spacing: .5px
+        }
+
+        .step {
+            background: #13132a;
+            border: 1px solid #1e1e3a;
+            border-radius: 14px;
+            padding: 16px 18px;
+            margin-bottom: 12px;
+            position: relative;
+            transition: border-color .3s
+        }
+
+        .step:hover {
+            border-color: #2d2d5a
+        }
+
+        .step-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            width: 22px;
+            height: 22px;
+            border-radius: 50%;
+            font-size: 11px;
+            font-weight: 700;
+            margin-right: 8px;
+            flex-shrink: 0
+        }
+
+        .step-badge.b1 {
+            background: rgba(99, 102, 241, .15);
+            color: #818cf8
+        }
+
+        .step-badge.b2 {
+            background: rgba(168, 85, 247, .15);
+            color: #c084fc
+        }
+
+        .step-badge.b3 {
+            background: rgba(34, 197, 94, .15);
+            color: #22c55e
+        }
+
+        .step-badge.b4 {
+            background: rgba(251, 146, 60, .15);
+            color: #fb923c
+        }
+
+        .step-head {
+            display: flex;
+            align-items: center;
+            margin-bottom: 6px
+        }
+
+        .step-title {
+            font-size: 14px;
+            font-weight: 600
+        }
+
+        .step-desc {
+            font-size: 11px;
+            color: #666;
+            margin-bottom: 12px;
+            line-height: 1.5
+        }
+
+        .dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            margin-right: 6px;
+            flex-shrink: 0
+        }
+
+        .dot.on {
+            background: #22c55e;
+            box-shadow: 0 0 6px rgba(34, 197, 94, .5)
+        }
+
+        .dot.off {
+            background: #555
+        }
+
+        .status-line {
+            font-size: 11px;
+            color: #777;
+            display: flex;
+            align-items: center;
+            margin-bottom: 10px
+        }
+
+        .actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap
+        }
+
+        .btn {
+            padding: 8px 18px;
+            border: none;
+            border-radius: 9px;
+            font-family: 'Inter', sans-serif;
+            font-size: 12px;
+            font-weight: 600;
+            cursor: pointer;
+            transition: all .15s;
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            white-space: nowrap
+        }
+
+        .btn:active {
+            transform: scale(.96)
+        }
+
+        .btn:disabled {
+            opacity: .4;
+            cursor: not-allowed;
+            transform: none
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #6366f1, #8b5cf6);
+            color: #fff;
+            box-shadow: 0 3px 12px rgba(99, 102, 241, .25)
+        }
+
+        .btn-primary:hover:not(:disabled) {
+            box-shadow: 0 3px 18px rgba(99, 102, 241, .45)
+        }
+
+        .btn-success {
+            background: linear-gradient(135deg, #059669, #10b981);
+            color: #fff;
+            box-shadow: 0 3px 12px rgba(16, 185, 129, .25)
+        }
+
+        .btn-success:hover:not(:disabled) {
+            box-shadow: 0 3px 18px rgba(16, 185, 129, .45)
+        }
+
+        .btn-ghost {
+            background: #1e1e3a;
+            color: #aaa
+        }
+
+        .btn-ghost:hover:not(:disabled) {
+            background: #2a2a4a;
+            color: #ddd
+        }
+
+        .btn-danger {
+            background: linear-gradient(135deg, #dc2626, #ef4444);
+            color: #fff
+        }
+
+        .btn-warn {
+            background: linear-gradient(135deg, #d97706, #f59e0b);
+            color: #fff;
+            box-shadow: 0 3px 12px rgba(245, 158, 11, .25)
+        }
+
+        .btn-warn:hover:not(:disabled) {
+            box-shadow: 0 3px 18px rgba(245, 158, 11, .45)
+        }
+
+        .btn-toggle {
+            min-width: 140px;
+            justify-content: center
+        }
+
+        .log-card {
+            background: #13132a;
+            border: 1px solid #1e1e3a;
+            border-radius: 14px;
+            padding: 14px 16px
+        }
+
+        .log-title {
+            font-size: 11px;
+            font-weight: 600;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+            margin-bottom: 10px
+        }
+
+        .log-box {
+            background: #08081a;
+            border: 1px solid #151530;
+            border-radius: 8px;
+            padding: 10px;
+            max-height: 200px;
+            overflow-y: auto;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 10.5px;
+            line-height: 1.8
+        }
+
+        .log-line .t {
+            color: #444;
+            margin-right: 6px
+        }
+
+        .log-line .m {
+            color: #999
+        }
+
+        .empty {
+            color: #444;
+            text-align: center;
+            padding: 16px;
+            font-size: 11px
+        }
+
+        .worker-info {
+            display: flex;
+            gap: 10px;
+            flex-wrap: wrap;
+            margin-bottom: 10px
+        }
+
+        .wi {
+            background: #0a0a1e;
+            border-radius: 8px;
+            padding: 8px 12px;
+            text-align: center;
+            flex: 1;
+            min-width: 80px
+        }
+
+        .wi-val {
+            font-size: 18px;
+            font-weight: 700;
+            color: #fff
+        }
+
+        .wi-val.g {
+            color: #22c55e
+        }
+
+        .wi-val.r {
+            color: #ef4444
+        }
+
+        .wi-val.b {
+            color: #818cf8
+        }
+
+        .wi-val.y {
+            color: #eab308
+        }
+
+        .wi-label {
+            font-size: 9px;
+            color: #555;
+            text-transform: uppercase;
+            letter-spacing: .5px;
+            margin-top: 2px
+        }
+
+        .spinner {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            border: 2px solid rgba(255, 255, 255, .2);
+            border-top-color: #fff;
+            border-radius: 50%;
+            animation: spin .5s linear infinite
+        }
+
+        @keyframes spin {
+            to {
+                transform: rotate(360deg)
+            }
+        }
+
+        .toast {
+            position: fixed;
+            bottom: 16px;
+            left: 50%;
+            transform: translateX(-50%) translateY(80px);
+            opacity: 0;
+            padding: 10px 20px;
+            border-radius: 10px;
+            font-size: 12px;
+            font-weight: 500;
+            z-index: 99;
+            transition: all .3s;
+            pointer-events: none
+        }
+
+        .toast.show {
+            transform: translateX(-50%) translateY(0);
+            opacity: 1
+        }
+
+        .toast.ok {
+            background: rgba(34, 197, 94, .12);
+            border: 1px solid rgba(34, 197, 94, .3);
+            color: #22c55e
+        }
+
+        .toast.err {
+            background: rgba(239, 68, 68, .12);
+            border: 1px solid rgba(239, 68, 68, .3);
+            color: #ef4444
+        }
+    </style>
+</head>
+
+<body>
+    <div class="app">
+        <div class="header">
+            <h1>⚡ YT Worker Launcher</h1>
+            <div class="sub" id="hostInfo">Loading...</div>
+        </div>
+
+        <!-- Step 1: Default Browser -->
+        <div class="step">
+            <div class="step-head"><span class="step-badge b1">1</span><span class="step-title">Browser Mặc Định</span>
+            </div>
+            <div class="step-desc">Mở Chrome để đăng nhập YouTube Studio. Dữ liệu sẽ được dùng để clone cho workers.
+            </div>
+            <div class="status-line"><span class="dot off" id="dotDefault"></span><span id="statusDefault">Chưa
+                    mở</span></div>
+            <div class="actions">
+                <button class="btn btn-primary" id="btnOpenDefault" onclick="openDefault()">🌐 Mở Browser</button>
+                <button class="btn btn-ghost" id="btnCloseDefault" onclick="closeDefault()" disabled>✕ Đóng</button>
+            </div>
+        </div>
+
+        <!-- Step 2: Clone & Workers -->
+        <div class="step">
+            <div class="step-head"><span class="step-badge b2">2</span><span class="step-title">Clone & Khởi Động
+                    Workers</span></div>
+            <div class="step-desc">Clone dữ liệu browser → workers, sau đó kết nối server và nhận jobs.</div>
+            <div class="status-line"><span class="dot off" id="dotWorker"></span><span id="statusWorker">Chưa
+                    chạy</span></div>
+            <div class="worker-info" id="workerInfo" style="display:none">
+                <div class="wi">
+                    <div class="wi-val b" id="wiBrowsers">0</div>
+                    <div class="wi-label">Browsers</div>
+                </div>
+                <div class="wi">
+                    <div class="wi-val g" id="wiSuccess">0</div>
+                    <div class="wi-label">Thành công</div>
+                </div>
+                <div class="wi">
+                    <div class="wi-val r" id="wiFailed">0</div>
+                    <div class="wi-label">Thất bại</div>
+                </div>
+            </div>
+            <div class="actions">
+                <button class="btn btn-success" id="btnClone" onclick="cloneAndStart()">🚀 Clone & Khởi Động</button>
+                <button class="btn btn-danger" id="btnStop" onclick="stopWorker()" style="display:none">⏹ Dừng</button>
+            </div>
+        </div>
+
+        <!-- Step 3: Toggle Headless -->
+        <div class="step">
+            <div class="step-head"><span class="step-badge b3">3</span><span class="step-title">Hiển Thị Browser</span>
+            </div>
+            <div class="step-desc">Bật/tắt hiển thị cửa sổ Chrome của workers.</div>
+            <div class="status-line"><span class="dot off" id="dotHeadless"></span><span id="statusHeadless">—</span>
+            </div>
+            <div class="actions">
+                <button class="btn btn-primary btn-toggle" id="btnToggle" onclick="toggleHeadless()" disabled>👁️ Đang
+                    tải...</button>
+            </div>
+        </div>
+
+        <!-- Step 4: Server Connection -->
+        <div class="step">
+            <div class="step-head"><span class="step-badge b4">4</span><span class="step-title">Kết Nối Server</span>
+            </div>
+            <div class="step-desc">Bật/tắt kết nối WebSocket với server để nhận và gửi jobs.</div>
+            <div class="status-line"><span class="dot off" id="dotConn"></span><span id="statusConn">—</span></div>
+            <div class="actions">
+                <button class="btn btn-warn btn-toggle" id="btnConn" onclick="toggleConnection()" disabled>🔗 Đang
+                    tải...</button>
+            </div>
+        </div>
+
+        <!-- Logs -->
+        <div class="log-card">
+            <div class="log-title">📋 Logs</div>
+            <div class="log-box" id="logBox">
+                <div class="empty">Chưa có log</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="toast" id="toast"></div>
+
+    <script>
+        const { ipcRenderer } = require('electron');
+        let logs = [];
+
+        // ===== Toast =====
+        function toast(msg, type = 'ok') {
+            const t = document.getElementById('toast');
+            t.textContent = msg; t.className = 'toast ' + type + ' show';
+            setTimeout(() => t.classList.remove('show'), 2500);
+        }
+
+        // ===== Log =====
+        ipcRenderer.on('log', (_, entry) => {
+            logs.push(entry);
+            if (logs.length > 150) logs.shift();
+            renderLogs();
+        });
+
+        function renderLogs() {
+            const box = document.getElementById('logBox');
+            if (logs.length === 0) { box.innerHTML = '<div class="empty">Chưa có log</div>'; return; }
+            box.innerHTML = logs.slice(-60).map(l =>
+                `<div class="log-line"><span class="t">${l.time}</span><span class="m">${esc(l.message)}</span></div>`
+            ).join('');
+            box.scrollTop = box.scrollHeight;
+        }
+        function esc(s) { return s.replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+
+        // ===== Status polling =====
+        ipcRenderer.on('status-changed', refreshAll);
+
+        async function refreshAll() {
+            const s = await ipcRenderer.invoke('get-status');
+            document.getElementById('hostInfo').textContent = s.hostname;
+
+            // Default browser
+            const dotD = document.getElementById('dotDefault');
+            const statusD = document.getElementById('statusDefault');
+            dotD.className = 'dot ' + (s.defaultRunning ? 'on' : 'off');
+            statusD.textContent = s.defaultRunning ? 'Đang mở' : (s.hasData ? 'Đã đóng (có dữ liệu ✓)' : 'Chưa mở');
+            document.getElementById('btnOpenDefault').disabled = s.defaultRunning;
+            document.getElementById('btnCloseDefault').disabled = !s.defaultRunning;
+
+            // Worker
+            const dotW = document.getElementById('dotWorker');
+            const statusW = document.getElementById('statusWorker');
+            dotW.className = 'dot ' + (s.workerRunning ? 'on' : 'off');
+            document.getElementById('btnClone').style.display = s.workerRunning ? 'none' : '';
+            document.getElementById('btnStop').style.display = s.workerRunning ? '' : 'none';
+
+            if (s.workerRunning) {
+                statusW.textContent = 'Đang chạy';
+                // Fetch worker API for details
+                const api = await ipcRenderer.invoke('get-worker-api');
+                if (api) {
+                    document.getElementById('workerInfo').style.display = 'flex';
+                    document.getElementById('wiBrowsers').textContent = api.browsers?.length || 0;
+                    document.getElementById('wiSuccess').textContent = api.jobStats?.success || 0;
+                    document.getElementById('wiFailed').textContent = api.jobStats?.failed || 0;
+
+                    // Headless toggle
+                    document.getElementById('btnToggle').disabled = false;
+                    const dotH = document.getElementById('dotHeadless');
+                    const statusH = document.getElementById('statusHeadless');
+                    if (api.headless) {
+                        dotH.className = 'dot off';
+                        statusH.textContent = 'Ẩn (Headless)';
+                        document.getElementById('btnToggle').innerHTML = '👁️ Bật hiển thị';
+                    } else {
+                        dotH.className = 'dot on';
+                        statusH.textContent = 'Đang hiện';
+                        document.getElementById('btnToggle').innerHTML = '🙈 Tắt hiển thị';
+                    }
+
+                    // Connection toggle
+                    document.getElementById('btnConn').disabled = false;
+                    const dotC = document.getElementById('dotConn');
+                    const statusC = document.getElementById('statusConn');
+                    if (api.connectionEnabled) {
+                        dotC.className = 'dot on';
+                        statusC.textContent = api.wsConnected ? 'Đã kết nối ✓' : 'Đang kết nối...';
+                        document.getElementById('btnConn').innerHTML = '🔌 Ngắt kết nối';
+                    } else {
+                        dotC.className = 'dot off';
+                        statusC.textContent = 'Đã ngắt';
+                        document.getElementById('btnConn').innerHTML = '🔗 Kết nối lại';
+                    }
+                }
+            } else {
+                statusW.textContent = 'Chưa chạy';
+                document.getElementById('workerInfo').style.display = 'none';
+                document.getElementById('btnToggle').disabled = true;
+                document.getElementById('btnToggle').innerHTML = '👁️ Hiện Browser';
+                document.getElementById('dotHeadless').className = 'dot off';
+                document.getElementById('statusHeadless').textContent = '—';
+                document.getElementById('btnConn').disabled = true;
+                document.getElementById('btnConn').innerHTML = '🔗 Kết nối';
+                document.getElementById('dotConn').className = 'dot off';
+                document.getElementById('statusConn').textContent = '—';
+            }
+        }
+
+        // ===== Actions =====
+        async function openDefault() {
+            const btn = document.getElementById('btnOpenDefault');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang mở...';
+            const r = await ipcRenderer.invoke('open-default-browser');
+            if (r.ok) { toast('Đã mở browser mặc định'); }
+            else { toast(r.error, 'err'); }
+            btn.innerHTML = '🌐 Mở Browser';
+            refreshAll();
+        }
+
+        async function closeDefault() {
+            await ipcRenderer.invoke('close-default-browser');
+            toast('Đã đóng browser');
+            refreshAll();
+        }
+
+        async function cloneAndStart() {
+            const btn = document.getElementById('btnClone');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang clone...';
+            const r = await ipcRenderer.invoke('clone-and-start');
+            if (r.ok) { toast('🚀 Worker đã khởi động!'); }
+            else { toast(r.error, 'err'); }
+            btn.disabled = false; btn.innerHTML = '🚀 Clone & Khởi Động';
+            refreshAll();
+        }
+
+        async function stopWorker() {
+            await ipcRenderer.invoke('stop-worker');
+            toast('Đã dừng worker');
+            refreshAll();
+        }
+
+        async function toggleHeadless() {
+            const btn = document.getElementById('btnToggle');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang chuyển...';
+            const r = await ipcRenderer.invoke('toggle-headless');
+            if (r.ok) { toast(r.headless ? '🙈 Đã ẩn browser' : '👁️ Đã hiện browser'); }
+            else { toast(r.error, 'err'); }
+            refreshAll();
+        }
+
+        async function toggleConnection() {
+            const btn = document.getElementById('btnConn');
+            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang chuyển...';
+            const r = await ipcRenderer.invoke('toggle-connection');
+            if (r.ok) { toast(r.connectionEnabled ? '🔗 Đã kết nối lại server' : '🔌 Đã ngắt kết nối'); }
+            else { toast(r.error, 'err'); }
+            refreshAll();
+        }
+
+        // Init
+        refreshAll();
+        setInterval(refreshAll, 3000);
+    </script>
+</body>
+
+</html>
