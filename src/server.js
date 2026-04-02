@@ -291,12 +291,31 @@ setInterval(() => {
 
 // Các domain rút gọn cần resolve
 const SHORT_URL_HOSTS = ['s.lazada.vn', 'c.lazada.vn', 's.shopee.vn', 'shp.ee', 'vn.shp.ee'];
+const LAZADA_SHORT_HOSTS = ['s.lazada.vn', 'c.lazada.vn'];
 
 function isShortUrl(url) {
   try {
     const parsed = new URL(url);
     return SHORT_URL_HOSTS.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
   } catch { return false; }
+}
+
+function isLazadaShortUrl(url) {
+  try {
+    const parsed = new URL(url);
+    return LAZADA_SHORT_HOSTS.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
+  } catch { return false; }
+}
+
+// Strip tracking params from Lazada URL, keep only clean product path
+function cleanLazadaUrl(url) {
+  try {
+    const parsed = new URL(url);
+    // Giữ lại origin + pathname, bỏ hết query params tracking
+    return parsed.origin + parsed.pathname;
+  } catch {
+    return url;
+  }
 }
 
 async function resolveRedirects(startUrl, maxHops = 10) {
@@ -371,14 +390,23 @@ app.post('/api/get-affiliate', async (req, res) => {
 
   // Resolve short URL → full URL trước khi gửi cho worker
   let finalProductUrl = sanitizedUrl;
+  let resolvedProductUrl = sanitizedUrl;
   if (isShortUrl(sanitizedUrl)) {
     try {
       console.log(`[API] Resolving short URL: ${sanitizedUrl}`);
-      finalProductUrl = await resolveRedirects(sanitizedUrl);
-      console.log(`[API] Resolved to: ${finalProductUrl}`);
-      // Validate lại URL sau khi resolve
-      if (!isValidProductUrl(finalProductUrl)) {
+      resolvedProductUrl = await resolveRedirects(sanitizedUrl);
+      console.log(`[API] Resolved to: ${resolvedProductUrl}`);
+      if (!isValidProductUrl(resolvedProductUrl)) {
         return res.status(400).json({ error: 'Link sau khi chuyển hướng không hợp lệ.' });
+      }
+
+      if (isLazadaShortUrl(sanitizedUrl)) {
+        // Lazada: YouTube Studio không nhận link ngắn → dùng link đã resolve nhưng strip tracking params
+        finalProductUrl = cleanLazadaUrl(resolvedProductUrl);
+        console.log(`[API] Lazada cleaned URL: ${finalProductUrl}`);
+      } else {
+        // Shopee: YouTube Studio nhận link ngắn OK → giữ nguyên link gốc
+        finalProductUrl = sanitizedUrl;
       }
     } catch (e) {
       console.error(`[API] Failed to resolve short URL: ${e.message}`);
@@ -439,10 +467,10 @@ app.post('/api/get-affiliate', async (req, res) => {
       console.log(`[API] Total job time: ${Date.now() - jobStart}ms`);
       console.log(`[API] Affiliate URL for ${finalProductUrl}: ${data.affiliateUrl}`);
 
-      // Verify domain match
+      // Verify domain match (dùng resolvedProductUrl vì nó có domain thật)
       if (data.affiliateUrl) {
-        const productDomain = finalProductUrl.includes('shopee') ? 'shopee' :
-          finalProductUrl.includes('lazada') ? 'lazada' : null;
+        const productDomain = resolvedProductUrl.includes('shopee') ? 'shopee' :
+          resolvedProductUrl.includes('lazada') ? 'lazada' : null;
         if (productDomain && !data.affiliateUrl.toLowerCase().includes(productDomain)) {
           console.warn(`[API] WARNING: Product domain mismatch! Expected ${productDomain} in affiliate URL but got: ${data.affiliateUrl}`);
         }

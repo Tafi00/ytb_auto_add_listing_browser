@@ -189,10 +189,23 @@ async function addProduct(page, productUrl) {
 
     try {
         await Promise.race([
-            editBtn.waitFor({ state: 'attached', timeout: 8000 }),
-            btn.waitFor({ state: 'attached', timeout: 8000 })
+            editBtn.waitFor({ state: 'attached', timeout: 15000 }),
+            btn.waitFor({ state: 'attached', timeout: 15000 })
         ]);
-    } catch (e) { }
+    } catch (e) {
+        // If neither button found, try one page reload then wait again
+        log('Products button not found, reloading page and retrying...');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => { });
+        await page.waitForTimeout(2000);
+        try {
+            await Promise.race([
+                editBtn.waitFor({ state: 'attached', timeout: 15000 }),
+                btn.waitFor({ state: 'attached', timeout: 15000 })
+            ]);
+        } catch (e2) {
+            throw new Error('Không tìm thấy nút Sản phẩm sau khi reload. Trang có thể chưa load xong.');
+        }
+    }
 
     const editVisible = await editBtn.isVisible().catch(() => false);
     if (!editVisible) {
