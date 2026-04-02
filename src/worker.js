@@ -149,11 +149,12 @@ async function launchBrowser(url, port, sessionDir) {
 async function getChromePage(targetUrl) {
     const chromium = await getPlaywright();
     const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
-    let worker = targetUrl ? activeWorkers.find(w => w.url === targetUrl || w.url.startsWith(targetBase)) : null;
+    let worker = targetUrl ? activeWorkers.find(w => w.url === targetUrl || w.url.split('?')[0] === targetBase) : null;
 
     if (!worker) {
         if (activeWorkers.length === 0) throw new Error('No browser running.');
-        worker = activeWorkers[0];
+        // Do NOT fallback to activeWorkers[0] - that causes cross-contamination
+        throw new Error(`No browser found for URL: ${targetUrl}`);
     }
 
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
@@ -167,10 +168,12 @@ async function getChromePage(targetUrl) {
 
     let page;
     if (targetUrl) {
-        page = pages.find(p => p.url() === targetUrl || p.url().startsWith(targetBase));
+        page = pages.find(p => p.url() === targetUrl || p.url().split('?')[0] === targetBase);
     }
     if (!page) {
-        page = pages[0];
+        // Do NOT fallback to pages[0] - that causes cross-contamination
+        await browser.close();
+        throw new Error(`No matching page found for URL: ${targetUrl}. Available pages: ${pages.map(p => p.url()).join(', ')}`);
     }
     return { browser, context, page };
 }

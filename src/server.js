@@ -160,14 +160,18 @@ function getQueueForTab(targetUrl) {
 
 // Get an available worker
 function getAvailableWorker(targetUrl) {
-  // Try to find a worker that handles this specific URL
+  // Try to find a worker that handles this specific URL (exact match)
   for (const [id, worker] of connectedWorkers) {
     if (worker.info?.urls?.includes(targetUrl)) return worker;
   }
-  // Fallback: return first connected worker
-  for (const [id, worker] of connectedWorkers) {
-    return worker;
+  // Try partial match (same base URL without query params)
+  const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
+  if (targetBase) {
+    for (const [id, worker] of connectedWorkers) {
+      if (worker.info?.urls?.some(u => u.split('?')[0] === targetBase)) return worker;
+    }
   }
+  // NO fallback - do not send job to wrong worker
   return null;
 }
 
