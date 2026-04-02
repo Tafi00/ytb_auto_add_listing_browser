@@ -292,35 +292,45 @@ async function addProduct(page, productUrl) {
             await saveBtn.evaluate(b => b.click());
         });
         log('Clicked Save button');
-        await page.waitForTimeout(1500);
-        log('Save clicked, proceeding to fetch after 1.5s');
+        await page.waitForTimeout(3000);
+        log('Save clicked, proceeding to fetch after 3s');
     }
 }
 
 const decodeUnicode = (str) => str.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
 
-async function fetchAffiliateUrl(videoUrl) {
+async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
     const videoIdMatch = videoUrl.match(/\/video\/([^/]+)\//);
     if (!videoIdMatch) throw new Error('Could not extract video ID from URL');
     const videoId = videoIdMatch[1];
     const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
     log(`Fetching public video: ${publicUrl}`);
 
+    // Determine expected domain from product URL for verification
+    const expectedDomain = expectedProductUrl
+        ? (expectedProductUrl.includes('shopee') ? 'shopee' : expectedProductUrl.includes('lazada') ? 'lazada' : null)
+        : null;
+
     let affiliateUrl = null;
     let metadata = { title: '', price: '', image: '' };
 
-    for (let attempt = 1; attempt <= 3; attempt++) {
+    for (let attempt = 1; attempt <= 5; attempt++) {
         if (attempt > 1) {
-            log(`Attempt ${attempt} fetchAffiliateUrl retrying after 200ms...`);
-            await new Promise(r => setTimeout(r, 200));
+            const delay = attempt <= 3 ? 1000 : 2000;
+            log(`Attempt ${attempt} fetchAffiliateUrl retrying after ${delay}ms...`);
+            await new Promise(r => setTimeout(r, delay));
         }
 
         const fetchStart = Date.now();
-        const response = await fetch(publicUrl, {
+        // Cache-busting: unique query param + no-cache headers
+        const bustUrl = `${publicUrl}&_cb=${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const response = await fetch(bustUrl, {
             headers: {
                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
                 'Accept-Encoding': 'gzip, deflate, br',
                 'Accept': 'text/html',
+                'Cache-Control': 'no-cache, no-store, must-revalidate',
+                'Pragma': 'no-cache',
             }
         });
         const pageContent = await response.text();
@@ -329,7 +339,15 @@ async function fetchAffiliateUrl(videoUrl) {
         const allUrlMatches = [...pageContent.matchAll(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/g)];
         const urlMatch = allUrlMatches.length > 0 ? allUrlMatches[0] : null;
         if (urlMatch) {
-            affiliateUrl = decodeUnicode(urlMatch[1]);
+            const candidateUrl = decodeUnicode(urlMatch[1]);
+
+            // Verify: affiliate URL domain must match the product we just added
+            if (expectedDomain && !candidateUrl.toLowerCase().includes(expectedDomain)) {
+                log(`Attempt ${attempt}: domain mismatch! Expected ${expectedDomain} but got: ${candidateUrl}. Retrying...`);
+                continue; // Retry - likely got stale/cached result from previous product
+            }
+
+            affiliateUrl = candidateUrl;
 
             const blockMarker = 'productListItemRenderer":{"title"';
             const blockStart = pageContent.indexOf(blockMarker);
@@ -372,7 +390,7 @@ async function executeJob(jobId, targetUrl, productUrl) {
         log(`addProduct took ${addProductTime}ms`);
 
         const fetchStart = Date.now();
-        const data = await fetchAffiliateUrl(targetUrl);
+        const data = await fetchAffiliateUrl(targetUrl, productUrl);
         log(`fetchAffiliateUrl took ${Date.now() - fetchStart}ms`);
         log(`Total job time: ${Date.now() - jobStart}ms`);
         log(`Affiliate URL: ${data.affiliateUrl}`);
