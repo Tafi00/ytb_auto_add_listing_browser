@@ -178,9 +178,26 @@ async function getChromePage(targetUrl) {
     return { browser, context, page };
 }
 
+// Setup persistent dialog handler for a page to auto-dismiss YouTube alerts
+function setupPageDialogHandler(page, port) {
+    page.on('dialog', async (dialog) => {
+        log(`[Port ${port}] Unexpected dialog: "${dialog.message()}" — auto-dismissing`);
+        await dialog.dismiss().catch(() => { });
+    });
+}
+
 // ==================== Browser Automation ====================
 
-async function addProduct(page, productUrl) {
+async function addProduct(page, productUrl, _retryCount = 0) {
+    // Setup dialog handler to auto-dismiss YouTube Studio alerts (e.g. "Sorry, we were not able to save your video")
+    let dialogDismissed = false;
+    const dialogHandler = (dialog) => {
+        log(`Dialog detected: "${dialog.message()}" — auto-dismissing`);
+        dialogDismissed = true;
+        dialog.dismiss().catch(() => { });
+    };
+    page.on('dialog', dialogHandler);
+
     const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content)').filter({
         hasText: /(Sản phẩm|Products|tagged product|sản phẩm đã gắn)/i
     }).first();
@@ -299,13 +316,53 @@ async function addProduct(page, productUrl) {
 
     if (isDisabled) {
         log('Save button is disabled (no changes). Proceeding directly.');
+        page.removeListener('dialog', dialogHandler);
     } else {
         await saveBtn.evaluate(b => b.scrollIntoView()).catch(() => { });
         await saveBtn.click({ force: true }).catch(async () => {
             await saveBtn.evaluate(b => b.click());
         });
         log('Clicked Save button');
+
+        // Wait for save to complete, checking for dialog errors
         await page.waitForTimeout(3000);
+
+        if (dialogDismissed) {
+            log('Save failed (dialog error detected). Reloading page...');
+            page.removeListener('dialog', dialogHandler);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => { });
+            await page.waitForTimeout(2000);
+
+            // Retry up to 2 times
+            if (_retryCount < 2) {
+                log(`Retrying addProduct (attempt ${_retryCount + 2}/3)...`);
+                return await addProduct(page, productUrl, _retryCount + 1);
+            } else {
+                throw new Error('Save failed after 3 attempts (YouTube dialog error).');
+            }
+        }
+
+        // Also check for "Oops, something went wrong" error on page
+        const oopsError = await page.evaluate(() => {
+            const el = document.querySelector('yt-alert-with-actions-renderer, .error-message, .yt-alert-message');
+            return el ? el.textContent.trim() : null;
+        }).catch(() => null);
+
+        if (oopsError && /oops|something went wrong|went wrong/i.test(oopsError)) {
+            log(`Page error detected: "${oopsError}". Reloading page...`);
+            page.removeListener('dialog', dialogHandler);
+            await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => { });
+            await page.waitForTimeout(2000);
+
+            if (_retryCount < 2) {
+                log(`Retrying addProduct (attempt ${_retryCount + 2}/3)...`);
+                return await addProduct(page, productUrl, _retryCount + 1);
+            } else {
+                throw new Error('Save failed after 3 attempts (page error).');
+            }
+        }
+
+        page.removeListener('dialog', dialogHandler);
         log('Save clicked, proceeding to fetch after 3s');
     }
 }
@@ -630,6 +687,43 @@ setInterval(() => {
         }
     });
 }, 5000);
+
+// Periodically check for stuck dialogs on all browser tabs and auto-dismiss + reload
+setInterval(async () => {
+    for (const worker of activeWorkers) {
+        try {
+            const chromium = await getPlaywright();
+            const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
+            const contexts = browser.contexts();
+            if (contexts.length > 0) {
+                for (const page of contexts[0].pages()) {
+                    // Register a one-time dialog handler to catch any pending dialog
+                    let hadDialog = false;
+                    const handler = (dialog) => {
+                        hadDialog = true;
+                        log(`[Watchdog] Dialog on port ${worker.port}: "${dialog.message()}" — dismissing & reloading`);
+                        dialog.dismiss().catch(() => { });
+                    };
+                    page.on('dialog', handler);
+
+                    // Quick check: try to evaluate something on the page
+                    // If a dialog is blocking, this will trigger the handler
+                    await page.evaluate(() => true).catch(() => { });
+
+                    page.removeListener('dialog', handler);
+
+                    if (hadDialog) {
+                        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => { });
+                        log(`[Watchdog] Page reloaded on port ${worker.port}`);
+                    }
+                }
+            }
+            await browser.close().catch(() => { });
+        } catch {
+            // Browser might be busy with a job, skip
+        }
+    }
+}, 15000);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
