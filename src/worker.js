@@ -175,6 +175,9 @@ async function getChromePage(targetUrl) {
         await browser.close();
         throw new Error(`No matching page found for URL: ${targetUrl}. Available pages: ${pages.map(p => p.url()).join(', ')}`);
     }
+    // Auto-dismiss any dialog (alert/confirm/prompt) immediately
+    setupPageDialogHandler(page, worker.port);
+
     return { browser, context, page };
 }
 
@@ -187,6 +190,85 @@ function setupPageDialogHandler(page, port) {
 }
 
 // ==================== Browser Automation ====================
+
+/**
+ * Fetch product title/price from Shopee/Lazada using Facebook bot UA (SSR for social preview).
+ * Returns { title, price, ... } or null.
+ */
+async function getProductInfo(productUrl) {
+    try {
+        const res = await fetch(productUrl, {
+            headers: {
+                'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+                'Accept': 'text/html',
+            },
+            redirect: 'follow',
+        });
+        if (!res.ok) return null;
+        const html = await res.text();
+
+        // --- Parse JSON-LD structured data (most reliable source) ---
+        let ld = null;
+        const ldMatches = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+        for (const m of ldMatches) {
+            try {
+                const parsed = JSON.parse(m[1]);
+                if (parsed['@type'] === 'Product') { ld = parsed; break; }
+            } catch { }
+        }
+
+        // --- Parse OG meta tags as fallback ---
+        const meta = (name) => {
+            const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\' + '$&');
+            const patterns = [
+                new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']*?)["']`, 'i'),
+                new RegExp(`<meta[^>]+content=["']([^"']*?)["'][^>]+(?:property|name)=["']${escaped}["']`, 'i'),
+            ];
+            for (const re of patterns) {
+                const m = html.match(re);
+                if (m) return m[1].trim();
+            }
+            return null;
+        };
+
+        const titleTag = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+        const cleanTitle = titleTag ? titleTag[1].replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() : null;
+        const offer = ld?.offers || {};
+        const seller = offer.seller || {};
+        const sellerRating = seller.aggregateRating || {};
+        const productRating = ld?.aggregateRating || {};
+
+        const info = {
+            // Basic
+            title: (ld?.name || meta('og:title') || cleanTitle || '').replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() || null,
+            description: ld?.description?.trim() || meta('og:description') || null,
+            image: ld?.image || meta('og:image') || null,
+            url: ld?.url || meta('og:url') || productUrl,
+            productID: ld?.productID || null,
+            brand: ld?.brand || null,
+            // Price
+            price: offer.price || null,
+            currency: offer.priceCurrency || null,
+            condition: offer.itemCondition?.replace('http://schema.org/', '') || null,
+            availability: offer.availability?.replace('http://schema.org/', '') || null,
+            // Seller
+            seller: seller.name || null,
+            sellerUrl: seller.url || null,
+            sellerImage: seller.image || null,
+            sellerRating: sellerRating.ratingValue || null,
+            sellerRatingCount: sellerRating.ratingCount || null,
+            // Product rating
+            rating: productRating.ratingValue || null,
+            ratingCount: productRating.ratingCount || null,
+        };
+
+        log(`Product info: title="${info.title}", price=${info.price || 'N/A'} ${info.currency || ''}, rating=${info.rating || 'N/A'}, seller="${info.seller || 'N/A'}"`);
+        return info;
+    } catch (e) {
+        log(`getProductInfo error: ${e.message}`);
+        return null;
+    }
+}
 
 async function addProduct(page, productUrl, _retryCount = 0) {
     // Setup dialog handler to auto-dismiss YouTube Studio alerts (e.g. "Sorry, we were not able to save your video")
@@ -295,9 +377,138 @@ async function addProduct(page, productUrl, _retryCount = 0) {
         throw new Error('Sản phẩm này không gắn giỏ được.');
     }
 
-    await tagBtn.click();
-    log('Clicked Tag button');
+    // ---- Check if product has multiple options (variants) ----
+    const optionsLabel = page.locator('ytshopping-product yt-formatted-string').filter({
+        hasText: /\d+\s*options?/i
+    }).first();
+    const hasOptions = await optionsLabel.isVisible({ timeout: 1000 }).catch(() => false);
 
+    if (hasOptions) {
+        const optionsText = await optionsLabel.textContent().catch(() => '');
+        log(`Product has variants: "${optionsText}" — entering variant selection flow`);
+
+        // Step 1: Fetch info from product page to know which variant to pick
+        let productInfo = null;
+        let shopeeTitle = null;
+        let shopeePrice = null;
+        productInfo = await getProductInfo(productUrl);
+        shopeeTitle = productInfo?.title || null;
+        shopeePrice = productInfo?.price || null;
+        log(`Product title: "${shopeeTitle}", price: ${shopeePrice}`);
+        if (!shopeeTitle) {
+            // Fallback: no title found, use normal tag flow
+            log('Could not fetch product title, falling back to normal tag flow');
+            await tagBtn.click();
+            log('Clicked Tag button (fallback)');
+        } else {
+            // Step 2: Click on product title card to open product details
+            const productTitleCard = page.locator('div.product-title.style-scope.ytshopping-product[role="button"]').first();
+            await productTitleCard.waitFor({ state: 'visible', timeout: 5000 });
+            await productTitleCard.click();
+            log('Clicked product title card');
+            await page.waitForTimeout(800);
+
+            // Step 3: Click on "x product options" group label to expand variants
+            const offerGroupLabel = page.locator('.ytshoppingProductDetailsOfferGroupLabelContent').first();
+            await offerGroupLabel.waitFor({ state: 'visible', timeout: 5000 });
+            await offerGroupLabel.click();
+            log('Clicked product options group label');
+
+            // Wait for variant selection panel to load
+            const variantPanel = page.locator('ytshopping-variant-selection');
+            await variantPanel.waitFor({ state: 'visible', timeout: 5000 });
+            await page.waitForTimeout(500);
+
+            // Step 4: Turn off "Show best option" switch (click the track to toggle off)
+            const switchTrack = page.locator('ytshopping-variant-selection .widgetsYtcpSwitchTrack.widgetsYtcpSwitchTrackActive').first();
+            const switchVisible = await switchTrack.isVisible({ timeout: 2000 }).catch(() => false);
+            if (switchVisible) {
+                await switchTrack.click();
+                log('Toggled off "Show best option" switch');
+                await page.waitForTimeout(500);
+            } else {
+                log('"Show best option" switch not active or not found, skipping toggle');
+            }
+
+            // Step 5: Find the variant whose title AND price match the Shopee product
+            const variantCards = page.locator('ytshopping-variant-selection-product');
+            await variantCards.first().waitFor({ state: 'visible', timeout: 5000 });
+            const variantCount = await variantCards.count();
+            log(`Found ${variantCount} variant(s)`);
+
+            // Normalize price: "17990000.00" → "17990000", "₫17,990,000" → "17990000"
+            const normalizePrice = (str) => {
+                if (!str) return '';
+                // Remove decimal part first (e.g. ".00"), then strip non-digits
+                const cleaned = str.replace(/\.\d+$/, '').replace(/[^\d]/g, '');
+                return cleaned.replace(/^0+/, '') || '0';
+            };
+            const shopeeNormPrice = normalizePrice(shopeePrice);
+
+            let matched = false;
+            let titleMatchIdx = -1; // track title-only match as fallback
+            for (let i = 0; i < variantCount; i++) {
+                const card = variantCards.nth(i);
+                const variantTitle = (await card.locator('.ytshoppingVariantSelectionProductProductTitle').textContent().catch(() => '')).trim();
+                const variantPriceText = (await card.locator('yt-formatted-string[aria-label="Price"]').textContent().catch(() => '')).trim();
+                const variantNormPrice = normalizePrice(variantPriceText);
+                log(`Variant ${i}: "${variantTitle}" — ${variantPriceText} (normalized: ${variantNormPrice})`);
+
+                const normTitle = (s) => s.replace(/\s+/g, ' ').trim();
+                const nVariant = normTitle(variantTitle);
+                const nShopee = normTitle(shopeeTitle);
+                const titleMatch = nVariant === nShopee
+                    || nVariant.startsWith(nShopee)
+                    || nShopee.startsWith(nVariant);
+                const priceMatch = shopeeNormPrice && variantNormPrice && variantNormPrice === shopeeNormPrice;
+
+                if (titleMatch && priceMatch) {
+                    log(`✅ Matched variant (title + price): "${variantTitle}" — ${variantPriceText}`);
+                    const variantTagBtn = card.locator('ytcp-icon-button#tag-button');
+                    await variantTagBtn.waitFor({ state: 'visible', timeout: 3000 });
+                    await variantTagBtn.click();
+                    log('Clicked tag button on matched variant');
+                    matched = true;
+                    break;
+                }
+                if (titleMatch && titleMatchIdx === -1) {
+                    titleMatchIdx = i;
+                }
+            }
+
+            // Fallback: title matched but price didn't (or no price from Shopee)
+            if (!matched && titleMatchIdx >= 0) {
+                log(`⚠️ Price mismatch — falling back to title-only match (variant ${titleMatchIdx})`);
+                const card = variantCards.nth(titleMatchIdx);
+                const variantTagBtn = card.locator('ytcp-icon-button#tag-button');
+                await variantTagBtn.waitFor({ state: 'visible', timeout: 3000 });
+                await variantTagBtn.click();
+                log('Clicked tag button on title-matched variant');
+                matched = true;
+            }
+
+            if (!matched) {
+                log(`⚠️ No variant matched title "${shopeeTitle}" + price ${shopeePrice}. Falling back to first variant.`);
+                const firstTagBtn = variantCards.first().locator('ytcp-icon-button#tag-button');
+                await firstTagBtn.waitFor({ state: 'visible', timeout: 3000 });
+                await firstTagBtn.click();
+                log('Clicked tag button on first variant (fallback)');
+            }
+
+            await page.waitForTimeout(500);
+
+            // Click Tag button via JS (dialog overlay blocks Playwright click, but JS click works fine)
+            await page.waitForTimeout(500);
+            await page.evaluate(() => document.querySelector("button[aria-label='Tag']").click());
+            log('Clicked Tag button on product card (via JS)');
+        }
+    } else {
+        // No options — normal flow: click tag directly
+        await tagBtn.click();
+        log('Clicked Tag button');
+    }
+
+    // Next → Done (same for both flows — variant dialog auto-closes after tagging)
     const nextBtn = page.locator('ytcp-button#picker-next-button button').first();
     await nextBtn.waitFor({ state: 'visible', timeout: 10000 });
     await nextBtn.click();
