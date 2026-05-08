@@ -484,9 +484,8 @@ async function addProduct(page, productUrl, _retryCount = 0) {
                     return cleaned.replace(/^0+/, '') || '0';
                 };
                 const shopeeNormPrice = normalizePrice(shopeePrice);
-                const normTitle = (s) => s.normalize('NFC').replace(/\s+/g, ' ').trim();
-                const nShopee = normTitle(shopeeTitle).toLowerCase();
-                const eWords = new Set(nShopee.split(/\s+/).filter(w => w.length > 1));
+                const normTitle = (s) => s.normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
+                const nShopee = normTitle(shopeeTitle);
 
                 // Batch-read all variant titles + prices in one evaluate call (fast!)
                 const allVariants = await page.evaluate(() => {
@@ -502,43 +501,26 @@ async function addProduct(page, productUrl, _retryCount = 0) {
                 });
                 log(`Found ${allVariants.length} variant(s), matching...`);
 
-                // Score each variant
+                // Find exact title match (prefer last match + price match)
                 let bestIdx = -1;
-                let bestScore = -1;
                 for (let i = 0; i < allVariants.length; i++) {
-                    const v = allVariants[i];
-                    const nVariant = normTitle(v.title).toLowerCase();
-                    const variantNormPrice = normalizePrice(v.price);
-                    let score = 0;
-
-                    // Title matching
-                    if (nVariant === nShopee) score += 10;
-                    else if (nVariant.startsWith(nShopee) || nShopee.startsWith(nVariant)) score += 8;
-                    else if (nVariant.includes(nShopee) || nShopee.includes(nVariant)) score += 5;
-                    else {
-                        // Word overlap (fuzzy match for different word order or extra words)
-                        const stripPunct = s => s.replace(/[^\p{L}\p{N}\s]/gu, '');
-                        const vWords = new Set(stripPunct(nVariant).split(/\s+/).filter(w => w.length > 1));
-                        const common = [...new Set(stripPunct(nShopee).split(/\s+/).filter(w => w.length > 1))].filter(w => vWords.has(w)).length;
-                        const eWordsClean = new Set(stripPunct(nShopee).split(/\s+/).filter(w => w.length > 1));
-                        const overlap = eWordsClean.size > 0 ? common / eWordsClean.size : 0;
-                        if (overlap >= 0.6) score += Math.round(overlap * 10); // up to 10 points for 100% overlap
-                    }
-
-                    // Price matching
-                    if (shopeeNormPrice && variantNormPrice && variantNormPrice === shopeeNormPrice) score += 5;
-
-                    // Use >= to prefer last match (original seller tends to be listed last)
-                    if (score >= bestScore) {
-                        bestScore = score;
+                    const nVariant = normTitle(allVariants[i].title);
+                    if (nVariant === nShopee) {
+                        const variantNormPrice = normalizePrice(allVariants[i].price);
+                        if (shopeeNormPrice && variantNormPrice && variantNormPrice === shopeeNormPrice) {
+                            // Exact title + price match — best possible
+                            bestIdx = i;
+                            break;
+                        }
+                        // Exact title match — keep last one (original seller tends to be last)
                         bestIdx = i;
                     }
                 }
 
-                // Click the best matching variant
+                // Click the matched variant
                 let matched = false;
-                if (bestIdx >= 0 && bestScore > 0) {
-                    log(`✅ Best match: variant ${bestIdx} (score ${bestScore}) — "${allVariants[bestIdx].title}" — ${allVariants[bestIdx].price}`);
+                if (bestIdx >= 0) {
+                    log(`✅ Match: variant ${bestIdx} — "${allVariants[bestIdx].title}" — ${allVariants[bestIdx].price}`);
                     const card = variantCards.nth(bestIdx);
                     const variantTagBtn = card.locator('ytcp-icon-button#tag-button');
                     await variantTagBtn.waitFor({ state: 'visible', timeout: 3000 });
@@ -548,7 +530,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
                 }
 
                 if (!matched) {
-                    log(`⚠️ No variant matched title "${shopeeTitle}" + price ${shopeePrice}. Falling back to first variant.`);
+                    log(`⚠️ No exact title match found. Falling back to first variant.`);
                     const firstTagBtn = variantCards.first().locator('ytcp-icon-button#tag-button');
                     await firstTagBtn.waitFor({ state: 'visible', timeout: 3000 });
                     await firstTagBtn.click();
