@@ -379,7 +379,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
 
     // ---- Check if product has multiple options (variants) ----
     const optionsLabel = page.locator('ytshopping-product yt-formatted-string').filter({
-        hasText: /\d+\s*options?/i
+        hasText: /\d+\+?\s*options?/i
     }).first();
     const hasOptions = await optionsLabel.isVisible({ timeout: 1000 }).catch(() => false);
 
@@ -410,97 +410,133 @@ async function addProduct(page, productUrl, _retryCount = 0) {
 
             // Step 3: Click on "x product options" group label to expand variants
             const offerGroupLabel = page.locator('.ytshoppingProductDetailsOfferGroupLabelContent').first();
-            await offerGroupLabel.waitFor({ state: 'visible', timeout: 5000 });
-            await offerGroupLabel.click();
-            log('Clicked product options group label');
-
-            // Wait for variant selection panel to load
-            const variantPanel = page.locator('ytshopping-variant-selection');
-            await variantPanel.waitFor({ state: 'visible', timeout: 5000 });
-            await page.waitForTimeout(500);
-
-            // Step 4: Turn off "Show best option" switch (click the track to toggle off)
-            const switchTrack = page.locator('ytshopping-variant-selection .widgetsYtcpSwitchTrack.widgetsYtcpSwitchTrackActive').first();
-            const switchVisible = await switchTrack.isVisible({ timeout: 2000 }).catch(() => false);
-            if (switchVisible) {
-                await switchTrack.click();
-                log('Toggled off "Show best option" switch');
-                await page.waitForTimeout(500);
+            // Scroll dialog to make offer group visible (may be below fold for products with long descriptions)
+            await page.evaluate(() => {
+                const dialog = document.querySelector('ytshopping-product-details-dialog');
+                if (dialog) dialog.scrollTop = dialog.scrollHeight;
+                const details = document.querySelector('ytshopping-product-details');
+                if (details) details.scrollTop = details.scrollHeight;
+            });
+            await page.waitForTimeout(300);
+            const offerGroupVisible = await offerGroupLabel.isVisible({ timeout: 3000 }).catch(() => false);
+            if (!offerGroupVisible) {
+                // No offer group — close dialog and fallback to normal tag
+                log('No offer group label found — falling back to normal tag flow');
+                const closeBtn = page.locator('ytcp-icon-button[aria-label="Close"]').first();
+                if (await closeBtn.isVisible({ timeout: 1000 }).catch(() => false)) {
+                    await closeBtn.click();
+                    await page.waitForTimeout(500);
+                }
+                await page.evaluate(() => document.querySelector("button[aria-label='Tag']")?.click());
+                log('Clicked Tag button (fallback, no offer group)');
             } else {
-                log('"Show best option" switch not active or not found, skipping toggle');
-            }
+                await offerGroupLabel.click();
+                log('Clicked product options group label');
 
-            // Step 5: Find the variant whose title AND price match the Shopee product
-            const variantCards = page.locator('ytshopping-variant-selection-product');
-            await variantCards.first().waitFor({ state: 'visible', timeout: 5000 });
-            const variantCount = await variantCards.count();
-            log(`Found ${variantCount} variant(s)`);
+                // Wait for variant selection panel to load
+                const variantPanel = page.locator('ytshopping-variant-selection');
+                await variantPanel.waitFor({ state: 'visible', timeout: 5000 });
+                await page.waitForTimeout(500);
 
-            // Normalize price: "17990000.00" → "17990000", "₫17,990,000" → "17990000"
-            const normalizePrice = (str) => {
-                if (!str) return '';
-                // Remove decimal part first (e.g. ".00"), then strip non-digits
-                const cleaned = str.replace(/\.\d+$/, '').replace(/[^\d]/g, '');
-                return cleaned.replace(/^0+/, '') || '0';
-            };
-            const shopeeNormPrice = normalizePrice(shopeePrice);
+                // Step 4: Turn off "Show best option" switch (click the track to toggle off)
+                const switchTrack = page.locator('ytshopping-variant-selection .widgetsYtcpSwitchTrack.widgetsYtcpSwitchTrackActive').first();
+                const switchVisible = await switchTrack.isVisible({ timeout: 2000 }).catch(() => false);
+                if (switchVisible) {
+                    await switchTrack.click();
+                    log('Toggled off "Show best option" switch');
+                    await page.waitForTimeout(500);
+                } else {
+                    log('"Show best option" switch not active or not found, skipping toggle');
+                }
 
-            let matched = false;
-            let titleMatchIdx = -1; // track title-only match as fallback
-            for (let i = 0; i < variantCount; i++) {
-                const card = variantCards.nth(i);
-                const variantTitle = (await card.locator('.ytshoppingVariantSelectionProductProductTitle').textContent().catch(() => '')).trim();
-                const variantPriceText = (await card.locator('yt-formatted-string[aria-label="Price"]').textContent().catch(() => '')).trim();
-                const variantNormPrice = normalizePrice(variantPriceText);
-                log(`Variant ${i}: "${variantTitle}" — ${variantPriceText} (normalized: ${variantNormPrice})`);
+                // Step 5: Find the variant whose title AND price match the Shopee product
+                const variantCards = page.locator('ytshopping-variant-selection-product');
+                await variantCards.first().waitFor({ state: 'visible', timeout: 5000 });
+                const variantCount = await variantCards.count();
+                log(`Found ${variantCount} variant(s)`);
 
+                // Normalize price: "17990000.00" → "17990000", "₫17,990,000" → "17990000"
+                const normalizePrice = (str) => {
+                    if (!str) return '';
+                    const cleaned = str.replace(/\.\d+$/, '').replace(/[^\d]/g, '');
+                    return cleaned.replace(/^0+/, '') || '0';
+                };
+                const shopeeNormPrice = normalizePrice(shopeePrice);
                 const normTitle = (s) => s.replace(/\s+/g, ' ').trim();
-                const nVariant = normTitle(variantTitle);
-                const nShopee = normTitle(shopeeTitle);
-                const titleMatch = nVariant === nShopee
-                    || nVariant.startsWith(nShopee)
-                    || nShopee.startsWith(nVariant);
-                const priceMatch = shopeeNormPrice && variantNormPrice && variantNormPrice === shopeeNormPrice;
+                const nShopee = normTitle(shopeeTitle).toLowerCase();
+                const eWords = new Set(nShopee.split(/\s+/).filter(w => w.length > 1));
 
-                if (titleMatch && priceMatch) {
-                    log(`✅ Matched variant (title + price): "${variantTitle}" — ${variantPriceText}`);
+                // Batch-read all variant titles + prices in one evaluate call (fast!)
+                const allVariants = await page.evaluate(() => {
+                    const cards = document.querySelectorAll('ytshopping-variant-selection-product');
+                    return Array.from(cards).map(c => {
+                        const titleEl = c.querySelector('.ytshoppingVariantSelectionProductProductTitle');
+                        const priceEl = c.querySelector('yt-formatted-string[aria-label*="rice"]');
+                        return {
+                            title: titleEl ? titleEl.textContent.trim() : '',
+                            price: priceEl ? priceEl.textContent.trim() : '',
+                        };
+                    });
+                });
+                log(`Found ${allVariants.length} variant(s), matching...`);
+
+                // Score each variant
+                let bestIdx = -1;
+                let bestScore = -1;
+                for (let i = 0; i < allVariants.length; i++) {
+                    const v = allVariants[i];
+                    const nVariant = normTitle(v.title).toLowerCase();
+                    const variantNormPrice = normalizePrice(v.price);
+                    let score = 0;
+
+                    // Title matching
+                    if (nVariant === nShopee) score += 10;
+                    else if (nVariant.startsWith(nShopee) || nShopee.startsWith(nVariant)) score += 8;
+                    else if (nVariant.includes(nShopee) || nShopee.includes(nVariant)) score += 5;
+                    else {
+                        // Word overlap
+                        const vWords = new Set(nVariant.split(/\s+/).filter(w => w.length > 1));
+                        const common = [...eWords].filter(w => vWords.has(w)).length;
+                        const overlap = eWords.size > 0 ? common / eWords.size : 0;
+                        if (overlap >= 0.6) score += Math.round(overlap * 5);
+                    }
+
+                    // Price matching
+                    if (shopeeNormPrice && variantNormPrice && variantNormPrice === shopeeNormPrice) score += 5;
+
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestIdx = i;
+                    }
+                }
+
+                // Click the best matching variant
+                let matched = false;
+                if (bestIdx >= 0 && bestScore > 0) {
+                    log(`✅ Best match: variant ${bestIdx} (score ${bestScore}) — "${allVariants[bestIdx].title}" — ${allVariants[bestIdx].price}`);
+                    const card = variantCards.nth(bestIdx);
                     const variantTagBtn = card.locator('ytcp-icon-button#tag-button');
                     await variantTagBtn.waitFor({ state: 'visible', timeout: 3000 });
                     await variantTagBtn.click();
                     log('Clicked tag button on matched variant');
                     matched = true;
-                    break;
                 }
-                if (titleMatch && titleMatchIdx === -1) {
-                    titleMatchIdx = i;
+
+                if (!matched) {
+                    log(`⚠️ No variant matched title "${shopeeTitle}" + price ${shopeePrice}. Falling back to first variant.`);
+                    const firstTagBtn = variantCards.first().locator('ytcp-icon-button#tag-button');
+                    await firstTagBtn.waitFor({ state: 'visible', timeout: 3000 });
+                    await firstTagBtn.click();
+                    log('Clicked tag button on first variant (fallback)');
                 }
-            }
 
-            // Fallback: title matched but price didn't (or no price from Shopee)
-            if (!matched && titleMatchIdx >= 0) {
-                log(`⚠️ Price mismatch — falling back to title-only match (variant ${titleMatchIdx})`);
-                const card = variantCards.nth(titleMatchIdx);
-                const variantTagBtn = card.locator('ytcp-icon-button#tag-button');
-                await variantTagBtn.waitFor({ state: 'visible', timeout: 3000 });
-                await variantTagBtn.click();
-                log('Clicked tag button on title-matched variant');
-                matched = true;
-            }
+                await page.waitForTimeout(500);
 
-            if (!matched) {
-                log(`⚠️ No variant matched title "${shopeeTitle}" + price ${shopeePrice}. Falling back to first variant.`);
-                const firstTagBtn = variantCards.first().locator('ytcp-icon-button#tag-button');
-                await firstTagBtn.waitFor({ state: 'visible', timeout: 3000 });
-                await firstTagBtn.click();
-                log('Clicked tag button on first variant (fallback)');
-            }
-
-            await page.waitForTimeout(500);
-
-            // Click Tag button via JS (dialog overlay blocks Playwright click, but JS click works fine)
-            await page.waitForTimeout(500);
-            await page.evaluate(() => document.querySelector("button[aria-label='Tag']").click());
-            log('Clicked Tag button on product card (via JS)');
+                // Click Tag button via JS (dialog overlay blocks Playwright click, but JS click works fine)
+                await page.waitForTimeout(500);
+                await page.evaluate(() => document.querySelector("button[aria-label='Tag']").click());
+                log('Clicked Tag button on product card (via JS)');
+            } // end offerGroupVisible else
         }
     } else {
         // No options — normal flow: click tag directly
@@ -592,6 +628,21 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
         ? (expectedProductUrl.includes('shopee') ? 'shopee' : expectedProductUrl.includes('lazada') ? 'lazada' : null)
         : null;
 
+    // Fetch expected product info (title + price) for matching
+    let expectedInfo = null;
+    if (expectedProductUrl) {
+        expectedInfo = await getProductInfo(expectedProductUrl);
+        if (expectedInfo) {
+            log(`Expected product: "${expectedInfo.title}", price: ${expectedInfo.price || 'N/A'}`);
+        }
+    }
+
+    const normPrice = (str) => {
+        if (!str) return '';
+        return str.replace(/\.\d+$/, '').replace(/[^\d]/g, '').replace(/^0+/, '') || '0';
+    };
+    const normTitle = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+
     let affiliateUrl = null;
     let metadata = { title: '', price: '', image: '' };
 
@@ -603,7 +654,6 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
         }
 
         const fetchStart = Date.now();
-        // Cache-busting: unique query param + no-cache headers
         const bustUrl = `${publicUrl}&_cb=${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
         const response = await fetch(bustUrl, {
             headers: {
@@ -617,38 +667,104 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
         const pageContent = await response.text();
         log(`Fetched page in ${Date.now() - fetchStart}ms (${(pageContent.length / 1024).toFixed(0)}KB)`);
 
+        // Extract all product blocks with their affiliate URLs
         const allUrlMatches = [...pageContent.matchAll(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/g)];
-        const urlMatch = allUrlMatches.length > 0 ? allUrlMatches[0] : null;
-        if (urlMatch) {
-            const candidateUrl = decodeUnicode(urlMatch[1]);
+        if (allUrlMatches.length === 0) {
+            log(`Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link`);
+            continue;
+        }
 
-            // Verify: affiliate URL domain must match the product we just added
-            if (expectedDomain && !candidateUrl.toLowerCase().includes(expectedDomain)) {
-                log(`Attempt ${attempt}: domain mismatch! Expected ${expectedDomain} but got: ${candidateUrl}. Retrying...`);
-                continue; // Retry - likely got stale/cached result from previous product
-            }
+        // Domain check on first match
+        const firstUrl = decodeUnicode(allUrlMatches[0][1]);
+        if (expectedDomain && !firstUrl.toLowerCase().includes(expectedDomain)) {
+            log(`Attempt ${attempt}: domain mismatch! Expected ${expectedDomain} but got: ${firstUrl}. Retrying...`);
+            continue;
+        }
 
-            affiliateUrl = candidateUrl;
+        // Parse all product blocks from page
+        const products = [];
+        const blockPattern = /productListItemRenderer":\{"title"/g;
+        let blockMatch;
+        let blockIdx = 0;
+        while ((blockMatch = blockPattern.exec(pageContent)) !== null) {
+            const block = pageContent.substring(blockMatch.index, blockMatch.index + 5000);
+            const titleM = block.match(/simpleText":"([^"]+)"/);
+            const priceM = block.match(/([0-9][0-9.,]+)\s*₫/) || block.match(/₫\s*([0-9][0-9,.]+)/);
+            const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
+                .map(m => decodeUnicode(m[1]));
+            const urlM = allUrlMatches[blockIdx] ? decodeUnicode(allUrlMatches[blockIdx][1]) : null;
 
-            const blockMarker = 'productListItemRenderer":{"title"';
-            const blockStart = pageContent.indexOf(blockMarker);
-            if (blockStart !== -1) {
-                const block = pageContent.substring(blockStart, blockStart + 5000);
+            products.push({
+                title: titleM ? decodeUnicode(titleM[1]) : '',
+                price: priceM ? decodeUnicode(priceM[1]) : '',
+                image: thumbUrls.length > 0 ? thumbUrls[0] : '',
+                url: urlM,
+            });
+            blockIdx++;
+        }
 
-                const titleMatch = block.match(/simpleText":"([^"]+)"/);
-                if (titleMatch) metadata.title = decodeUnicode(titleMatch[1]);
-
-                const priceMatch = block.match(/([0-9][0-9.,]+)\s*₫/) || block.match(/₫\s*([0-9][0-9,.]+)/);
-                if (priceMatch) metadata.price = decodeUnicode(priceMatch[1]) + ' ₫';
-
-                const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
-                    .map(m => decodeUnicode(m[1]));
-                if (thumbUrls.length > 0) metadata.image = thumbUrls[0];
-            }
+        // If no blocks parsed, fallback to first URL
+        if (products.length === 0 && allUrlMatches.length > 0) {
+            affiliateUrl = firstUrl;
+            log('No product blocks found, using first affiliate URL');
             break;
         }
 
-        log(`Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link`);
+        log(`Found ${products.length} product(s) on YouTube page`);
+
+        // Match by title + price
+        if (expectedInfo && expectedInfo.title) {
+            const eTitle = normTitle(expectedInfo.title);
+            const ePrice = normPrice(expectedInfo.price);
+
+            let bestMatch = null;
+            let bestScore = -1;
+
+            for (let i = 0; i < products.length; i++) {
+                const p = products[i];
+                const pTitle = normTitle(p.title);
+                const pPrice = normPrice(p.price);
+                let score = 0;
+
+                // Title matching
+                if (pTitle === eTitle) score += 10;
+                else if (pTitle.startsWith(eTitle) || eTitle.startsWith(pTitle)) score += 8;
+                else if (pTitle.includes(eTitle) || eTitle.includes(pTitle)) score += 5;
+                else {
+                    // Word overlap: count shared words between titles
+                    const eWords = new Set(eTitle.split(/\s+/).filter(w => w.length > 1));
+                    const pWords = new Set(pTitle.split(/\s+/).filter(w => w.length > 1));
+                    const common = [...eWords].filter(w => pWords.has(w)).length;
+                    const overlap = eWords.size > 0 ? common / eWords.size : 0;
+                    if (overlap >= 0.6) score += Math.round(overlap * 5); // up to 5 points
+                }
+
+                // Price matching
+                if (ePrice && pPrice && pPrice === ePrice) score += 5;
+
+                log(`  Product ${i}: "${p.title}" — ${p.price || 'no price'} (score: ${score})`);
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestMatch = i;
+                }
+            }
+
+            if (bestMatch !== null && bestScore > 0) {
+                const picked = products[bestMatch];
+                affiliateUrl = picked.url;
+                metadata = { title: picked.title, price: picked.price ? picked.price + ' ₫' : '', image: picked.image };
+                log(`✅ Best match (score ${bestScore}): "${picked.title}" — ${picked.price || 'no price'}`);
+                break;
+            }
+        }
+
+        // Fallback: use first product
+        const first = products[0] || {};
+        affiliateUrl = first.url || firstUrl;
+        metadata = { title: first.title || '', price: first.price ? first.price + ' ₫' : '', image: first.image || '' };
+        log('Using first product (no better match found)');
+        break;
     }
 
     log('Extracted metadata: ' + JSON.stringify(metadata));
