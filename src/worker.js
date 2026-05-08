@@ -193,81 +193,103 @@ function setupPageDialogHandler(page, port) {
 
 /**
  * Fetch product title/price from Shopee/Lazada using Facebook bot UA (SSR for social preview).
+ * Retries up to 3 times with delay if rate-limited.
  * Returns { title, price, ... } or null.
  */
 async function getProductInfo(productUrl) {
-    try {
-        const res = await fetch(productUrl, {
-            headers: {
-                'User-Agent': 'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
-                'Accept': 'text/html',
-            },
-            redirect: 'follow',
-        });
-        if (!res.ok) return null;
-        const html = await res.text();
-
-        // --- Parse JSON-LD structured data (most reliable source) ---
-        let ld = null;
-        const ldMatches = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
-        for (const m of ldMatches) {
-            try {
-                const parsed = JSON.parse(m[1]);
-                if (parsed['@type'] === 'Product') { ld = parsed; break; }
-            } catch { }
-        }
-
-        // --- Parse OG meta tags as fallback ---
-        const meta = (name) => {
-            const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\' + '$&');
-            const patterns = [
-                new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']*?)["']`, 'i'),
-                new RegExp(`<meta[^>]+content=["']([^"']*?)["'][^>]+(?:property|name)=["']${escaped}["']`, 'i'),
-            ];
-            for (const re of patterns) {
-                const m = html.match(re);
-                if (m) return m[1].trim();
+    const userAgents = [
+        'facebookexternalhit/1.1 (+http://www.facebook.com/externalhit_uatext.php)',
+        'WhatsApp/2.23.20.0',
+        'facebookexternalhit/1.1',
+    ];
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+            if (attempt > 1) {
+                const delay = attempt * 2000;
+                log(`getProductInfo retry ${attempt} after ${delay}ms...`);
+                await new Promise(r => setTimeout(r, delay));
             }
-            return null;
-        };
+            const ua = userAgents[(attempt - 1) % userAgents.length];
+            const res = await fetch(productUrl, {
+                headers: {
+                    'User-Agent': ua,
+                    'Accept': 'text/html',
+                },
+                redirect: 'follow',
+            });
+            if (!res.ok) {
+                log(`getProductInfo attempt ${attempt}: HTTP ${res.status}`);
+                continue;
+            }
+            const html = await res.text();
+            if (html.length < 1000) {
+                log(`getProductInfo attempt ${attempt}: response too short (${html.length} bytes)`);
+                continue;
+            }
 
-        const titleTag = html.match(/<title[^>]*>([^<]+)<\/title>/i);
-        const cleanTitle = titleTag ? titleTag[1].replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() : null;
-        const offer = ld?.offers || {};
-        const seller = offer.seller || {};
-        const sellerRating = seller.aggregateRating || {};
-        const productRating = ld?.aggregateRating || {};
+            // --- Parse JSON-LD structured data (most reliable source) ---
+            let ld = null;
+            const ldMatches = [...html.matchAll(/<script[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)];
+            for (const m of ldMatches) {
+                try {
+                    const parsed = JSON.parse(m[1]);
+                    if (parsed['@type'] === 'Product') { ld = parsed; break; }
+                } catch { }
+            }
 
-        const info = {
-            // Basic
-            title: (ld?.name || meta('og:title') || cleanTitle || '').replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() || null,
-            description: ld?.description?.trim() || meta('og:description') || null,
-            image: ld?.image || meta('og:image') || null,
-            url: ld?.url || meta('og:url') || productUrl,
-            productID: ld?.productID || null,
-            brand: ld?.brand || null,
-            // Price
-            price: offer.price || null,
-            currency: offer.priceCurrency || null,
-            condition: offer.itemCondition?.replace('http://schema.org/', '') || null,
-            availability: offer.availability?.replace('http://schema.org/', '') || null,
-            // Seller
-            seller: seller.name || null,
-            sellerUrl: seller.url || null,
-            sellerImage: seller.image || null,
-            sellerRating: sellerRating.ratingValue || null,
-            sellerRatingCount: sellerRating.ratingCount || null,
-            // Product rating
-            rating: productRating.ratingValue || null,
-            ratingCount: productRating.ratingCount || null,
-        };
+            // --- Parse OG meta tags as fallback ---
+            const meta = (name) => {
+                const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\' + '$&');
+                const patterns = [
+                    new RegExp(`<meta[^>]+(?:property|name)=["']${escaped}["'][^>]+content=["']([^"']*?)["']`, 'i'),
+                    new RegExp(`<meta[^>]+content=["']([^"']*?)["'][^>]+(?:property|name)=["']${escaped}["']`, 'i'),
+                ];
+                for (const re of patterns) {
+                    const m = html.match(re);
+                    if (m) return m[1].trim();
+                }
+                return null;
+            };
 
-        log(`Product info: title="${info.title}", price=${info.price || 'N/A'} ${info.currency || ''}, rating=${info.rating || 'N/A'}, seller="${info.seller || 'N/A'}"`);
-        return info;
-    } catch (e) {
-        log(`getProductInfo error: ${e.message}`);
-        return null;
+            const titleTag = html.match(/<title[^>]*>([^<]+)<\/title>/i);
+            const cleanTitle = titleTag ? titleTag[1].replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() : null;
+            const offer = ld?.offers || {};
+            const seller = offer.seller || {};
+            const sellerRating = seller.aggregateRating || {};
+            const productRating = ld?.aggregateRating || {};
+
+            const info = {
+                // Basic
+                title: (ld?.name || meta('og:title') || cleanTitle || '').replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() || null,
+                description: ld?.description?.trim() || meta('og:description') || null,
+                image: ld?.image || meta('og:image') || null,
+                url: ld?.url || meta('og:url') || productUrl,
+                productID: ld?.productID || null,
+                brand: ld?.brand || null,
+                // Price
+                price: offer.price || null,
+                currency: offer.priceCurrency || null,
+                condition: offer.itemCondition?.replace('http://schema.org/', '') || null,
+                availability: offer.availability?.replace('http://schema.org/', '') || null,
+                // Seller
+                seller: seller.name || null,
+                sellerUrl: seller.url || null,
+                sellerImage: seller.image || null,
+                sellerRating: sellerRating.ratingValue || null,
+                sellerRatingCount: sellerRating.ratingCount || null,
+                // Product rating
+                rating: productRating.ratingValue || null,
+                ratingCount: productRating.ratingCount || null,
+            };
+
+            log(`Product info: title="${info.title}", price=${info.price || 'N/A'} ${info.currency || ''}, rating=${info.rating || 'N/A'}, seller="${info.seller || 'N/A'}"`);
+            return info;
+        } catch (e) {
+            log(`getProductInfo attempt ${attempt} error: ${e.message}`);
+            if (attempt === 3) return null;
+        }
     }
+    return null;
 }
 
 async function addProduct(page, productUrl, _retryCount = 0) {
@@ -462,7 +484,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
                     return cleaned.replace(/^0+/, '') || '0';
                 };
                 const shopeeNormPrice = normalizePrice(shopeePrice);
-                const normTitle = (s) => s.replace(/\s+/g, ' ').trim();
+                const normTitle = (s) => s.normalize('NFC').replace(/\s+/g, ' ').trim();
                 const nShopee = normTitle(shopeeTitle).toLowerCase();
                 const eWords = new Set(nShopee.split(/\s+/).filter(w => w.length > 1));
 
@@ -494,17 +516,20 @@ async function addProduct(page, productUrl, _retryCount = 0) {
                     else if (nVariant.startsWith(nShopee) || nShopee.startsWith(nVariant)) score += 8;
                     else if (nVariant.includes(nShopee) || nShopee.includes(nVariant)) score += 5;
                     else {
-                        // Word overlap
-                        const vWords = new Set(nVariant.split(/\s+/).filter(w => w.length > 1));
-                        const common = [...eWords].filter(w => vWords.has(w)).length;
-                        const overlap = eWords.size > 0 ? common / eWords.size : 0;
-                        if (overlap >= 0.6) score += Math.round(overlap * 5);
+                        // Word overlap (fuzzy match for different word order or extra words)
+                        const stripPunct = s => s.replace(/[^\p{L}\p{N}\s]/gu, '');
+                        const vWords = new Set(stripPunct(nVariant).split(/\s+/).filter(w => w.length > 1));
+                        const common = [...new Set(stripPunct(nShopee).split(/\s+/).filter(w => w.length > 1))].filter(w => vWords.has(w)).length;
+                        const eWordsClean = new Set(stripPunct(nShopee).split(/\s+/).filter(w => w.length > 1));
+                        const overlap = eWordsClean.size > 0 ? common / eWordsClean.size : 0;
+                        if (overlap >= 0.6) score += Math.round(overlap * 10); // up to 10 points for 100% overlap
                     }
 
                     // Price matching
                     if (shopeeNormPrice && variantNormPrice && variantNormPrice === shopeeNormPrice) score += 5;
 
-                    if (score > bestScore) {
+                    // Use >= to prefer last match (original seller tends to be listed last)
+                    if (score >= bestScore) {
                         bestScore = score;
                         bestIdx = i;
                     }
@@ -641,7 +666,7 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
         if (!str) return '';
         return str.replace(/\.\d+$/, '').replace(/[^\d]/g, '').replace(/^0+/, '') || '0';
     };
-    const normTitle = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+    const normTitle = (s) => (s || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
 
     let affiliateUrl = null;
     let metadata = { title: '', price: '', image: '' };
@@ -732,11 +757,12 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
                 else if (pTitle.includes(eTitle) || eTitle.includes(pTitle)) score += 5;
                 else {
                     // Word overlap: count shared words between titles
-                    const eWords = new Set(eTitle.split(/\s+/).filter(w => w.length > 1));
-                    const pWords = new Set(pTitle.split(/\s+/).filter(w => w.length > 1));
+                    const stripPunct = s => s.replace(/[^\p{L}\p{N}\s]/gu, '');
+                    const eWords = new Set(stripPunct(eTitle).split(/\s+/).filter(w => w.length > 1));
+                    const pWords = new Set(stripPunct(pTitle).split(/\s+/).filter(w => w.length > 1));
                     const common = [...eWords].filter(w => pWords.has(w)).length;
                     const overlap = eWords.size > 0 ? common / eWords.size : 0;
-                    if (overlap >= 0.6) score += Math.round(overlap * 5); // up to 5 points
+                    if (overlap >= 0.6) score += Math.round(overlap * 10); // up to 10 points
                 }
 
                 // Price matching
