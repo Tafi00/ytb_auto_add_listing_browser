@@ -18,6 +18,9 @@ const WORKER_AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN || 'default-worker-token
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
 let headlessMode = process.env.HEADLESS === 'true';
 const CONTROL_PANEL_PORT = parseInt(process.env.CONTROL_PANEL_PORT || '19200');
+const BROWSER_HEALTH_INTERVAL_MS = parseInt(process.env.BROWSER_HEALTH_INTERVAL_MS || '15000');
+const PAGE_IDLE_REFRESH_MS = parseInt(process.env.PAGE_IDLE_REFRESH_MS || `${30 * 60 * 1000}`);
+const CHROME_ERROR_URL_PREFIX = 'chrome-error://';
 
 // State
 let ws = null;
@@ -29,6 +32,7 @@ let activeWorkers = []; // Chrome process workers
 let _playwrightChromium = null;
 let recentLogs = []; // Keep last 100 logs for control panel
 let jobStats = { total: 0, success: 0, failed: 0 };
+const pagesWithDialogHandler = new WeakSet();
 
 // ==================== Playwright & Chrome ====================
 
@@ -61,6 +65,52 @@ function cleanLockFiles(dir) {
     for (const f of ['SingletonLock', 'SingletonSocket', 'SingletonCookie']) {
         try { fs.rmSync(path.join(dir, f), { force: true }); } catch { }
     }
+}
+
+function isProcessAlive(child) {
+    if (!child || child.killed || !child.pid) return false;
+    try {
+        process.kill(child.pid, 0);
+        return true;
+    } catch {
+        return false;
+    }
+}
+
+async function waitForDebugPort(port, timeout = 15000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+        try {
+            const res = await fetch(`http://127.0.0.1:${port}/json/version`);
+            if (res.ok) return true;
+        } catch { }
+        await new Promise(r => setTimeout(r, 300));
+    }
+    return false;
+}
+
+async function navigateFirstPage(port, url) {
+    if (!url || url === 'about:blank') return;
+
+    await new Promise(r => setTimeout(r, 500));
+    const targetsRes = await fetch(`http://127.0.0.1:${port}/json`);
+    const targets = await targetsRes.json();
+    const pageTarget = targets.find(t => t.type === 'page');
+
+    if (!pageTarget) return;
+
+    const navWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
+    await new Promise((resolve, reject) => {
+        navWs.on('open', () => {
+            navWs.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url } }));
+            navWs.on('message', (data) => {
+                const msg = JSON.parse(data.toString());
+                if (msg.id === 1) { navWs.close(); resolve(); }
+            });
+        });
+        navWs.on('error', reject);
+        setTimeout(() => { navWs.close(); resolve(); }, 10000);
+    });
 }
 
 async function launchBrowser(url, port, sessionDir) {
@@ -107,37 +157,12 @@ async function launchBrowser(url, port, sessionDir) {
     child.stdout.on('data', () => { });
 
     // Wait for debug port
-    const start = Date.now();
-    while (Date.now() - start < 15000) {
-        try {
-            const res = await fetch(`http://127.0.0.1:${port}/json/version`);
-            if (res.ok) break;
-        } catch { }
-        await new Promise(r => setTimeout(r, 300));
-    }
+    await waitForDebugPort(port, 15000);
 
     // Navigate to URL
     if (url && url !== 'about:blank') {
         try {
-            await new Promise(r => setTimeout(r, 500));
-            const targetsRes = await fetch(`http://127.0.0.1:${port}/json`);
-            const targets = await targetsRes.json();
-            const pageTarget = targets.find(t => t.type === 'page');
-
-            if (pageTarget) {
-                const navWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
-                await new Promise((resolve, reject) => {
-                    navWs.on('open', () => {
-                        navWs.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url } }));
-                        navWs.on('message', (data) => {
-                            const msg = JSON.parse(data.toString());
-                            if (msg.id === 1) { navWs.close(); resolve(); }
-                        });
-                    });
-                    navWs.on('error', reject);
-                    setTimeout(() => { navWs.close(); resolve(); }, 10000);
-                });
-            }
+            await navigateFirstPage(port, url);
         } catch (e) {
             log(`Could not navigate to URL: ${e.message}`);
         }
@@ -157,6 +182,11 @@ async function getChromePage(targetUrl) {
         throw new Error(`No browser found for URL: ${targetUrl}`);
     }
 
+    if (!isProcessAlive(worker.process) || !await waitForDebugPort(worker.port, 1000)) {
+        log(`[Recovery] Browser on port ${worker.port} is not reachable. Restarting...`);
+        worker = await restartWorkerBrowser(worker, 'debug port not reachable');
+    }
+
     const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
     const contexts = browser.contexts();
     if (contexts.length === 0) {
@@ -171,22 +201,92 @@ async function getChromePage(targetUrl) {
         page = pages.find(p => p.url() === targetUrl || p.url().split('?')[0] === targetBase);
     }
     if (!page) {
-        // Do NOT fallback to pages[0] - that causes cross-contamination
-        await browser.close();
-        throw new Error(`No matching page found for URL: ${targetUrl}. Available pages: ${pages.map(p => p.url()).join(', ')}`);
+        page = await recoverWorkerPage(browser, context, worker, 'matching page missing');
+    } else if (await isChromeCrashPage(page)) {
+        page = await recoverWorkerPage(browser, context, worker, 'Chrome crash page');
     }
     // Auto-dismiss any dialog (alert/confirm/prompt) immediately
     setupPageDialogHandler(page, worker.port);
 
-    return { browser, context, page };
+    return { browser, context, page, worker };
 }
 
 // Setup persistent dialog handler for a page to auto-dismiss YouTube alerts
 function setupPageDialogHandler(page, port) {
+    if (pagesWithDialogHandler.has(page)) return;
+    pagesWithDialogHandler.add(page);
     page.on('dialog', async (dialog) => {
         log(`[Port ${port}] Unexpected dialog: "${dialog.message()}" — auto-dismissing`);
         await dialog.dismiss().catch(() => { });
     });
+}
+
+async function isChromeCrashPage(page) {
+    try {
+        const url = page.url();
+        if (url.startsWith(CHROME_ERROR_URL_PREFIX)) return true;
+
+        const title = await page.title().catch(() => '');
+        if (/aw,\s*snap|out of memory/i.test(title)) return true;
+
+        return await page.evaluate(() => {
+            const bodyText = document.body?.innerText || '';
+            return /Aw,\s*Snap!|Error code:\s*Out of Memory/i.test(bodyText);
+        }).catch(() => true);
+    } catch {
+        return true;
+    }
+}
+
+async function closeExtraPages(context, keepPage) {
+    for (const page of context.pages()) {
+        if (page === keepPage) continue;
+        const url = page.url();
+        if (url === 'about:blank' || url.startsWith(CHROME_ERROR_URL_PREFIX) || /studio\.youtube\.com/.test(url)) {
+            await page.close().catch(() => { });
+        }
+    }
+}
+
+async function recoverWorkerPage(browser, context, worker, reason) {
+    log(`[Recovery] Port ${worker.port}: ${reason}. Reopening ${worker.url}`);
+
+    for (const page of context.pages()) {
+        await page.close().catch(() => { });
+    }
+
+    const page = await context.newPage();
+    setupPageDialogHandler(page, worker.port);
+    await page.goto(worker.url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(async (e) => {
+        log(`[Recovery] goto failed on port ${worker.port}: ${e.message}. Retrying with commit...`);
+        await page.goto(worker.url, { waitUntil: 'commit', timeout: 30000 }).catch(() => { });
+    });
+    await page.waitForTimeout(2000);
+    await closeExtraPages(context, page);
+    worker.lastRecoveredAt = Date.now();
+    worker.lastRefreshAt = Date.now();
+
+    if (await isChromeCrashPage(page)) {
+        await browser.close().catch(() => { });
+        await restartWorkerBrowser(worker, 'page still crashed after reopen');
+        throw new Error(`Browser on port ${worker.port} was restarted after repeated Chrome crash. Please retry the job.`);
+    }
+
+    return page;
+}
+
+async function restartWorkerBrowser(worker, reason = 'unknown') {
+    log(`[Recovery] Restarting browser on port ${worker.port}: ${reason}`);
+    try { worker.process.kill(); } catch { }
+    await new Promise(r => setTimeout(r, 1000));
+
+    const child = await launchBrowser(worker.url, worker.port, worker.sessionDir);
+    worker.process = child;
+    worker.busy = false;
+    worker.lastRecoveredAt = Date.now();
+    worker.lastRefreshAt = Date.now();
+    log(`[Recovery] Browser restarted on port ${worker.port}`);
+    return worker;
 }
 
 // ==================== Browser Automation ====================
@@ -785,7 +885,8 @@ async function executeJob(jobId, targetUrl, productUrl) {
     const jobStart = Date.now();
     log(`Job START: ${productUrl} on tab: ${targetUrl}`);
 
-    const { browser, page } = await getChromePage(targetUrl);
+    const { browser, page, worker } = await getChromePage(targetUrl);
+    worker.busy = true;
     try {
         await page.bringToFront().catch(() => { });
         await page.waitForTimeout(300);
@@ -801,16 +902,24 @@ async function executeJob(jobId, targetUrl, productUrl) {
         log(`Affiliate URL: ${data.affiliateUrl}`);
 
         await browser.close().catch(() => { });
+        worker.busy = false;
+        worker.lastRefreshAt = Date.now();
         return { success: true, affiliateUrl: data.affiliateUrl, metadata: data.metadata };
     } catch (e) {
         log(`Error during job: ${e.message}`);
         try {
-            await page.reload({ waitUntil: 'commit', timeout: 15000 });
-            log('Page reloaded after error');
+            if (await isChromeCrashPage(page)) {
+                await recoverWorkerPage(browser, browser.contexts()[0], worker, 'Chrome crash after job error');
+            } else {
+                await page.reload({ waitUntil: 'commit', timeout: 15000 });
+                log('Page reloaded after error');
+            }
         } catch (reloadErr) {
             log(`Failed to reload page: ${reloadErr.message}`);
         }
         await browser.close().catch(() => { });
+        worker.busy = false;
+        worker.lastRefreshAt = Date.now();
         return { success: false, error: e.message };
     }
 }
@@ -862,7 +971,15 @@ async function openBrowsers(urls) {
 
         try {
             const child = await launchBrowser(url, port, sessionDir);
-            activeWorkers.push({ process: child, port, url });
+            activeWorkers.push({
+                process: child,
+                port,
+                url,
+                sessionDir,
+                busy: false,
+                lastRefreshAt: Date.now(),
+                lastRecoveredAt: 0,
+            });
             log(`Browser ${i} opened on port ${port} for URL: ${url}`);
         } catch (e) {
             log(`Failed to launch browser ${i}: ${e.message}`);
@@ -1011,21 +1128,22 @@ setInterval(() => {
     }
 }, 30000);
 
-// Clean up dead browser processes
-setInterval(() => {
-    activeWorkers = activeWorkers.filter(w => {
-        try {
-            process.kill(w.process.pid, 0);
-            return true;
-        } catch {
-            return false;
+// Restart dead browser processes instead of silently dropping them.
+setInterval(async () => {
+    for (const worker of activeWorkers) {
+        if (worker.busy) continue;
+        if (!isProcessAlive(worker.process)) {
+            await restartWorkerBrowser(worker, 'Chrome process exited').catch(e => {
+                log(`[Recovery] Failed to restart port ${worker.port}: ${e.message}`);
+            });
         }
-    });
+    }
 }, 5000);
 
 // Periodically check for stuck dialogs on all browser tabs and auto-dismiss + reload
 setInterval(async () => {
     for (const worker of activeWorkers) {
+        if (worker.busy) continue;
         try {
             const chromium = await getPlaywright();
             const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
@@ -1059,6 +1177,50 @@ setInterval(async () => {
         }
     }
 }, 15000);
+
+// Stronger health check for Chrome's "Aw, Snap! / Out of Memory" crash page.
+setInterval(async () => {
+    for (const worker of activeWorkers) {
+        if (worker.busy) continue;
+
+        try {
+            if (!isProcessAlive(worker.process) || !await waitForDebugPort(worker.port, 1000)) {
+                await restartWorkerBrowser(worker, 'health check could not reach debug port');
+                continue;
+            }
+
+            const chromium = await getPlaywright();
+            const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
+            const context = browser.contexts()[0];
+            if (!context) {
+                await browser.close().catch(() => { });
+                await restartWorkerBrowser(worker, 'missing browser context');
+                continue;
+            }
+
+            let targetPage = context.pages().find(p => p.url() === worker.url || p.url().split('?')[0] === worker.url.split('?')[0]);
+            if (!targetPage) {
+                targetPage = await recoverWorkerPage(browser, context, worker, 'health check could not find target tab');
+            } else if (await isChromeCrashPage(targetPage)) {
+                targetPage = await recoverWorkerPage(browser, context, worker, 'Chrome Aw Snap / Out of Memory');
+            }
+
+            await closeExtraPages(context, targetPage);
+
+            if (Date.now() - (worker.lastRefreshAt || 0) > PAGE_IDLE_REFRESH_MS) {
+                log(`[Watchdog] Periodic refresh on port ${worker.port} to release YouTube Studio memory`);
+                await targetPage.reload({ waitUntil: 'domcontentloaded', timeout: 30000 }).catch(async () => {
+                    targetPage = await recoverWorkerPage(browser, context, worker, 'periodic refresh failed');
+                });
+                worker.lastRefreshAt = Date.now();
+            }
+
+            await browser.close().catch(() => { });
+        } catch (e) {
+            log(`[Watchdog] Health check skipped on port ${worker.port}: ${e.message}`);
+        }
+    }
+}, BROWSER_HEALTH_INTERVAL_MS);
 
 // Graceful shutdown
 process.on('SIGINT', () => {
