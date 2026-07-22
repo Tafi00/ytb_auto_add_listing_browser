@@ -2,7 +2,7 @@
 // Run on Windows machine: npm run worker
 
 import 'dotenv/config';
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import path from 'path';
 import { fileURLToPath } from 'url';
 import fs from 'fs';
@@ -21,6 +21,11 @@ const CONTROL_PANEL_PORT = parseInt(process.env.CONTROL_PANEL_PORT || '19200');
 const BROWSER_HEALTH_INTERVAL_MS = parseInt(process.env.BROWSER_HEALTH_INTERVAL_MS || '15000');
 const PAGE_IDLE_REFRESH_MS = parseInt(process.env.PAGE_IDLE_REFRESH_MS || `${30 * 60 * 1000}`);
 const CHROME_ERROR_URL_PREFIX = 'chrome-error://';
+const ENABLE_BROWSER_PUBLIC_FALLBACK = process.env.ENABLE_BROWSER_PUBLIC_FALLBACK === '1';
+const USE_DIRECT_SHOPEE_AFFILIATE = process.env.USE_DIRECT_SHOPEE_AFFILIATE !== '0';
+const USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK = process.env.USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK !== '0';
+const USE_DIRECT_LAZADA_AFFILIATE = process.env.USE_DIRECT_LAZADA_AFFILIATE !== '0';
+const LAZADA_YOUTUBE_EXLAZ = process.env.LAZADA_YOUTUBE_EXLAZ || 'd_2:mm_254241245_236353075_2194553061:vn2880030:00:';
 
 // State
 let ws = null;
@@ -29,6 +34,7 @@ let reconnectDelay = 1000;
 let connectionEnabled = true; // Bật/tắt kết nối server
 let currentUrls = [];
 let activeWorkers = []; // Chrome process workers
+let browsersOpening = false;
 let _playwrightChromium = null;
 let recentLogs = []; // Keep last 100 logs for control panel
 let jobStats = { total: 0, success: 0, failed: 0 };
@@ -42,6 +48,58 @@ async function getPlaywright() {
         _playwrightChromium = pw.chromium;
     }
     return _playwrightChromium;
+}
+
+async function connectWorkerBrowser(worker, timeout = 10000) {
+    if (worker.cdpBrowser?.isConnected?.()) return worker.cdpBrowser;
+
+    worker.cdpBrowser = null;
+    const chromium = await getPlaywright();
+    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`, { timeout });
+    worker.cdpBrowser = browser;
+    browser.once?.('disconnected', () => {
+        if (worker.cdpBrowser === browser) worker.cdpBrowser = null;
+    });
+    return browser;
+}
+
+function forgetWorkerBrowser(worker, browser = null) {
+    if (!worker) return;
+    if (!browser || worker.cdpBrowser === browser) worker.cdpBrowser = null;
+}
+
+async function disconnectBrowser() {
+    // Intentionally a no-op for connectOverCDP browsers. Calling browser.close()
+    // closes the real Chrome instance, and closing the internal Playwright
+    // connection can poison later CDP attaches. Keep one connection per worker.
+}
+
+function shortErrorMessage(error) {
+    return (error?.message || String(error))
+        .replace(/(?:browserType\.connectOverCDP:\s*){2,}/g, 'browserType.connectOverCDP: ')
+        .replace(/(?:browserContext\.newPage:\s*){2,}/g, 'browserContext.newPage: ')
+        .replace(/(?:page\.(?:close|evaluate|removeListener|title):\s*){2,}/g, '')
+        .slice(0, 500);
+}
+
+function isTargetClosedError(error) {
+    return /Target page, context or browser has been closed|Browser closed|Connection closed|Session closed/i
+        .test(error?.message || String(error));
+}
+
+async function acquireCdpLock(worker, owner, { wait = false, timeout = 15000 } = {}) {
+    const start = Date.now();
+    while (worker.cdpLocked) {
+        if (!wait || Date.now() - start > timeout) return false;
+        await new Promise(r => setTimeout(r, 100));
+    }
+    worker.cdpLocked = owner;
+    return true;
+}
+
+function releaseCdpLock(worker, owner) {
+    if (!worker) return;
+    if (!owner || worker.cdpLocked === owner) worker.cdpLocked = null;
 }
 
 function findChrome() {
@@ -67,6 +125,38 @@ function cleanLockFiles(dir) {
     }
 }
 
+function cleanSessionRestoreState(userDataDir) {
+    const defaultDir = path.join(userDataDir, 'Default');
+    if (!fs.existsSync(defaultDir)) return;
+
+    // Chrome stores the tabs it should restore here. Keeping these files after a
+    // forced restart can reopen many stale YouTube Studio tabs and exhaust RAM.
+    for (const name of ['Sessions', 'Current Session', 'Current Tabs', 'Last Session', 'Last Tabs']) {
+        try { fs.rmSync(path.join(defaultDir, name), { recursive: true, force: true }); } catch { }
+    }
+
+    const preferencesPath = path.join(defaultDir, 'Preferences');
+    try {
+        if (!fs.existsSync(preferencesPath)) return;
+        const preferences = JSON.parse(fs.readFileSync(preferencesPath, 'utf8').replace(/^\uFEFF/, ''));
+        preferences.profile = preferences.profile || {};
+        preferences.profile.exit_type = 'Normal';
+        preferences.profile.exited_cleanly = true;
+
+        if (preferences.session?.restore_on_startup === 1) {
+            delete preferences.session.restore_on_startup;
+            delete preferences.session.startup_urls;
+        }
+
+        fs.writeFileSync(preferencesPath, JSON.stringify(preferences));
+    } catch { }
+}
+
+function prepareProfileForLaunch(userDataDir) {
+    cleanLockFiles(userDataDir);
+    cleanSessionRestoreState(userDataDir);
+}
+
 function isProcessAlive(child) {
     if (!child || child.killed || !child.pid) return false;
     try {
@@ -89,17 +179,114 @@ async function waitForDebugPort(port, timeout = 15000) {
     return false;
 }
 
-async function navigateFirstPage(port, url) {
-    if (!url || url === 'about:blank') return;
+async function waitForDebugPortClosed(port, timeout = 5000) {
+    const start = Date.now();
+    while (Date.now() - start < timeout) {
+        if (!await waitForDebugPort(port, 250)) return true;
+        await new Promise(r => setTimeout(r, 250));
+    }
+    return false;
+}
 
-    await new Promise(r => setTimeout(r, 500));
+async function waitForProcessExit(child, timeout = 5000) {
+    if (!isProcessAlive(child)) return true;
+    return await new Promise(resolve => {
+        const timer = setTimeout(() => resolve(!isProcessAlive(child)), timeout);
+        child.once?.('exit', () => {
+            clearTimeout(timer);
+            resolve(true);
+        });
+    });
+}
+
+function killProcessTree(childOrPid, force = true) {
+    const pid = typeof childOrPid === 'number' ? childOrPid : childOrPid?.pid;
+    if (!pid) return;
+
+    if (process.platform === 'win32') {
+        const args = [force ? '/F' : null, '/T', '/PID', String(pid)].filter(Boolean);
+        try { execFileSync('taskkill', args, { stdio: 'ignore' }); } catch { }
+        return;
+    }
+
+    try { process.kill(pid, force ? 'SIGKILL' : 'SIGTERM'); } catch { }
+}
+
+async function sendBrowserClose(port) {
+    try {
+        const versionRes = await fetch(`http://127.0.0.1:${port}/json/version`);
+        if (!versionRes.ok) return false;
+        const version = await versionRes.json();
+        if (!version.webSocketDebuggerUrl) return false;
+
+        const closeWs = new WebSocket(version.webSocketDebuggerUrl);
+        return await new Promise(resolve => {
+            let done = false;
+            const finish = (ok) => {
+                if (done) return;
+                done = true;
+                try { closeWs.close(); } catch { }
+                resolve(ok);
+            };
+            const timer = setTimeout(() => finish(false), 2500);
+            closeWs.on('open', () => {
+                closeWs.send(JSON.stringify({ id: 1, method: 'Browser.close' }));
+            });
+            closeWs.on('message', (data) => {
+                try {
+                    const msg = JSON.parse(data.toString());
+                    if (msg.id === 1) {
+                        clearTimeout(timer);
+                        finish(true);
+                    }
+                } catch { }
+            });
+            closeWs.on('close', () => {
+                clearTimeout(timer);
+                finish(true);
+            });
+            closeWs.on('error', () => {
+                clearTimeout(timer);
+                finish(false);
+            });
+        });
+    } catch {
+        return false;
+    }
+}
+
+async function stopWorkerBrowser(worker, reason = 'restart') {
+    if (!worker?.process) return;
+
+    log(`[Recovery] Closing browser on port ${worker.port}: ${reason}`);
+    if (worker.port && await waitForDebugPort(worker.port, 800)) {
+        await sendBrowserClose(worker.port);
+        await waitForProcessExit(worker.process, 4000);
+    }
+
+    if (isProcessAlive(worker.process)) {
+        killProcessTree(worker.process, true);
+        await waitForProcessExit(worker.process, 3000);
+    }
+
+    if (worker.port) await waitForDebugPortClosed(worker.port, 3000);
+}
+
+async function getPageTargets(port) {
     const targetsRes = await fetch(`http://127.0.0.1:${port}/json`);
     const targets = await targetsRes.json();
-    const pageTarget = targets.find(t => t.type === 'page');
+    return targets.filter(t => t.type === 'page');
+}
 
-    if (!pageTarget) return;
+function urlsMatch(actualUrl, targetUrl) {
+    if (!actualUrl || !targetUrl) return false;
+    return actualUrl === targetUrl || actualUrl.split('?')[0] === targetUrl.split('?')[0];
+}
 
-    const navWs = new WebSocket(pageTarget.webSocketDebuggerUrl);
+async function navigateTarget(target, url) {
+    if (!url || url === 'about:blank') return;
+
+    const navWs = new WebSocket(target.webSocketDebuggerUrl);
     await new Promise((resolve, reject) => {
         navWs.on('open', () => {
             navWs.send(JSON.stringify({ id: 1, method: 'Page.navigate', params: { url } }));
@@ -113,6 +300,26 @@ async function navigateFirstPage(port, url) {
     });
 }
 
+async function resetBrowserToSingleTab(port, url) {
+    await new Promise(r => setTimeout(r, 500));
+
+    let pageTargets = await getPageTargets(port);
+    let keepTarget = pageTargets.find(t => urlsMatch(t.url, url))
+        || pageTargets.find(t => t.url === 'about:blank' || t.url.startsWith('chrome://newtab'))
+        || pageTargets[0];
+
+    if (!keepTarget) return;
+
+    await navigateTarget(keepTarget, url);
+
+    pageTargets = await getPageTargets(port);
+    keepTarget = pageTargets.find(t => urlsMatch(t.url, url)) || keepTarget;
+    for (const target of pageTargets) {
+        if (target.id === keepTarget.id) continue;
+        await fetch(`http://127.0.0.1:${port}/json/close/${target.id}`).catch(() => { });
+    }
+}
+
 async function launchBrowser(url, port, sessionDir) {
     const chromePath = findChrome();
     if (!chromePath) throw new Error('Chrome not found. Set CHROME_PATH env var.');
@@ -120,7 +327,7 @@ async function launchBrowser(url, port, sessionDir) {
     const userDataDir = path.join(sessionDir, 'browser-data');
     if (!fs.existsSync(userDataDir)) fs.mkdirSync(userDataDir, { recursive: true });
 
-    cleanLockFiles(userDataDir);
+    prepareProfileForLaunch(userDataDir);
 
     const args = [
         `--user-data-dir=${userDataDir}`,
@@ -134,6 +341,11 @@ async function launchBrowser(url, port, sessionDir) {
         '--disable-dev-shm-usage',
         '--disable-logging',
         '--disable-extensions',
+        '--no-first-run',
+        '--no-default-browser-check',
+        '--disable-session-crashed-bubble',
+        '--disable-restore-session-state',
+        '--noerrdialogs',
         '--window-size=1200,800',
     ];
 
@@ -157,12 +369,13 @@ async function launchBrowser(url, port, sessionDir) {
     child.stdout.on('data', () => { });
 
     // Wait for debug port
-    await waitForDebugPort(port, 15000);
+    const ready = await waitForDebugPort(port, 15000);
+    if (!ready) throw new Error(`Chrome debugging port ${port} not ready after 15000ms`);
 
-    // Navigate to URL
+    // Navigate to URL and close restored/stale tabs immediately.
     if (url && url !== 'about:blank') {
         try {
-            await navigateFirstPage(port, url);
+            await resetBrowserToSingleTab(port, url);
         } catch (e) {
             log(`Could not navigate to URL: ${e.message}`);
         }
@@ -171,10 +384,16 @@ async function launchBrowser(url, port, sessionDir) {
     return child;
 }
 
-async function getChromePage(targetUrl) {
-    const chromium = await getPlaywright();
+function findWorkerForTargetUrl(targetUrl) {
     const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
-    let worker = targetUrl ? activeWorkers.find(w => w.url === targetUrl || w.url.split('?')[0] === targetBase) : null;
+    return targetUrl
+        ? activeWorkers.find(w => w.url === targetUrl || w.url.split('?')[0] === targetBase)
+        : activeWorkers[0];
+}
+
+async function getChromePage(targetUrl, reservedWorker = null) {
+    const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
+    let worker = reservedWorker || findWorkerForTargetUrl(targetUrl);
 
     if (!worker) {
         if (activeWorkers.length === 0) throw new Error('No browser running.');
@@ -182,33 +401,55 @@ async function getChromePage(targetUrl) {
         throw new Error(`No browser found for URL: ${targetUrl}`);
     }
 
-    if (!isProcessAlive(worker.process) || !await waitForDebugPort(worker.port, 1000)) {
-        log(`[Recovery] Browser on port ${worker.port} is not reachable. Restarting...`);
-        worker = await restartWorkerBrowser(worker, 'debug port not reachable');
+    let lastError = null;
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        let browser = null;
+        try {
+            if (!isProcessAlive(worker.process) || !await waitForDebugPort(worker.port, 3000)) {
+                log(`[Recovery] Browser on port ${worker.port} is not reachable. Restarting...`);
+                worker = await restartWorkerBrowser(worker, 'debug port not reachable');
+                worker.busy = true;
+            }
+
+            browser = await connectWorkerBrowser(worker, 10000);
+            const contexts = browser.contexts();
+            if (contexts.length === 0) {
+                throw new Error(`No browser context found on port ${worker.port}.`);
+            }
+            const context = contexts[0];
+            const pages = context.pages();
+
+            let page;
+            if (targetUrl) {
+                page = pages.find(p => p.url() === targetUrl || p.url().split('?')[0] === targetBase);
+            }
+            if (!page) {
+                page = await recoverWorkerPage(browser, context, worker, 'matching page missing');
+            } else if (await isChromeCrashPage(page)) {
+                page = await recoverWorkerPage(browser, context, worker, 'Chrome crash page');
+            }
+            setupPageDialogHandler(page, worker.port);
+
+            return { browser, context, page, worker };
+        } catch (e) {
+            lastError = e;
+            forgetWorkerBrowser(worker, browser);
+            log(`[Recovery] connectOverCDP failed on port ${worker.port} (attempt ${attempt}/3): ${shortErrorMessage(e)}`);
+
+            if (!isProcessAlive(worker.process) || isTargetClosedError(e)) {
+                const reason = isTargetClosedError(e)
+                    ? 'CDP target closed while connecting'
+                    : 'Chrome process exited while connecting';
+                worker = await restartWorkerBrowser(worker, reason);
+                worker.busy = true;
+                await new Promise(r => setTimeout(r, 1000));
+            }
+
+            if (attempt < 3) await new Promise(r => setTimeout(r, 700 * attempt));
+        }
     }
 
-    const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
-    const contexts = browser.contexts();
-    if (contexts.length === 0) {
-        await browser.close();
-        throw new Error(`No browser context found on port ${worker.port}.`);
-    }
-    const context = contexts[0];
-    const pages = context.pages();
-
-    let page;
-    if (targetUrl) {
-        page = pages.find(p => p.url() === targetUrl || p.url().split('?')[0] === targetBase);
-    }
-    if (!page) {
-        page = await recoverWorkerPage(browser, context, worker, 'matching page missing');
-    } else if (await isChromeCrashPage(page)) {
-        page = await recoverWorkerPage(browser, context, worker, 'Chrome crash page');
-    }
-    // Auto-dismiss any dialog (alert/confirm/prompt) immediately
-    setupPageDialogHandler(page, worker.port);
-
-    return { browser, context, page, worker };
+    throw new Error(`Không kết nối được browser trên port ${worker.port}: ${shortErrorMessage(lastError)}`);
 }
 
 // Setup persistent dialog handler for a page to auto-dismiss YouTube alerts
@@ -251,11 +492,8 @@ async function closeExtraPages(context, keepPage) {
 async function recoverWorkerPage(browser, context, worker, reason) {
     log(`[Recovery] Port ${worker.port}: ${reason}. Reopening ${worker.url}`);
 
-    for (const page of context.pages()) {
-        await page.close().catch(() => { });
-    }
-
-    const page = await context.newPage();
+    const existingPages = context.pages();
+    const page = existingPages[0] || await context.newPage();
     setupPageDialogHandler(page, worker.port);
     await page.goto(worker.url, { waitUntil: 'domcontentloaded', timeout: 30000 }).catch(async (e) => {
         log(`[Recovery] goto failed on port ${worker.port}: ${e.message}. Retrying with commit...`);
@@ -267,7 +505,7 @@ async function recoverWorkerPage(browser, context, worker, reason) {
     worker.lastRefreshAt = Date.now();
 
     if (await isChromeCrashPage(page)) {
-        await browser.close().catch(() => { });
+        await disconnectBrowser(browser);
         await restartWorkerBrowser(worker, 'page still crashed after reopen');
         throw new Error(`Browser on port ${worker.port} was restarted after repeated Chrome crash. Please retry the job.`);
     }
@@ -276,20 +514,58 @@ async function recoverWorkerPage(browser, context, worker, reason) {
 }
 
 async function restartWorkerBrowser(worker, reason = 'unknown') {
-    log(`[Recovery] Restarting browser on port ${worker.port}: ${reason}`);
-    try { worker.process.kill(); } catch { }
-    await new Promise(r => setTimeout(r, 1000));
+    if (worker.restarting) {
+        log(`[Recovery] Restart already in progress on port ${worker.port}, skip: ${reason}`);
+        return worker;
+    }
 
-    const child = await launchBrowser(worker.url, worker.port, worker.sessionDir);
-    worker.process = child;
-    worker.busy = false;
-    worker.lastRecoveredAt = Date.now();
-    worker.lastRefreshAt = Date.now();
-    log(`[Recovery] Browser restarted on port ${worker.port}`);
-    return worker;
+    worker.restarting = true;
+    try {
+        log(`[Recovery] Restarting browser on port ${worker.port}: ${reason}`);
+        forgetWorkerBrowser(worker);
+        await stopWorkerBrowser(worker, reason);
+
+        const child = await launchBrowser(worker.url, worker.port, worker.sessionDir);
+        worker.process = child;
+        worker.busy = false;
+        worker.healthMisses = 0;
+        worker.lastRecoveredAt = Date.now();
+        worker.lastRefreshAt = Date.now();
+        log(`[Recovery] Browser restarted on port ${worker.port}`);
+        return worker;
+    } finally {
+        worker.restarting = false;
+    }
 }
 
 // ==================== Browser Automation ====================
+
+function normalizeMaybeUrl(url) {
+    if (Array.isArray(url)) return normalizeMaybeUrl(url[0]);
+    if (!url || typeof url !== 'string') return url || null;
+    return url.startsWith('//') ? `https:${url}` : url;
+}
+
+function jsonLdTypeMatches(node, type) {
+    const nodeType = node?.['@type'];
+    return nodeType === type || (Array.isArray(nodeType) && nodeType.includes(type));
+}
+
+function parseLazadaTrackingData(html) {
+    const match = html.match(/var\s+pdpTrackingData\s*=\s*"((?:\\.|[^"\\])*)"/);
+    if (!match) return null;
+
+    try {
+        const jsonText = JSON.parse(`"${match[1]}"`);
+        return JSON.parse(jsonText);
+    } catch {
+        try {
+            return JSON.parse(match[1].replace(/\\"/g, '"').replace(/\\\\/g, '\\'));
+        } catch {
+            return null;
+        }
+    }
+}
 
 /**
  * Fetch product title/price from Shopee/Lazada using Facebook bot UA (SSR for social preview).
@@ -333,7 +609,9 @@ async function getProductInfo(productUrl) {
             for (const m of ldMatches) {
                 try {
                     const parsed = JSON.parse(m[1]);
-                    if (parsed['@type'] === 'Product') { ld = parsed; break; }
+                    const nodes = Array.isArray(parsed) ? parsed : [parsed];
+                    const productNode = nodes.find(node => jsonLdTypeMatches(node, 'Product'));
+                    if (productNode) { ld = productNode; break; }
                 } catch { }
             }
 
@@ -354,21 +632,26 @@ async function getProductInfo(productUrl) {
             const titleTag = html.match(/<title[^>]*>([^<]+)<\/title>/i);
             const cleanTitle = titleTag ? titleTag[1].replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() : null;
             const offer = ld?.offers || {};
+            const lazadaTrackingData = parseLazadaTrackingData(html);
+            const offerPrice = offer.price ?? offer.lowPrice ?? offer.highPrice ?? null;
+            const trackingPrice = lazadaTrackingData?.pdt_price
+                ? String(lazadaTrackingData.pdt_price).replace(/[^\d]/g, '') || String(lazadaTrackingData.pdt_price)
+                : null;
             const seller = offer.seller || {};
             const sellerRating = seller.aggregateRating || {};
             const productRating = ld?.aggregateRating || {};
 
             const info = {
                 // Basic
-                title: (ld?.name || meta('og:title') || cleanTitle || '').replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() || null,
+                title: (ld?.name || meta('og:title') || lazadaTrackingData?.pdt_name || cleanTitle || '').replace(/\s*\|\s*(Shopee|Lazada).*$/i, '').trim() || null,
                 description: ld?.description?.trim() || meta('og:description') || null,
-                image: ld?.image || meta('og:image') || null,
+                image: normalizeMaybeUrl(ld?.image || meta('og:image') || lazadaTrackingData?.pdt_photo || null),
                 url: ld?.url || meta('og:url') || productUrl,
                 productID: ld?.productID || null,
-                brand: ld?.brand || null,
+                brand: ld?.brand || lazadaTrackingData?.brand_name || null,
                 // Price
-                price: offer.price || null,
-                currency: offer.priceCurrency || null,
+                price: offerPrice || meta('product:price:amount') || meta('og:price:amount') || trackingPrice || null,
+                currency: offer.priceCurrency || meta('product:price:currency') || meta('og:price:currency') || lazadaTrackingData?.core?.currencyCode || null,
                 condition: offer.itemCondition?.replace('http://schema.org/', '') || null,
                 availability: offer.availability?.replace('http://schema.org/', '') || null,
                 // Seller
@@ -380,6 +663,7 @@ async function getProductInfo(productUrl) {
                 // Product rating
                 rating: productRating.ratingValue || null,
                 ratingCount: productRating.ratingCount || null,
+                resolvedUrl: res.url || productUrl,
             };
 
             log(`Product info: title="${info.title}", price=${info.price || 'N/A'} ${info.currency || ''}, rating=${info.rating || 'N/A'}, seller="${info.seller || 'N/A'}"`);
@@ -392,6 +676,316 @@ async function getProductInfo(productUrl) {
     return null;
 }
 
+async function isProductDetailsOpen(page) {
+    return await page.locator('ytshopping-product-details-dialog').first()
+        .isVisible({ timeout: 300 })
+        .catch(() => false);
+}
+
+async function closeProductDetailsDialog(page) {
+    if (!await isProductDetailsOpen(page)) return false;
+
+    const closeBtn = page.locator([
+        'ytshopping-product-details-dialog ytcp-icon-button[aria-label="Close"]',
+        'ytshopping-product-details-dialog button[aria-label="Close"]',
+        'ytshopping-product-details-dialog [aria-label="Close"]',
+        'ytshopping-product-details-dialog ytcp-icon-button[aria-label="Đóng"]',
+        'ytshopping-product-details-dialog button[aria-label="Đóng"]',
+        'ytshopping-product-details-dialog [aria-label="Đóng"]',
+    ].join(', ')).first();
+
+    if (await closeBtn.isVisible({ timeout: 800 }).catch(() => false)) {
+        await closeBtn.click({ force: true }).catch(async () => {
+            await closeBtn.evaluate(el => el.click()).catch(() => { });
+        });
+    } else {
+        await page.keyboard.press('Escape').catch(() => { });
+    }
+
+    await page.locator('ytshopping-product-details-dialog').first()
+        .waitFor({ state: 'hidden', timeout: 3000 })
+        .catch(() => { });
+    return true;
+}
+
+async function isPickerNextEnabled(page) {
+    const pickerNextBtn = page.locator('ytcp-button#picker-next-button button').first();
+    const visible = await pickerNextBtn.isVisible({ timeout: 300 }).catch(() => false);
+    if (!visible) return false;
+
+    return await pickerNextBtn.evaluate(btn => {
+        const host = btn.closest('ytcp-button');
+        const disabled = btn.disabled
+            || btn.getAttribute('aria-disabled') === 'true'
+            || host?.getAttribute('aria-disabled') === 'true'
+            || host?.hasAttribute('disabled');
+        return !disabled;
+    }).catch(() => false);
+}
+
+async function waitForTagClickOutcome(page, timeout = 2500) {
+    const selectedProduct = page.locator('ytshopping-product-picker-selected-product ytshopping-product');
+    const start = Date.now();
+
+    while (Date.now() - start < timeout) {
+        if (await isPickerNextEnabled(page)) return 'next-enabled';
+        if (await selectedProduct.first().isVisible({ timeout: 200 }).catch(() => false)) return 'selected-product';
+        if (await isProductDetailsOpen(page)) return 'details-opened';
+        await page.waitForTimeout(150);
+    }
+
+    return null;
+}
+
+async function getPickerSelectedProductCount(page) {
+    return await page.evaluate(() =>
+        document.querySelectorAll('ytshopping-product-picker-selected-product ytshopping-product').length
+    ).catch(() => 0);
+}
+
+async function clickPickerNextButton(page) {
+    const nextBtn = page.locator('ytcp-button#picker-next-button button').first();
+    await nextBtn.waitFor({ state: 'visible', timeout: 10000 });
+
+    await page.waitForFunction(() => {
+        const selectedCount = document.querySelectorAll('ytshopping-product-picker-selected-product ytshopping-product').length;
+        const btn = document.querySelector('ytcp-button#picker-next-button button');
+        const host = document.querySelector('ytcp-button#picker-next-button');
+        if (!btn || selectedCount <= 0) return false;
+        return !btn.disabled
+            && btn.getAttribute('aria-disabled') !== 'true'
+            && host?.getAttribute('aria-disabled') !== 'true'
+            && !host?.hasAttribute('disabled');
+    }, null, { timeout: 12000 }).catch(() => { });
+
+    const selectedCount = await getPickerSelectedProductCount(page);
+    const enabled = await isPickerNextEnabled(page);
+    log(`Picker selected products: ${selectedCount}; Next enabled: ${enabled ? 'yes' : 'no'}`);
+    if (!enabled) throw new Error('Next button is not enabled after tagging product.');
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        let method = null;
+        if (attempt === 1) {
+            method = 'playwright';
+            await nextBtn.click({ timeout: 3000 }).catch(() => { method = null; });
+        }
+
+        if (!method && attempt <= 2) {
+            method = await page.evaluate(() => {
+                const host = document.querySelector('ytcp-button#picker-next-button');
+                const btn = host?.querySelector('button');
+                if (!btn) return null;
+                btn.click();
+                return 'dom';
+            }).catch(() => null);
+        }
+
+        if (!method) {
+            const point = await nextBtn.evaluate(btn => {
+                const rect = btn.getBoundingClientRect();
+                if (!rect.width || !rect.height) return null;
+                return {
+                    x: Math.round(rect.left + rect.width / 2),
+                    y: Math.round(rect.top + rect.height / 2),
+                };
+            }).catch(() => null);
+            if (point) {
+                await page.mouse.click(point.x, point.y);
+                method = 'mouse';
+            }
+        }
+
+        if (method) log(`Clicked Next button (${method}, attempt ${attempt})`);
+
+        const movedToDone = await page.locator('ytcp-button#picker-done-button button, button[aria-label="Done"], button[aria-label="Xong"]')
+            .first()
+            .isVisible({ timeout: 2500 })
+            .catch(() => false);
+        if (movedToDone) return;
+
+        await page.waitForTimeout(500);
+    }
+
+    throw new Error('Clicked Next but product picker did not advance to Done step.');
+}
+
+async function clickPickerDoneButton(page) {
+    const doneBtn = page.locator('ytcp-button#picker-done-button button, button[aria-label="Done"], button[aria-label="Xong"]').first();
+    await doneBtn.waitFor({ state: 'visible', timeout: 10000 });
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        let method = null;
+        if (attempt === 1) {
+            method = 'playwright';
+            await doneBtn.click({ timeout: 3000 }).catch(() => { method = null; });
+        }
+
+        if (!method && attempt <= 2) {
+            method = await page.evaluate(() => {
+                const host = document.querySelector('ytcp-button#picker-done-button');
+                const btn = host?.querySelector('button')
+                    || document.querySelector('button[aria-label="Done"], button[aria-label="Xong"]');
+                if (!btn) return null;
+                btn.click();
+                return 'dom';
+            }).catch(() => null);
+        }
+
+        if (!method) {
+            const point = await doneBtn.evaluate(btn => {
+                const rect = btn.getBoundingClientRect();
+                if (!rect.width || !rect.height) return null;
+                return {
+                    x: Math.round(rect.left + rect.width / 2),
+                    y: Math.round(rect.top + rect.height / 2),
+                };
+            }).catch(() => null);
+            if (point) {
+                await page.mouse.click(point.x, point.y);
+                method = 'mouse';
+            }
+        }
+
+        if (method) log(`Clicked Done button (${method}, attempt ${attempt})`);
+
+        const pickerClosed = await page.locator('input#search-input.search-input')
+            .first()
+            .isVisible({ timeout: 2500 })
+            .then(visible => !visible)
+            .catch(() => true);
+        if (pickerClosed) return;
+
+        await page.waitForTimeout(500);
+    }
+
+    throw new Error('Clicked Done but product picker did not close.');
+}
+
+async function clickTagButtonPrecisely(page, tagBtn, label = 'Tag button') {
+    await tagBtn.waitFor({ state: 'visible', timeout: 10000 });
+    await tagBtn.scrollIntoViewIfNeeded().catch(() => { });
+
+    for (let attempt = 1; attempt <= 3; attempt++) {
+        if (await closeProductDetailsDialog(page)) {
+            log(`${label}: closed Details dialog before retry`);
+            await page.waitForTimeout(300);
+        }
+
+        const domTarget = await tagBtn.evaluate(el => {
+            const roots = [el.shadowRoot, el].filter(Boolean);
+            const selectors = [
+                'button[aria-label="Tag"]',
+                'button[title="Tag"]',
+                'button',
+                '[role="button"]',
+                '#button',
+                'tp-yt-paper-icon-button',
+                'paper-icon-button',
+            ];
+
+            for (const root of roots) {
+                for (const selector of selectors) {
+                    const target = root.querySelector(selector);
+                    if (!target) continue;
+                    const rect = target.getBoundingClientRect();
+                    if (rect.width <= 0 || rect.height <= 0) continue;
+                    target.click();
+                    return selector;
+                }
+            }
+
+            el.click();
+            return 'host';
+        }).catch(e => {
+            log(`${label}: DOM click failed on attempt ${attempt}: ${e.message}`);
+            return null;
+        });
+
+        if (domTarget) log(`${label}: DOM clicked ${domTarget} (attempt ${attempt})`);
+        let outcome = await waitForTagClickOutcome(page, 1800);
+        if (outcome && outcome !== 'details-opened') {
+            log(`${label}: click confirmed by ${outcome}`);
+            return;
+        }
+
+        if (outcome === 'details-opened' || await isProductDetailsOpen(page)) {
+            log(`${label}: click opened Details instead of tagging; closing and retrying`);
+            await closeProductDetailsDialog(page);
+            await page.waitForTimeout(300);
+        }
+
+        const point = await tagBtn.evaluate(el => {
+            const candidates = [];
+            const roots = [el.shadowRoot, el].filter(Boolean);
+            const selectors = [
+                'button[aria-label="Tag"]',
+                'button[title="Tag"]',
+                'button',
+                '[role="button"]',
+                '#button',
+                'tp-yt-paper-icon-button',
+                'paper-icon-button',
+                'yt-icon',
+                'iron-icon',
+                'svg',
+            ];
+
+            for (const root of roots) {
+                for (const selector of selectors) {
+                    for (const target of root.querySelectorAll(selector)) {
+                        const rect = target.getBoundingClientRect();
+                        if (rect.width > 0 && rect.height > 0) candidates.push(rect);
+                    }
+                }
+            }
+
+            const hostRect = el.getBoundingClientRect();
+            if (hostRect.width > 0 && hostRect.height > 0) candidates.push(hostRect);
+            candidates.sort((a, b) => (a.width * a.height) - (b.width * b.height));
+            const rect = candidates[0];
+            if (!rect) return null;
+
+            return {
+                x: Math.round(rect.left + rect.width / 2),
+                y: Math.round(rect.top + rect.height / 2),
+            };
+        }).catch(() => null);
+
+        if (point) {
+            await page.mouse.click(point.x, point.y);
+            log(`${label}: mouse clicked at ${point.x},${point.y} (attempt ${attempt})`);
+        }
+
+        outcome = await waitForTagClickOutcome(page, 2200);
+        if (outcome && outcome !== 'details-opened') {
+            log(`${label}: click confirmed by ${outcome}`);
+            return;
+        }
+
+        if (outcome === 'details-opened' || await isProductDetailsOpen(page)) {
+            log(`${label}: mouse click opened Details; closing and retrying`);
+            await closeProductDetailsDialog(page);
+            await page.waitForTimeout(300);
+        }
+    }
+
+    throw new Error('Đã tìm thấy nút Tag nhưng bấm không thành công.');
+}
+
+async function waitForSaveToFinish(page, saveBtn) {
+    await page.waitForFunction(() => {
+        const btn = document.querySelector('ytcp-button#save button');
+        const host = document.querySelector('ytcp-button#save');
+        if (!btn) return false;
+        return btn.disabled
+            || btn.getAttribute('aria-disabled') === 'true'
+            || host?.getAttribute('aria-disabled') === 'true'
+            || host?.hasAttribute('disabled');
+    }, null, { timeout: 15000 }).catch(() => { });
+
+    await saveBtn.waitFor({ state: 'attached', timeout: 3000 }).catch(() => { });
+}
+
 async function addProduct(page, productUrl, _retryCount = 0) {
     // Setup dialog handler to auto-dismiss YouTube Studio alerts (e.g. "Sorry, we were not able to save your video")
     let dialogDismissed = false;
@@ -401,6 +995,14 @@ async function addProduct(page, productUrl, _retryCount = 0) {
         dialog.dismiss().catch(() => { });
     };
     page.on('dialog', dialogHandler);
+
+    let cachedProductInfo = null;
+    const getExpectedProductInfo = async () => {
+        if (cachedProductInfo !== null) return cachedProductInfo;
+        cachedProductInfo = await getProductInfo(productUrl).catch(() => null);
+        return cachedProductInfo;
+    };
+    const normalizeProductTitle = (s) => (s || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
 
     const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content)').filter({
         hasText: /(Sản phẩm|Products|tagged product|sản phẩm đã gắn)/i
@@ -447,6 +1049,26 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     const searchInput = page.locator('input#search-input.search-input');
     await searchInput.waitFor({ state: 'visible', timeout: 10000 });
 
+    let matchingProductAlreadySelected = false;
+    try {
+        const selectedProductTexts = await page.evaluate(() => {
+            const products = document.querySelectorAll('ytshopping-product-picker-selected-product ytshopping-product');
+            return Array.from(products).map(p => (p.textContent || '').replace(/\s+/g, ' ').trim()).filter(Boolean);
+        });
+        if (selectedProductTexts.length > 0) {
+            const existingInfo = await getExpectedProductInfo();
+            const expectedTitle = normalizeProductTitle(existingInfo?.title || '');
+            matchingProductAlreadySelected = !!expectedTitle && selectedProductTexts.some(text => {
+                const selectedTitle = normalizeProductTitle(text);
+                return selectedTitle.includes(expectedTitle) || expectedTitle.includes(selectedTitle);
+            });
+            log(`Found ${selectedProductTexts.length} existing selected product(s); match target: ${matchingProductAlreadySelected ? 'yes' : 'no'}`);
+        }
+    } catch (e) {
+        log(`Warning: could not inspect selected products: ${shortErrorMessage(e)}`);
+    }
+
+    if (!matchingProductAlreadySelected) {
     await searchInput.click();
     await searchInput.fill(productUrl);
     log(`Filled product URL: ${productUrl}`);
@@ -478,13 +1100,21 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     }
 
     // Wait for search results
-    const tagBtn = page.locator('ytcp-icon-button.tag-product-button').first();
+    const searchResultProduct = page.locator('ytshopping-product').filter({
+        has: page.locator('ytcp-icon-button.tag-product-button')
+    }).first();
+    let tagBtn = searchResultProduct.locator('ytcp-icon-button.tag-product-button').first();
     try {
         await tagBtn.waitFor({ state: 'visible', timeout: 8000 });
     } catch {
-        log('Product not found within 8s, reloading page...');
-        await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
-        throw new Error('Sản phẩm này không gắn giỏ được.');
+        tagBtn = page.locator('ytcp-icon-button.tag-product-button').first();
+        try {
+            await tagBtn.waitFor({ state: 'visible', timeout: 7000 });
+        } catch {
+            log('Product not found within 15s, reloading page...');
+            await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
+            throw new Error('Sản phẩm này không gắn giỏ được.');
+        }
     }
 
     // Check banner error
@@ -500,7 +1130,10 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     }
 
     // ---- Check if product has multiple options (variants) ----
-    const optionsLabel = page.locator('ytshopping-product yt-formatted-string').filter({
+    const productScope = await searchResultProduct.isVisible({ timeout: 500 }).catch(() => false)
+        ? searchResultProduct
+        : page;
+    const optionsLabel = productScope.locator('yt-formatted-string').filter({
         hasText: /\d+\+?\s*options?/i
     }).first();
     const hasOptions = await optionsLabel.isVisible({ timeout: 1000 }).catch(() => false);
@@ -513,18 +1146,18 @@ async function addProduct(page, productUrl, _retryCount = 0) {
         let productInfo = null;
         let shopeeTitle = null;
         let shopeePrice = null;
-        productInfo = await getProductInfo(productUrl);
+        productInfo = await getExpectedProductInfo();
         shopeeTitle = productInfo?.title || null;
         shopeePrice = productInfo?.price || null;
         log(`Product title: "${shopeeTitle}", price: ${shopeePrice}`);
         if (!shopeeTitle) {
             // Fallback: no title found, use normal tag flow
             log('Could not fetch product title, falling back to normal tag flow');
-            await tagBtn.click();
+            await clickTagButtonPrecisely(page, tagBtn, 'Fallback tag button');
             log('Clicked Tag button (fallback)');
         } else {
             // Step 2: Click on product title card to open product details
-            const productTitleCard = page.locator('div.product-title.style-scope.ytshopping-product[role="button"]').first();
+            const productTitleCard = productScope.locator('div.product-title.style-scope.ytshopping-product[role="button"]').first();
             await productTitleCard.waitFor({ state: 'visible', timeout: 5000 });
             await productTitleCard.click();
             log('Clicked product title card');
@@ -549,7 +1182,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
                     await closeBtn.click();
                     await page.waitForTimeout(500);
                 }
-                await page.evaluate(() => document.querySelector("button[aria-label='Tag']")?.click());
+                await clickTagButtonPrecisely(page, tagBtn, 'Fallback tag button');
                 log('Clicked Tag button (fallback, no offer group)');
             } else {
                 await offerGroupLabel.click();
@@ -647,20 +1280,26 @@ async function addProduct(page, productUrl, _retryCount = 0) {
         }
     } else {
         // No options — normal flow: click tag directly
-        await tagBtn.click();
+        await clickTagButtonPrecisely(page, tagBtn);
         log('Clicked Tag button');
     }
 
     // Next → Done (same for both flows — variant dialog auto-closes after tagging)
-    const nextBtn = page.locator('ytcp-button#picker-next-button button').first();
-    await nextBtn.waitFor({ state: 'visible', timeout: 10000 });
-    await nextBtn.click();
-    log('Clicked Next button');
+    } else {
+        const selectedCount = await getPickerSelectedProductCount(page);
+        if (selectedCount > 0) {
+            log('Matching target product already selected in picker; completing Next/Done without re-tagging.');
+        } else {
+            log('Matching target product already selected in Studio; skipping remove/search/tag to avoid resetting YouTube publish.');
+            await page.keyboard.press('Escape').catch(() => { });
+            await page.waitForTimeout(500);
+            page.removeListener('dialog', dialogHandler);
+            return;
+        }
+    }
 
-    const doneBtn = page.locator('ytcp-button#picker-done-button button, button[aria-label="Done"], button[aria-label="Xong"]').first();
-    await doneBtn.waitFor({ state: 'visible', timeout: 10000 });
-    await doneBtn.click();
-    log('Clicked Done button');
+    await clickPickerNextButton(page);
+    await clickPickerDoneButton(page);
 
     const saveBtn = page.locator('ytcp-button#save button').first();
     await saveBtn.waitFor({ state: 'attached', timeout: 10000 });
@@ -679,7 +1318,8 @@ async function addProduct(page, productUrl, _retryCount = 0) {
         log('Clicked Save button');
 
         // Wait for save to complete, checking for dialog errors
-        await page.waitForTimeout(3000);
+        await waitForSaveToFinish(page, saveBtn);
+        await page.waitForTimeout(5000);
 
         if (dialogDismissed) {
             log('Save failed (dialog error detected). Reloading page...');
@@ -717,23 +1357,491 @@ async function addProduct(page, productUrl, _retryCount = 0) {
         }
 
         page.removeListener('dialog', dialogHandler);
-        log('Save clicked, proceeding to fetch after 3s');
+        log('Save clicked, proceeding to fetch after save wait');
     }
 }
 
-const decodeUnicode = (str) => str.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(parseInt(hex, 16)));
+const decodeUnicode = (str = '') => String(str).replace(/\\u([0-9a-fA-F]{4})/g, (_, hex) => String.fromCharCode(Number(`0x${hex}`)));
 
-async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
+function safeDecodeURIComponent(value) {
+    try { return decodeURIComponent(value); } catch { return value; }
+}
+
+function normalizeAffiliateUrl(rawUrl) {
+    if (!rawUrl) return '';
+
+    let url = decodeUnicode(rawUrl)
+        .replace(/\\\//g, '/')
+        .replace(/&amp;/g, '&')
+        .trim();
+
+    if (/^https?%3a%2f%2f/i.test(url)) {
+        url = safeDecodeURIComponent(url);
+    }
+
+    if (url.startsWith('/redirect?')) {
+        url = `https://www.youtube.com${url}`;
+    }
+
+    if (/^https:\/\/www\.youtube\.com\/redirect\?/i.test(url)) {
+        try {
+            const redirect = new URL(url);
+            const target = redirect.searchParams.get('q') || redirect.searchParams.get('url');
+            if (target) return normalizeAffiliateUrl(target);
+        } catch { }
+    }
+
+    return url;
+}
+
+function extractAffiliateUrlCandidates(pageContent) {
+    const candidates = [];
+    const seen = new Set();
+    const shoppingDomainPattern = /(shopee\.vn|shp\.ee|lazada\.vn|lzd\.co)/i;
+
+    const addCandidate = (rawUrl, index) => {
+        const url = normalizeAffiliateUrl(rawUrl);
+        if (!url || !shoppingDomainPattern.test(url)) return;
+        if (seen.has(url)) return;
+        seen.add(url);
+        candidates.push({ url, index });
+    };
+
+    const patterns = [
+        /"url"\s*:\s*"([^"]+)"/g,
+        /"(https?:\\?\/\\?\/[^"]+)"/g,
+        /"(\/redirect\?[^"]+)"/g,
+        /https%3A%2F%2F[^"'\\<>\s]+/gi,
+    ];
+
+    for (const pattern of patterns) {
+        let match;
+        while ((match = pattern.exec(pageContent)) !== null) {
+            addCandidate(match[1] || match[0], match.index);
+        }
+    }
+
+    return candidates.sort((a, b) => a.index - b.index);
+}
+
+function withYouTubeLocale(url) {
+    try {
+        const parsed = new URL(url);
+        if (!parsed.searchParams.has('hl')) parsed.searchParams.set('hl', 'vi');
+        if (!parsed.searchParams.has('gl')) parsed.searchParams.set('gl', 'VN');
+        return parsed.toString();
+    } catch {
+        return url;
+    }
+}
+
+function getPublicPageSignals(pageContent) {
+    return {
+        hasProductShelf: pageContent.includes('productListItemRenderer'),
+        hasShoppingText: /(shopee|shp\.ee|lazada|lzd\.co)/i.test(pageContent),
+    };
+}
+
+function extractYouTubeConfig(pageContent) {
+    return {
+        apiKey: decodeUnicode(pageContent.match(/"INNERTUBE_API_KEY"\s*:\s*"([^"]+)"/)?.[1] || ''),
+        clientVersion: decodeUnicode(pageContent.match(/"INNERTUBE_CLIENT_VERSION"\s*:\s*"([^"]+)"/)?.[1] || ''),
+        visitorData: decodeUnicode(
+            pageContent.match(/"VISITOR_DATA"\s*:\s*"([^"]+)"/)?.[1]
+            || pageContent.match(/"visitorData"\s*:\s*"([^"]+)"/)?.[1]
+            || ''
+        ),
+    };
+}
+
+function buildYouTubeNextVariants(config, videoId) {
+    const versions = [
+        config.clientVersion,
+        '2.20260612.01.00-canary_experiment_2.20260611.01.00',
+        '2.20260612.01.00',
+        '2.20260610.01.00',
+    ].filter(Boolean);
+    const uniqueVersions = [...new Set(versions)];
+    const variants = [];
+
+    for (const clientVersion of uniqueVersions) {
+        variants.push({
+            label: `${clientVersion}${config.visitorData ? ' + visitor' : ''}`,
+            clientVersion,
+            visitorData: config.visitorData || '',
+        });
+        variants.push({
+            label: `${clientVersion} clean`,
+            clientVersion,
+            visitorData: '',
+        });
+    }
+
+    return variants.slice(0, 6).map(variant => ({
+        ...variant,
+        body: {
+            context: {
+                client: {
+                    hl: 'vi',
+                    gl: 'VN',
+                    clientName: 'WEB',
+                    clientVersion: variant.clientVersion,
+                    ...(variant.visitorData ? { visitorData: variant.visitorData } : {}),
+                },
+            },
+            videoId,
+            racyCheckOk: true,
+            contentCheckOk: true,
+        },
+    }));
+}
+
+async function fetchYouTubeNextData(videoId, publicUrl, seedPageContent = '') {
+    let config = extractYouTubeConfig(seedPageContent);
+    let configHtml = seedPageContent;
+    const localeUrl = withYouTubeLocale(publicUrl);
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cookie': 'PREF=hl=vi&gl=VN; SOCS=CAI',
+    };
+
+    if (!config.apiKey) {
+        const configStart = Date.now();
+        const response = await fetch(localeUrl, { headers: { ...headers, 'Accept': 'text/html' } });
+        configHtml = await response.text();
+        config = extractYouTubeConfig(configHtml);
+        log(`Fetched YouTube config in ${Date.now() - configStart}ms (${(configHtml.length / 1024).toFixed(0)}KB, apiKey=${config.apiKey ? 'yes' : 'no'})`);
+    }
+
+    if (!config.apiKey) return null;
+
+    let bestContent = configHtml;
+    let bestScore = 0;
+    for (const variant of buildYouTubeNextVariants(config, videoId)) {
+        const started = Date.now();
+        const response = await fetch(`https://www.youtube.com/youtubei/v1/next?key=${encodeURIComponent(config.apiKey)}`, {
+            method: 'POST',
+            headers: {
+                ...headers,
+                'Accept': '*/*',
+                'Content-Type': 'application/json',
+                'Origin': 'https://www.youtube.com',
+                'Referer': localeUrl,
+                'X-YouTube-Client-Name': '1',
+                'X-YouTube-Client-Version': variant.clientVersion,
+            },
+            body: JSON.stringify(variant.body),
+        });
+        const content = await response.text();
+        const candidates = extractAffiliateUrlCandidates(content);
+        const signals = getPublicPageSignals(content);
+        const score = candidates.length * 10 + (signals.hasProductShelf ? 2 : 0) + (signals.hasShoppingText ? 1 : 0);
+        log(`Fetched youtubei next (${variant.label}) in ${Date.now() - started}ms (${(content.length / 1024).toFixed(0)}KB, status=${response.status}, candidates=${candidates.length}, shelf=${signals.hasProductShelf ? 'yes' : 'no'}, shopping=${signals.hasShoppingText ? 'yes' : 'no'})`);
+        if (score > bestScore) {
+            bestScore = score;
+            bestContent = content;
+        }
+        if (candidates.length > 0) return content;
+    }
+
+    return bestContent;
+}
+
+async function fetchPublicDataWithBrowserRequest(browser, videoId, publicUrl) {
+    const context = browser?.contexts?.()[0];
+    const request = context?.request;
+    if (!request) return null;
+
+    const localeUrl = withYouTubeLocale(publicUrl);
+    const headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+        'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+        'Cache-Control': 'no-cache, no-store, must-revalidate',
+        'Pragma': 'no-cache',
+    };
+
+    const started = Date.now();
+    const watchResponse = await request.get(localeUrl, { headers: { ...headers, 'Accept': 'text/html' }, timeout: 30000 });
+    const watchContent = await watchResponse.text();
+    let bestContent = watchContent;
+    let bestCandidates = extractAffiliateUrlCandidates(watchContent);
+    let bestSignals = getPublicPageSignals(watchContent);
+    log(`Browser request watch in ${Date.now() - started}ms (${(watchContent.length / 1024).toFixed(0)}KB, status=${watchResponse.status()}, candidates=${bestCandidates.length}, shelf=${bestSignals.hasProductShelf ? 'yes' : 'no'}, shopping=${bestSignals.hasShoppingText ? 'yes' : 'no'})`);
+    if (bestCandidates.length > 0) return bestContent;
+
+    const config = extractYouTubeConfig(watchContent);
+    if (!config.apiKey) return bestContent;
+
+    for (const variant of buildYouTubeNextVariants(config, videoId)) {
+        const nextStart = Date.now();
+        const response = await request.post(`https://www.youtube.com/youtubei/v1/next?key=${encodeURIComponent(config.apiKey)}`, {
+            headers: {
+                ...headers,
+                'Accept': '*/*',
+                'Content-Type': 'application/json',
+                'Origin': 'https://www.youtube.com',
+                'Referer': localeUrl,
+                'X-YouTube-Client-Name': '1',
+                'X-YouTube-Client-Version': variant.clientVersion,
+            },
+            data: variant.body,
+            timeout: 30000,
+        });
+        const content = await response.text();
+        const candidates = extractAffiliateUrlCandidates(content);
+        const signals = getPublicPageSignals(content);
+        log(`Browser request youtubei (${variant.label}) in ${Date.now() - nextStart}ms (${(content.length / 1024).toFixed(0)}KB, status=${response.status()}, candidates=${candidates.length}, shelf=${signals.hasProductShelf ? 'yes' : 'no'}, shopping=${signals.hasShoppingText ? 'yes' : 'no'})`);
+        if (candidates.length > bestCandidates.length || signals.hasProductShelf || signals.hasShoppingText) {
+            bestContent = content;
+            bestCandidates = candidates;
+            bestSignals = signals;
+        }
+        if (candidates.length > 0) return content;
+    }
+
+    return bestContent;
+}
+
+async function resolveProductOriginUrl(productUrl, expectedInfo) {
+    const candidates = [
+        expectedInfo?.resolvedUrl,
+        expectedInfo?.url,
+        productUrl,
+    ].filter(Boolean);
+
+    const direct = candidates.find(url => /shopee\.vn\/(product|opaanlp|[^/?#]+-i\.)/i.test(url));
+    if (direct) return direct;
+
+    try {
+        const response = await fetch(productUrl, {
+            redirect: 'follow',
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+                'Accept': 'text/html',
+            },
+        });
+        return response.url || productUrl;
+    } catch {
+        return candidates[0] || productUrl;
+    }
+}
+
+async function buildFallbackAffiliateUrl(expectedProductUrl, expectedInfo, videoId) {
+    const lower = (expectedProductUrl || '').toLowerCase();
+    if (!lower.includes('shopee') && !lower.includes('shp.ee')) return null;
+
+    const originUrl = await resolveProductOriginUrl(expectedProductUrl, expectedInfo);
+    if (!originUrl) return null;
+
+    const subId = `YT3-fallback-${videoId}`.replace(/[^A-Za-z0-9_-]/g, '');
+    const affiliateUrl = `https://s.shopee.vn/an_redir?affiliate_id=17104820001&sub_id=${encodeURIComponent(subId)}&origin_link=${encodeURIComponent(originUrl)}`;
+    return affiliateUrl;
+}
+
+function isLazadaUrl(url) {
+    if (!url) return false;
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.toLowerCase();
+        return host === 'lazada.vn' || host.endsWith('.lazada.vn') || host === 'lzd.co' || host.endsWith('.lzd.co');
+    } catch {
+        return /lazada\.vn|lzd\.co/i.test(String(url));
+    }
+}
+
+function cleanLazadaProductUrl(url) {
+    try {
+        const parsed = new URL(url);
+        if (!isLazadaUrl(parsed.href)) return null;
+        return `${parsed.origin}${parsed.pathname}`;
+    } catch {
+        return null;
+    }
+}
+
+function buildDirectLazadaAffiliateUrl(expectedProductUrl, expectedInfo, videoId) {
+    const candidates = [
+        expectedProductUrl,
+        expectedInfo?.resolvedUrl,
+        expectedInfo?.url,
+    ].filter(Boolean);
+
+    const productUrl = candidates.map(cleanLazadaProductUrl).find(Boolean);
+    if (!productUrl) return null;
+
+    const subId = `YT3-fallback-${videoId}`.replace(/[^A-Za-z0-9_-]/g, '');
+    const parsed = new URL(productUrl);
+    parsed.searchParams.set('from_gmc', '1');
+    parsed.searchParams.set('fl_tag', '1');
+    parsed.searchParams.set('sub_aff_id', subId);
+    parsed.searchParams.set('exlaz', LAZADA_YOUTUBE_EXLAZ);
+    return parsed.toString();
+}
+
+function isLikelyLazadaAffiliateUrl(url) {
+    if (!url) return false;
+
+    try {
+        const parsed = new URL(url);
+        const host = parsed.hostname.toLowerCase();
+        const query = parsed.search.toLowerCase();
+        const full = url.toLowerCase();
+
+        if (host === 'c.lazada.vn' || host.endsWith('.c.lazada.vn') || host === 'lzd.co' || host.endsWith('.lzd.co')) return true;
+        if (/(laz_trackid|mkttid|exlaz|sub_aff_id|sub_id|aff_id|trafficfrom|lzd_click_id)/i.test(query)) return true;
+        if (/\/\/s\.lazada\.vn\/l\./i.test(full)) return true;
+    } catch {
+        return /(c\.lazada\.vn|lzd\.co|laz_trackid|mkttid|exlaz|sub_aff_id|aff_id)/i.test(String(url));
+    }
+
+    return false;
+}
+
+async function getBrowserShoppingState(page) {
+    return await page.evaluate(() => {
+        const shoppingPattern = /(shopee\.vn|shp\.ee|lazada\.vn|lzd\.co)/i;
+        const html = document.documentElement?.innerHTML || '';
+        const text = document.body?.innerText || '';
+        const urls = [];
+        for (const el of document.querySelectorAll('a[href], area[href]')) {
+            const href = el.href || el.getAttribute('href') || '';
+            if (shoppingPattern.test(href)) urls.push(href);
+        }
+        for (const el of document.querySelectorAll('[data-url], [data-href], [data-command]')) {
+            for (const name of ['data-url', 'data-href', 'data-command']) {
+                const value = el.getAttribute(name) || '';
+                if (shoppingPattern.test(value)) urls.push(value);
+            }
+        }
+        return {
+            title: document.title,
+            url: location.href,
+            htmlLength: html.length,
+            hasProductShelf: html.includes('productListItemRenderer'),
+            hasShoppingText: shoppingPattern.test(html),
+            textHasProduct: /\d+\s+product|view products|products|sản phẩm|xem sản phẩm/i.test(text),
+            textSnippet: text.slice(0, 800),
+            urls: [...new Set(urls)].slice(0, 20),
+        };
+    });
+}
+
+async function clickPublicProductsButton(page) {
+    try {
+        return await page.evaluate(() => {
+            const labelPattern = /view products|xem sản phẩm|\d+\s+product|products/i;
+            const elements = [...document.querySelectorAll('button, a, ytd-button-renderer, yt-button-shape, tp-yt-paper-button')];
+            const target = elements.find(el => {
+                const text = `${el.innerText || ''} ${el.textContent || ''} ${el.getAttribute('aria-label') || ''}`.trim();
+                if (!labelPattern.test(text)) return false;
+                const rect = el.getBoundingClientRect();
+                return rect.width > 0 && rect.height > 0;
+            });
+            if (!target) return false;
+            const clickable = target.closest('button, a, ytd-button-renderer, yt-button-shape, tp-yt-paper-button') || target;
+            clickable.click();
+            return true;
+        });
+    } catch {
+        return false;
+    }
+}
+
+async function readPublicPageContent(page, label, publicUrl) {
+    const started = Date.now();
+    const url = withYouTubeLocale(publicUrl);
+    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30000 });
+    await page.waitForFunction(() => {
+        const html = document.documentElement?.innerHTML || '';
+        const text = document.body?.innerText || '';
+        return html.includes('productListItemRenderer')
+            || /(shopee|shp\.ee|lazada)/i.test(html)
+            || /\d+\s+product|view products|xem sản phẩm|sản phẩm/i.test(text);
+    }, null, { timeout: 12000 }).catch(() => { });
+    await page.waitForTimeout(1000);
+
+    let content = await page.content();
+    let candidates = extractAffiliateUrlCandidates(content);
+    let state = await getBrowserShoppingState(page).catch(() => null);
+    log(`Browser fallback ${label}: candidates=${candidates.length}, shelf=${state?.hasProductShelf ? 'yes' : 'no'}, shopping=${state?.hasShoppingText ? 'yes' : 'no'}, textProduct=${state?.textHasProduct ? 'yes' : 'no'}`);
+
+    if (candidates.length === 0 && state?.textHasProduct) {
+        const clicked = await clickPublicProductsButton(page);
+        if (clicked) {
+            await page.waitForTimeout(3000);
+            content = await page.content();
+            state = await getBrowserShoppingState(page).catch(() => state);
+            const domUrls = state?.urls?.length
+                ? `\n${state.urls.map(u => `"url":"${u.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join('\n')}`
+                : '';
+            content += domUrls;
+            candidates = extractAffiliateUrlCandidates(content);
+            log(`Browser fallback ${label} after product click: candidates=${candidates.length}, shelf=${state?.hasProductShelf ? 'yes' : 'no'}, shopping=${state?.hasShoppingText ? 'yes' : 'no'}`);
+        }
+    } else if (state?.urls?.length) {
+        content += `\n${state.urls.map(u => `"url":"${u.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join('\n')}`;
+        candidates = extractAffiliateUrlCandidates(content);
+    }
+
+    log(`Browser fallback ${label} fetched public page in ${Date.now() - started}ms (${(content.length / 1024).toFixed(0)}KB)`);
+    return { content, candidates };
+}
+
+async function fetchPublicVideoHtmlFromBrowser(browser, publicUrl) {
+    const context = browser?.contexts?.()[0];
+    if (!context) return null;
+
+    let publicPage = null;
+    let privateContext = null;
+    try {
+        publicPage = await context.newPage();
+        const defaultResult = await readPublicPageContent(publicPage, 'default context', publicUrl);
+        if (defaultResult.candidates.length > 0) return defaultResult.content;
+
+        if (browser.newContext) {
+            privateContext = await browser.newContext({
+                locale: 'vi-VN',
+                extraHTTPHeaders: { 'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' },
+            });
+            const privatePage = await privateContext.newPage();
+            const privateResult = await readPublicPageContent(privatePage, 'anonymous context', publicUrl);
+            if (privateResult.candidates.length > 0) return privateResult.content;
+            return privateResult.content || defaultResult.content;
+        }
+
+        return defaultResult.content;
+    } catch (e) {
+        log(`Browser fallback failed: ${shortErrorMessage(e)}`);
+        return null;
+    } finally {
+        if (publicPage) await publicPage.close().catch(() => { });
+        if (privateContext) await privateContext.close().catch(() => { });
+    }
+}
+
+async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, providedAffiliateFallbackUrl = null) {
     const videoIdMatch = videoUrl.match(/\/video\/([^/]+)\//);
     if (!videoIdMatch) throw new Error('Could not extract video ID from URL');
     const videoId = videoIdMatch[1];
     const publicUrl = `https://www.youtube.com/watch?v=${videoId}`;
     log(`Fetching public video: ${publicUrl}`);
 
-    // Determine expected domain from product URL for verification
-    const expectedDomain = expectedProductUrl
-        ? (expectedProductUrl.includes('shopee') ? 'shopee' : expectedProductUrl.includes('lazada') ? 'lazada' : null)
+    // Determine expected domains from product URL for verification.
+    // YouTube may expose Shopee affiliate links as shp.ee short links.
+    const expectedProductUrlLower = (expectedProductUrl || '').toLowerCase();
+    const expectedDomainAliases = expectedProductUrlLower
+        ? expectedProductUrlLower.includes('shopee') || expectedProductUrlLower.includes('shp.ee')
+            ? ['shopee', 'shp.ee']
+            : expectedProductUrlLower.includes('lazada') || expectedProductUrlLower.includes('lzd.co')
+                ? ['lazada', 'lzd.co']
+                : null
         : null;
+    const matchesExpectedDomain = (url) => {
+        if (!expectedDomainAliases) return true;
+        const lower = (url || '').toLowerCase();
+        return expectedDomainAliases.some(alias => lower.includes(alias));
+    };
 
     // Fetch expected product info (title + price) for matching
     let expectedInfo = null;
@@ -741,6 +1849,52 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
         expectedInfo = await getProductInfo(expectedProductUrl);
         if (expectedInfo) {
             log(`Expected product: "${expectedInfo.title}", price: ${expectedInfo.price || 'N/A'}`);
+        }
+    }
+
+    if (USE_DIRECT_SHOPEE_AFFILIATE && expectedDomainAliases?.some(alias => alias.includes('shopee') || alias.includes('shp.ee'))) {
+        const directAffiliateUrl = await buildFallbackAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
+        if (directAffiliateUrl) {
+            const directMetadata = {
+                title: expectedInfo?.title || '',
+                price: expectedInfo?.price || '',
+                image: expectedInfo?.image || '',
+                fallback: true,
+                source: 'direct-shopee',
+            };
+            log(`Using direct Shopee affiliate URL; skipping YouTube public shelf polling: ${directAffiliateUrl.slice(0, 180)}...`);
+            return { affiliateUrl: directAffiliateUrl, metadata: directMetadata };
+        }
+    }
+
+    if (
+        USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK
+        && expectedDomainAliases?.some(alias => alias.includes('lazada') || alias.includes('lzd.co'))
+        && isLikelyLazadaAffiliateUrl(providedAffiliateFallbackUrl)
+    ) {
+        const fallbackMetadata = {
+            title: expectedInfo?.title || '',
+            price: expectedInfo?.price || '',
+            image: expectedInfo?.image || '',
+            fallback: true,
+            source: 'provided-lazada-affiliate',
+        };
+        log(`Using provided Lazada affiliate URL; skipping YouTube public shelf polling: ${String(providedAffiliateFallbackUrl).slice(0, 180)}...`);
+        return { affiliateUrl: providedAffiliateFallbackUrl, metadata: fallbackMetadata };
+    }
+
+    if (USE_DIRECT_LAZADA_AFFILIATE && expectedDomainAliases?.some(alias => alias.includes('lazada') || alias.includes('lzd.co'))) {
+        const directLazadaUrl = buildDirectLazadaAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
+        if (directLazadaUrl) {
+            const directMetadata = {
+                title: expectedInfo?.title || '',
+                price: expectedInfo?.price || '',
+                image: expectedInfo?.image || '',
+                fallback: true,
+                source: 'direct-lazada',
+            };
+            log(`Using direct Lazada affiliate URL; skipping YouTube public shelf polling: ${directLazadaUrl.slice(0, 180)}...`);
+            return { affiliateUrl: directLazadaUrl, metadata: directMetadata };
         }
     }
 
@@ -753,65 +1907,137 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
     let affiliateUrl = null;
     let metadata = { title: '', price: '', image: '' };
 
-    for (let attempt = 1; attempt <= 5; attempt++) {
+    const maxAttempts = 18;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         if (attempt > 1) {
-            const delay = attempt <= 3 ? 1000 : 2000;
+            const delay = attempt <= 3 ? 1500 : attempt <= 7 ? 3000 : 5000;
             log(`Attempt ${attempt} fetchAffiliateUrl retrying after ${delay}ms...`);
             await new Promise(r => setTimeout(r, delay));
         }
 
-        const fetchStart = Date.now();
-        const bustUrl = `${publicUrl}&_cb=${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-        const response = await fetch(bustUrl, {
-            headers: {
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Accept': 'text/html',
-                'Cache-Control': 'no-cache, no-store, must-revalidate',
-                'Pragma': 'no-cache',
-            }
-        });
-        const pageContent = await response.text();
-        log(`Fetched page in ${Date.now() - fetchStart}ms (${(pageContent.length / 1024).toFixed(0)}KB)`);
+        const baseHeaders = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
+            'Accept-Encoding': 'gzip, deflate, br',
+            'Accept': 'text/html',
+            'Cache-Control': 'no-cache, no-store, must-revalidate',
+            'Pragma': 'no-cache',
+        };
+        const cacheBustUrl = `${publicUrl}&_cb=${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+        const fetchPlans = [
+            {
+                label: 'VN locale',
+                url: withYouTubeLocale(cacheBustUrl),
+                headers: {
+                    ...baseHeaders,
+                    'Accept-Language': 'vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7',
+                    'Cookie': 'PREF=hl=vi&gl=VN; SOCS=CAI',
+                },
+            },
+            { label: 'default', url: cacheBustUrl, headers: baseHeaders },
+        ];
 
-        // Extract all product blocks with their affiliate URLs
-        const allUrlMatches = [...pageContent.matchAll(/"url"\s*:\s*"(https:\/\/[^"]*(shopee\.vn|shp\.ee|lazada\.vn)[^"]*)"/g)];
-        if (allUrlMatches.length === 0) {
-            log(`Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link`);
+        let pageContent = '';
+        let urlCandidates = [];
+        for (const plan of fetchPlans) {
+            const fetchStart = Date.now();
+            const response = await fetch(plan.url, { headers: plan.headers });
+            const candidateContent = await response.text();
+            const candidateUrls = extractAffiliateUrlCandidates(candidateContent);
+            const signals = getPublicPageSignals(candidateContent);
+            log(`Fetched ${plan.label} page in ${Date.now() - fetchStart}ms (${(candidateContent.length / 1024).toFixed(0)}KB, candidates=${candidateUrls.length}, shelf=${signals.hasProductShelf ? 'yes' : 'no'}, shopping=${signals.hasShoppingText ? 'yes' : 'no'})`);
+            if (!pageContent || candidateUrls.length > urlCandidates.length || signals.hasProductShelf || signals.hasShoppingText) {
+                pageContent = candidateContent;
+                urlCandidates = candidateUrls;
+            }
+            if (urlCandidates.length > 0) break;
+        }
+
+        // Extract all product blocks with their affiliate URLs. YouTube may expose
+        // links as direct Shopee/Lazada URLs, YouTube redirects, or escaped strings.
+        if (urlCandidates.length === 0) {
+            const nextContent = await fetchYouTubeNextData(videoId, publicUrl, pageContent).catch(e => {
+                log(`youtubei next failed: ${shortErrorMessage(e)}`);
+                return null;
+            });
+            if (nextContent) {
+                const nextCandidates = extractAffiliateUrlCandidates(nextContent);
+                const nextSignals = getPublicPageSignals(nextContent);
+                if (nextCandidates.length > urlCandidates.length || nextSignals.hasProductShelf || nextSignals.hasShoppingText) {
+                    pageContent = nextContent;
+                    urlCandidates = nextCandidates;
+                }
+            }
+        }
+
+        if (urlCandidates.length === 0 && browser) {
+            const browserRequestContent = await fetchPublicDataWithBrowserRequest(browser, videoId, publicUrl).catch(e => {
+                log(`browser request fallback failed: ${shortErrorMessage(e)}`);
+                return null;
+            });
+            if (browserRequestContent) {
+                const browserRequestCandidates = extractAffiliateUrlCandidates(browserRequestContent);
+                const browserRequestSignals = getPublicPageSignals(browserRequestContent);
+                if (browserRequestCandidates.length > urlCandidates.length || browserRequestSignals.hasProductShelf || browserRequestSignals.hasShoppingText) {
+                    pageContent = browserRequestContent;
+                    urlCandidates = browserRequestCandidates;
+                }
+            }
+        }
+
+        if (urlCandidates.length === 0 && ENABLE_BROWSER_PUBLIC_FALLBACK && browser && attempt >= 3 && (attempt % 3 === 0 || attempt === maxAttempts)) {
+            log(`Attempt ${attempt}: opening browser fallback to read public product shelf`);
+            const browserPageContent = await fetchPublicVideoHtmlFromBrowser(browser, publicUrl);
+            if (browserPageContent) {
+                pageContent = browserPageContent;
+                urlCandidates = extractAffiliateUrlCandidates(pageContent);
+                log(`Attempt ${attempt}: browser fallback found ${urlCandidates.length} shopping URL candidate(s)`);
+            }
+        } else if (urlCandidates.length === 0 && !ENABLE_BROWSER_PUBLIC_FALLBACK && attempt === 3) {
+            log('Browser public fallback disabled; using fetch/youtubei only (no new tab)');
+        }
+
+        if (urlCandidates.length === 0) {
+            const hasProductShelf = pageContent.includes('productListItemRenderer');
+            const hasShoppingText = /(shopee|shp\.ee|lazada|lzd\.co)/i.test(pageContent);
+            log(`Attempt ${attempt} fetchAffiliateUrl failed to find affiliate link (product shelf: ${hasProductShelf ? 'yes' : 'no'}, shopping text: ${hasShoppingText ? 'yes' : 'no'})`);
             continue;
         }
 
-        // Domain check on first match
-        const firstUrl = decodeUnicode(allUrlMatches[0][1]);
-        if (expectedDomain && !firstUrl.toLowerCase().includes(expectedDomain)) {
-            log(`Attempt ${attempt}: domain mismatch! Expected ${expectedDomain} but got: ${firstUrl}. Retrying...`);
+        const decodedUrls = urlCandidates.map(c => c.url);
+        const firstExpectedUrl = decodedUrls.find(matchesExpectedDomain);
+        const firstUrl = firstExpectedUrl || decodedUrls[0];
+        log(`Attempt ${attempt}: found ${urlCandidates.length} shopping URL candidate(s)`);
+
+        if (expectedDomainAliases && !firstExpectedUrl) {
+            log(`Attempt ${attempt}: domain mismatch! Expected ${expectedDomainAliases.join('/')} but got: ${decodedUrls[0]}. Retrying...`);
             continue;
         }
 
         // Parse all product blocks from page
         const products = [];
-        const blockPattern = /productListItemRenderer":\{"title"/g;
-        let blockMatch;
-        let blockIdx = 0;
-        while ((blockMatch = blockPattern.exec(pageContent)) !== null) {
-            const block = pageContent.substring(blockMatch.index, blockMatch.index + 5000);
-            const titleM = block.match(/simpleText":"([^"]+)"/);
-            const priceM = block.match(/([0-9][0-9.,]+)\s*₫/) || block.match(/₫\s*([0-9][0-9,.]+)/);
+        const blockStarts = [...pageContent.matchAll(/productListItemRenderer":\{"title"/g)].map(m => m.index);
+        for (let blockIdx = 0; blockIdx < blockStarts.length; blockIdx++) {
+            const blockStart = blockStarts[blockIdx];
+            const blockEnd = Math.min(pageContent.length, blockStarts[blockIdx + 1] || blockStart + 15000);
+            const block = pageContent.substring(blockStart, blockEnd);
+            const titleM = block.match(/"title"\s*:\s*\{"simpleText":"([^"]+)"/) || block.match(/simpleText":"([^"]+)"/);
+            const priceM = block.match(/"price"\s*:\s*"([^"]+)"/);
             const thumbUrls = [...block.matchAll(/(https?:\/\/encrypted-tbn\d+\.gstatic\.com\/shopping\?q=tbn:[A-Za-z0-9_-]+)/g)]
                 .map(m => decodeUnicode(m[1]));
-            const urlM = allUrlMatches[blockIdx] ? decodeUnicode(allUrlMatches[blockIdx][1]) : null;
+            const blockUrl = urlCandidates.find(c => c.index >= blockStart && c.index < blockEnd)?.url
+                || urlCandidates[blockIdx]?.url
+                || null;
 
             products.push({
                 title: titleM ? decodeUnicode(titleM[1]) : '',
-                price: priceM ? decodeUnicode(priceM[1]) : '',
+                price: priceM ? decodeUnicode(priceM[1]).replace(/\u00a0/g, ' ').trim() : '',
                 image: thumbUrls.length > 0 ? thumbUrls[0] : '',
-                url: urlM,
+                url: blockUrl,
             });
-            blockIdx++;
         }
 
         // If no blocks parsed, fallback to first URL
-        if (products.length === 0 && allUrlMatches.length > 0) {
+        if (products.length === 0 && urlCandidates.length > 0) {
             affiliateUrl = firstUrl;
             log('No product blocks found, using first affiliate URL');
             break;
@@ -860,19 +2086,64 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
 
             if (bestMatch !== null && bestScore > 0) {
                 const picked = products[bestMatch];
-                affiliateUrl = picked.url;
-                metadata = { title: picked.title, price: picked.price ? picked.price + ' ₫' : '', image: picked.image };
+                affiliateUrl = picked.url || firstExpectedUrl || firstUrl;
+                metadata = { title: picked.title, price: picked.price || '', image: picked.image };
                 log(`✅ Best match (score ${bestScore}): "${picked.title}" — ${picked.price || 'no price'}`);
                 break;
             }
         }
 
-        // Fallback: use first product
-        const first = products[0] || {};
+        // Fallback: if the expected domain is known, avoid returning a product
+        // from a different merchant when the shelf contains mixed stores.
+        const firstMatchingDomain = expectedDomainAliases
+            ? products.find(p => p.url && matchesExpectedDomain(p.url))
+            : null;
+        const first = firstMatchingDomain || products[0] || {};
         affiliateUrl = first.url || firstUrl;
-        metadata = { title: first.title || '', price: first.price ? first.price + ' ₫' : '', image: first.image || '' };
-        log('Using first product (no better match found)');
+        metadata = { title: first.title || '', price: first.price || '', image: first.image || '' };
+        log(firstMatchingDomain ? 'Using first product matching expected domain' : 'Using first product (no better match found)');
         break;
+    }
+
+    if (!affiliateUrl) {
+        const fallbackAffiliateUrl = await buildFallbackAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
+        if (fallbackAffiliateUrl) {
+            affiliateUrl = fallbackAffiliateUrl;
+            metadata = {
+                title: expectedInfo?.title || metadata.title || '',
+                price: expectedInfo?.price || metadata.price || '',
+                image: expectedInfo?.image || metadata.image || '',
+                fallback: true,
+            };
+            log(`YouTube product shelf still unavailable; using constructed Shopee fallback URL: ${affiliateUrl.slice(0, 180)}...`);
+        } else if (USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK && isLikelyLazadaAffiliateUrl(providedAffiliateFallbackUrl)) {
+            affiliateUrl = providedAffiliateFallbackUrl;
+            metadata = {
+                title: expectedInfo?.title || metadata.title || '',
+                price: expectedInfo?.price || metadata.price || '',
+                image: expectedInfo?.image || metadata.image || '',
+                fallback: true,
+                source: 'provided-lazada-affiliate',
+            };
+            log(`YouTube product shelf still unavailable; using provided Lazada affiliate URL: ${String(affiliateUrl).slice(0, 180)}...`);
+        } else if (USE_DIRECT_LAZADA_AFFILIATE) {
+            const directLazadaUrl = buildDirectLazadaAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
+            if (directLazadaUrl) {
+                affiliateUrl = directLazadaUrl;
+                metadata = {
+                    title: expectedInfo?.title || metadata.title || '',
+                    price: expectedInfo?.price || metadata.price || '',
+                    image: expectedInfo?.image || metadata.image || '',
+                    fallback: true,
+                    source: 'direct-lazada',
+                };
+                log(`YouTube product shelf still unavailable; using direct Lazada affiliate URL: ${affiliateUrl.slice(0, 180)}...`);
+            }
+        }
+
+        if (!affiliateUrl) {
+            throw new Error('Không lấy được link affiliate sau khi lưu video. YouTube có thể cập nhật chậm, vui lòng thử lại.');
+        }
     }
 
     log('Extracted metadata: ' + JSON.stringify(metadata));
@@ -881,13 +2152,30 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl) {
 
 // ==================== Job Execution ====================
 
-async function executeJob(jobId, targetUrl, productUrl) {
+async function executeJob(jobId, targetUrl, productUrl, providedAffiliateFallbackUrl = null) {
     const jobStart = Date.now();
     log(`Job START: ${productUrl} on tab: ${targetUrl}`);
 
-    const { browser, page, worker } = await getChromePage(targetUrl);
+    let browser = null;
+    let page = null;
+    let worker = findWorkerForTargetUrl(targetUrl);
+    if (!worker) {
+        return { success: false, error: `No browser found for URL: ${targetUrl}` };
+    }
+
+    const lockOwner = `job:${jobId}`;
+    if (!await acquireCdpLock(worker, lockOwner, { wait: true, timeout: 20000 })) {
+        return { success: false, error: 'Browser đang bận kiểm tra, vui lòng thử lại.' };
+    }
+
     worker.busy = true;
     try {
+        const chromePage = await getChromePage(targetUrl, worker);
+        browser = chromePage.browser;
+        page = chromePage.page;
+        worker = chromePage.worker;
+        worker.busy = true;
+
         await page.bringToFront().catch(() => { });
         await page.waitForTimeout(300);
 
@@ -896,96 +2184,114 @@ async function executeJob(jobId, targetUrl, productUrl) {
         log(`addProduct took ${addProductTime}ms`);
 
         const fetchStart = Date.now();
-        const data = await fetchAffiliateUrl(targetUrl, productUrl);
+        const data = await fetchAffiliateUrl(targetUrl, productUrl, browser, providedAffiliateFallbackUrl);
         log(`fetchAffiliateUrl took ${Date.now() - fetchStart}ms`);
         log(`Total job time: ${Date.now() - jobStart}ms`);
         log(`Affiliate URL: ${data.affiliateUrl}`);
 
-        await browser.close().catch(() => { });
-        worker.busy = false;
-        worker.lastRefreshAt = Date.now();
         return { success: true, affiliateUrl: data.affiliateUrl, metadata: data.metadata };
     } catch (e) {
-        log(`Error during job: ${e.message}`);
+        log(`Error during job: ${shortErrorMessage(e)}`);
         try {
-            if (await isChromeCrashPage(page)) {
+            if (page && browser && await isChromeCrashPage(page)) {
                 await recoverWorkerPage(browser, browser.contexts()[0], worker, 'Chrome crash after job error');
-            } else {
+            } else if (page) {
                 await page.reload({ waitUntil: 'commit', timeout: 15000 });
                 log('Page reloaded after error');
             }
         } catch (reloadErr) {
-            log(`Failed to reload page: ${reloadErr.message}`);
+            log(`Failed to reload page: ${shortErrorMessage(reloadErr)}`);
         }
-        await browser.close().catch(() => { });
-        worker.busy = false;
-        worker.lastRefreshAt = Date.now();
-        return { success: false, error: e.message };
+        return { success: false, error: shortErrorMessage(e) };
+    } finally {
+        await disconnectBrowser(browser);
+        if (worker) {
+            worker.busy = false;
+            worker.lastRefreshAt = Date.now();
+        }
+        releaseCdpLock(worker, lockOwner);
     }
 }
 
 // ==================== Browser Management ====================
 
 async function openBrowsers(urls) {
-    // Kill existing workers
-    for (const w of activeWorkers) {
-        try { w.process.kill(); } catch { }
+    if (browsersOpening) {
+        log('[Recovery] Browser open/restart is already running, skipping duplicate request');
+        return;
     }
-    activeWorkers = [];
 
-    await new Promise(r => setTimeout(r, 500));
-
-    const sessionsDir = path.resolve(__dirname, '..', SESSIONS_DIR);
-    const defaultDataDir = path.join(sessionsDir, 'default', 'browser-data');
-    let startPort = 19222;
-
-    // Dirs to skip when cloning (cache = large & unnecessary)
-    const SKIP_DIRS = ['Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'GrShaderCache',
-        'ShaderCache', 'Service Worker', 'ScriptCache', 'component_crx_cache'];
-
-    for (let i = 0; i < urls.length; i++) {
-        const url = urls[i];
-        const port = startPort + i;
-        const sessionDir = path.join(sessionsDir, `worker-${i}`);
-        const browserDataDir = path.join(sessionDir, 'browser-data');
-
-        // Auto-clone from default profile if this worker has no session data
-        if (!fs.existsSync(path.join(browserDataDir, 'Local State')) && fs.existsSync(path.join(defaultDataDir, 'Local State'))) {
-            try {
-                if (fs.existsSync(browserDataDir)) fs.rmSync(browserDataDir, { recursive: true, force: true });
-                fs.cpSync(defaultDataDir, browserDataDir, {
-                    recursive: true,
-                    filter: (src) => !SKIP_DIRS.includes(path.basename(src)),
-                });
-                cleanLockFiles(browserDataDir);
-                log(`📋 Auto-clone session → worker-${i}`);
-            } catch (e) {
-                log(`⚠️ Lỗi auto-clone worker-${i}: ${e.message}`);
-            }
-        }
-
-        // Prepare session directory
-        if (!fs.existsSync(sessionDir)) {
-            fs.mkdirSync(sessionDir, { recursive: true });
-        }
-
-        try {
-            const child = await launchBrowser(url, port, sessionDir);
-            activeWorkers.push({
-                process: child,
-                port,
-                url,
-                sessionDir,
-                busy: false,
-                lastRefreshAt: Date.now(),
-                lastRecoveredAt: 0,
+    browsersOpening = true;
+    try {
+        // Kill existing workers
+        for (const w of activeWorkers) {
+            w.restarting = true;
+            await stopWorkerBrowser(w, 'opening new browser set').catch(e => {
+                log(`[Recovery] Failed to close port ${w.port}: ${e.message}`);
             });
-            log(`Browser ${i} opened on port ${port} for URL: ${url}`);
-        } catch (e) {
-            log(`Failed to launch browser ${i}: ${e.message}`);
         }
+        activeWorkers = [];
 
         await new Promise(r => setTimeout(r, 500));
+
+        const sessionsDir = path.resolve(__dirname, '..', SESSIONS_DIR);
+        const defaultDataDir = path.join(sessionsDir, 'default', 'browser-data');
+        let startPort = 19222;
+
+        // Dirs to skip when cloning (cache = large & unnecessary)
+        const SKIP_DIRS = ['Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'GrShaderCache',
+            'ShaderCache', 'Service Worker', 'ScriptCache', 'component_crx_cache', 'Sessions'];
+
+        for (let i = 0; i < urls.length; i++) {
+            const url = urls[i];
+            const port = startPort + i;
+            const sessionDir = path.join(sessionsDir, `worker-${i}`);
+            const browserDataDir = path.join(sessionDir, 'browser-data');
+
+            // Auto-clone from default profile if this worker has no session data
+            if (!fs.existsSync(path.join(browserDataDir, 'Local State')) && fs.existsSync(path.join(defaultDataDir, 'Local State'))) {
+                try {
+                    if (fs.existsSync(browserDataDir)) fs.rmSync(browserDataDir, { recursive: true, force: true });
+                    fs.cpSync(defaultDataDir, browserDataDir, {
+                        recursive: true,
+                        filter: (src) => !SKIP_DIRS.includes(path.basename(src)),
+                    });
+                    prepareProfileForLaunch(browserDataDir);
+                    log(`📋 Auto-clone session → worker-${i}`);
+                } catch (e) {
+                    log(`⚠️ Lỗi auto-clone worker-${i}: ${e.message}`);
+                }
+            }
+
+            // Prepare session directory
+            if (!fs.existsSync(sessionDir)) {
+                fs.mkdirSync(sessionDir, { recursive: true });
+            }
+
+            try {
+                const child = await launchBrowser(url, port, sessionDir);
+                activeWorkers.push({
+                    process: child,
+                    port,
+                    url,
+                    sessionDir,
+                    busy: false,
+                    restarting: false,
+                    cdpLocked: null,
+                    cdpBrowser: null,
+                    healthMisses: 0,
+                    lastRefreshAt: Date.now(),
+                    lastRecoveredAt: 0,
+                });
+                log(`Browser ${i} opened on port ${port} for URL: ${url}`);
+            } catch (e) {
+                log(`Failed to launch browser ${i}: ${e.message}`);
+            }
+
+            await new Promise(r => setTimeout(r, 500));
+        }
+    } finally {
+        browsersOpening = false;
     }
 }
 
@@ -1024,6 +2330,7 @@ function connect() {
             urls: activeWorkers.map(w => w.url),
             hostname: os.hostname(),
         }));
+        log(`Registered ${activeWorkers.length} browser URL(s) with server`);
     });
 
     ws.on('message', async (data) => {
@@ -1065,11 +2372,19 @@ function connect() {
 
             } else if (msg.type === 'execute-job') {
                 // Execute job
-                const { jobId, targetUrl, productUrl } = msg;
+                const { jobId, targetUrl, productUrl, affiliateFallbackUrl } = msg;
                 log(`Nhận job: ${jobId} - ${productUrl}`);
+                log(`Target video tab: ${targetUrl}`);
+                if (affiliateFallbackUrl) log(`Provided affiliate fallback: ${String(affiliateFallbackUrl).slice(0, 180)}...`);
 
                 jobStats.total++;
-                const result = await executeJob(jobId, targetUrl, productUrl);
+                let result;
+                try {
+                    result = await executeJob(jobId, targetUrl, productUrl, affiliateFallbackUrl);
+                } catch (e) {
+                    result = { success: false, error: shortErrorMessage(e) };
+                    log(`Job failed before result handler: ${result.error}`);
+                }
                 if (result.success) jobStats.success++; else jobStats.failed++;
 
                 if (ws.readyState === WebSocket.OPEN) {
@@ -1130,8 +2445,9 @@ setInterval(() => {
 
 // Restart dead browser processes instead of silently dropping them.
 setInterval(async () => {
+    if (browsersOpening) return;
     for (const worker of activeWorkers) {
-        if (worker.busy) continue;
+        if (worker.busy || worker.restarting || worker.cdpLocked) continue;
         if (!isProcessAlive(worker.process)) {
             await restartWorkerBrowser(worker, 'Chrome process exited').catch(e => {
                 log(`[Recovery] Failed to restart port ${worker.port}: ${e.message}`);
@@ -1142,11 +2458,14 @@ setInterval(async () => {
 
 // Periodically check for stuck dialogs on all browser tabs and auto-dismiss + reload
 setInterval(async () => {
+    if (browsersOpening) return;
     for (const worker of activeWorkers) {
-        if (worker.busy) continue;
+        if (worker.busy || worker.restarting) continue;
+        const lockOwner = 'watchdog-dialog';
+        if (!await acquireCdpLock(worker, lockOwner, { wait: false })) continue;
+        let browser = null;
         try {
-            const chromium = await getPlaywright();
-            const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
+            browser = await connectWorkerBrowser(worker);
             const contexts = browser.contexts();
             if (contexts.length > 0) {
                 for (const page of contexts[0].pages()) {
@@ -1171,29 +2490,44 @@ setInterval(async () => {
                     }
                 }
             }
-            await browser.close().catch(() => { });
         } catch {
             // Browser might be busy with a job, skip
+        } finally {
+            await disconnectBrowser(browser);
+            releaseCdpLock(worker, lockOwner);
         }
     }
 }, 15000);
 
 // Stronger health check for Chrome's "Aw, Snap! / Out of Memory" crash page.
 setInterval(async () => {
+    if (browsersOpening) return;
     for (const worker of activeWorkers) {
-        if (worker.busy) continue;
+        if (worker.busy || worker.restarting) continue;
+        const lockOwner = 'watchdog-health';
+        if (!await acquireCdpLock(worker, lockOwner, { wait: false })) continue;
+        let browser = null;
 
         try {
-            if (!isProcessAlive(worker.process) || !await waitForDebugPort(worker.port, 1000)) {
-                await restartWorkerBrowser(worker, 'health check could not reach debug port');
+            if (!isProcessAlive(worker.process)) {
+                worker.healthMisses = 0;
+                await restartWorkerBrowser(worker, 'health check found Chrome process exited');
                 continue;
             }
 
-            const chromium = await getPlaywright();
-            const browser = await chromium.connectOverCDP(`http://127.0.0.1:${worker.port}`);
+            if (!await waitForDebugPort(worker.port, 4000)) {
+                worker.healthMisses = (worker.healthMisses || 0) + 1;
+                log(`[Watchdog] Debug port ${worker.port} not reachable (${worker.healthMisses}/3)`);
+                if (worker.healthMisses >= 3) {
+                    await restartWorkerBrowser(worker, 'health check could not reach debug port after 3 tries');
+                }
+                continue;
+            }
+            worker.healthMisses = 0;
+
+            browser = await connectWorkerBrowser(worker);
             const context = browser.contexts()[0];
             if (!context) {
-                await browser.close().catch(() => { });
                 await restartWorkerBrowser(worker, 'missing browser context');
                 continue;
             }
@@ -1215,18 +2549,22 @@ setInterval(async () => {
                 worker.lastRefreshAt = Date.now();
             }
 
-            await browser.close().catch(() => { });
         } catch (e) {
-            log(`[Watchdog] Health check skipped on port ${worker.port}: ${e.message}`);
+            if (!/Target page, context or browser has been closed|Connection closed|Browser closed/i.test(e.message)) {
+                log(`[Watchdog] Health check skipped on port ${worker.port}: ${e.message}`);
+            }
+        } finally {
+            await disconnectBrowser(browser);
+            releaseCdpLock(worker, lockOwner);
         }
     }
 }, BROWSER_HEALTH_INTERVAL_MS);
 
 // Graceful shutdown
-process.on('SIGINT', () => {
+process.on('SIGINT', async () => {
     log('Đang tắt worker...');
     for (const w of activeWorkers) {
-        try { w.process.kill(); } catch { }
+        await stopWorkerBrowser(w, 'worker shutdown').catch(() => { });
     }
     if (ws) ws.close();
     process.exit(0);

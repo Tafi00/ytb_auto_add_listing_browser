@@ -11,6 +11,8 @@
     "server": "node src/server.js",
     "dev:web": "npm run dev:client --prefix web",
     "worker": "node src/worker.js",
+    "android-worker": "python -m android_worker.worker --config android-worker.json",
+    "test:android": "python -m unittest discover -s tests -p \"test_android_*.py\"",
     "launcher": "electron src/launcher.js",
     "build-launcher": "electron-builder --win portable"
   },

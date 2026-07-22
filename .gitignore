@@ -7,3 +7,6 @@ config/
 data/
 dist/
 *.exe
+android-worker.json
+data/android-jobs/
+data/android-artifacts/
