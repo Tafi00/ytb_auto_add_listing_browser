@@ -10,3 +10,5 @@ dist/
 android-worker.json
 data/android-jobs/
 data/android-artifacts/
+__pycache__/
+*.py[cod]
