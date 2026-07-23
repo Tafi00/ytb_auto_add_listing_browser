@@ -121,11 +121,12 @@ app.get('/api/verify', auth, (req, res) => {
 
 // Connected workers (Windows machines)
 const connectedWorkers = new Map(); // id -> { ws, info, busy }
-// Mobile jobs include public-shelf propagation and a verified cleanup pass, so
-// they legitimately take longer than the old browser-only flow.
+// Shopping jobs include public-shelf propagation and a verified cleanup pass.
 const WORKER_JOB_TIMEOUT_MS = parseInt(process.env.WORKER_JOB_TIMEOUT_MS || '420000', 10);
 const QUEUE_WAIT_TIMEOUT_MS = parseInt(process.env.QUEUE_WAIT_TIMEOUT_MS || '30000', 10);
-const PREFER_ANDROID_WORKERS = process.env.PREFER_ANDROID_WORKERS !== '0';
+const PREFER_LOCAL_WORKERS =
+  process.env.PREFER_LOCAL_WORKERS !== '0'
+  && process.env.PREFER_ANDROID_WORKERS !== '0';
 
 // Simple sequential queue per tab
 class JobQueue {
@@ -180,8 +181,11 @@ function getAvailableWorker(targetUrl) {
   const workers = [...connectedWorkers.values()]
     .filter(worker => worker?.ws?.readyState === 1)
     .sort((a, b) => {
-      if (!PREFER_ANDROID_WORKERS) return 0;
-      return Number(b.info?.workerType === 'android') - Number(a.info?.workerType === 'android');
+      if (!PREFER_LOCAL_WORKERS) return 0;
+      const priority = workerType => (
+        workerType === 'studio-api' ? 2 : workerType === 'android' ? 1 : 0
+      );
+      return priority(b.info?.workerType) - priority(a.info?.workerType);
     });
 
   // Try to find a worker that handles this specific URL (exact match)
@@ -206,11 +210,10 @@ function getWorkerReadyUrls(configUrls) {
   return configUrls.filter(url => !!getAvailableWorker(url));
 }
 
-function getLocalAndroidWorkerUrls() {
+function getLocalWorkerUrls() {
   const urls = [];
   for (const worker of connectedWorkers.values()) {
     if (worker?.ws?.readyState !== 1) continue;
-    if (worker.info?.workerType !== 'android') continue;
     if (!worker.info?.capabilities?.includes('local-video-pool')) continue;
     urls.push(...(worker.info?.urls || []));
   }
@@ -540,13 +543,13 @@ app.post('/api/get-affiliate', async (req, res) => {
   }
 
   const urlPattern = /https?:\/\/[^\s]+/g;
-  const localAndroidUrls = getLocalAndroidWorkerUrls();
+  const localWorkerUrls = getLocalWorkerUrls();
   const config = loadJobConfig();
   const serverUrls = config.url ? config.url.match(urlPattern) || [] : [];
-  const urls = localAndroidUrls.length > 0 ? localAndroidUrls : serverUrls;
+  const urls = localWorkerUrls.length > 0 ? localWorkerUrls : serverUrls;
   if (urls.length === 0) {
     return res.status(400).json({
-      error: 'Android worker chưa cấu hình video_urls local và server cũng chưa có Video URL.',
+      error: 'Studio API worker chưa cấu hình video local và server cũng chưa có Video URL.',
     });
   }
 
@@ -557,7 +560,7 @@ app.post('/api/get-affiliate', async (req, res) => {
       return res.status(503).json({ error: 'Tool chưa sẵn sàng: worker chưa mở browser đúng video URL. Vui lòng mở/restart browsers trong tool.' });
     }
 
-  // Keep the reverse-proxy connection active while the Android worker waits
+  // Keep the reverse-proxy connection active while the worker waits
   // for YouTube propagation and verified cleanup. Whitespace before JSON is
   // valid and prevents nginx/proxies from replacing the response with a plain
   // text "Bad Gateway" page during a healthy long-running job.

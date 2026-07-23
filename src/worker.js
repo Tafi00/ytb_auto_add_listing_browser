@@ -48,11 +48,8 @@ function getRegistrationInfo() {
     if (!USE_STUDIO_INTERNAL_API) {
         return { workerType: 'browser', capabilities: [] };
     }
-    // Compatibility with the currently deployed relay: local video pools are
-    // still discovered under workerType=android. The capability and job
-    // metadata distinguish this API implementation.
     return {
-        workerType: 'android',
+        workerType: 'studio-api',
         capabilities: ['local-video-pool', 'internal-metadata-api'],
     };
 }
