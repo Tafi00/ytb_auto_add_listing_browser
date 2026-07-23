@@ -122,7 +122,21 @@ function normalizeVideoUrls(value) {
   for (const item of items) {
     const url = String(item || '').trim();
     if (!url) continue;
-    if (!/^https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url)) {
+    let parsed;
+    try {
+      parsed = new URL(url);
+    } catch {
+      throw new Error(`URL YouTube không hợp lệ: ${url}`);
+    }
+    const host = parsed.hostname.toLowerCase();
+    const isYouTubeHost = host === 'youtu.be'
+      || host === 'youtube.com'
+      || host.endsWith('.youtube.com');
+    const hasVideoId = /studio\.youtube\.com\/video\/[A-Za-z0-9_-]{6,}/i.test(url)
+      || /youtu\.be\/[A-Za-z0-9_-]{6,}/i.test(url)
+      || /[?&]v=[A-Za-z0-9_-]{6,}/i.test(url)
+      || /youtube\.com\/(?:shorts|live)\/[A-Za-z0-9_-]{6,}/i.test(url);
+    if (!isYouTubeHost || !hasVideoId) {
       throw new Error(`URL YouTube không hợp lệ: ${url}`);
     }
     if (!urls.includes(url)) urls.push(url);
