@@ -110,9 +110,25 @@ function currentStatus() {
     lastWorkerExit,
     pythonFound: !!findPython(),
     configFound: fs.existsSync(CONFIG_PATH),
+    videoUrls: Array.isArray(config.video_urls) ? config.video_urls : [],
     ...deviceInfo,
     logs: recentLogs,
   };
+}
+
+function normalizeVideoUrls(value) {
+  const items = Array.isArray(value) ? value : String(value || '').split(/\r?\n/);
+  const urls = [];
+  for (const item of items) {
+    const url = String(item || '').trim();
+    if (!url) continue;
+    if (!/^https?:\/\/(?:www\.)?(?:youtube\.com|youtu\.be)\//i.test(url)) {
+      throw new Error(`URL YouTube không hợp lệ: ${url}`);
+    }
+    if (!urls.includes(url)) urls.push(url);
+  }
+  if (urls.length === 0) throw new Error('Cần nhập ít nhất một URL video YouTube');
+  return urls;
 }
 
 function stopWorker() {
@@ -168,6 +184,7 @@ async function startWorker() {
     stdio: ['ignore', 'pipe', 'pipe'],
     windowsHide: true,
   });
+  const startedProc = workerProc;
   workerStartedAt = new Date().toISOString();
   lastWorkerExit = null;
   addLog(`Đang khởi động Android worker (PID ${workerProc.pid})...`);
@@ -180,10 +197,12 @@ async function startWorker() {
   workerProc.stderr.on('data', data => {
     data.toString().split(/\r?\n/).map(line => line.trim()).filter(Boolean).forEach(line => addLog(line, 'error'));
   });
-  workerProc.on('exit', code => {
+  startedProc.on('exit', code => {
     lastWorkerExit = { code, at: new Date().toISOString() };
-    workerProc = null;
-    workerStartedAt = null;
+    if (workerProc === startedProc) {
+      workerProc = null;
+      workerStartedAt = null;
+    }
     addLog(`Android worker đã dừng (code ${code})`, code === 0 ? 'info' : 'error');
     send('status-changed');
   });
@@ -192,6 +211,28 @@ async function startWorker() {
 }
 
 ipcMain.handle('android-start-worker', () => startWorker());
+
+ipcMain.handle('android-save-video-urls', async (_, value) => {
+  try {
+    const videoUrls = normalizeVideoUrls(value);
+    const config = loadConfig();
+    config.video_urls = videoUrls;
+    fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
+
+    const shouldRestart = !!workerProc;
+    if (shouldRestart) stopWorker();
+    addLog(`Đã lưu ${videoUrls.length} video local`);
+    if (shouldRestart) {
+      const result = await startWorker();
+      if (!result.ok) return result;
+      addLog('Đã đăng ký lại danh sách video với relay');
+    }
+    send('status-changed');
+    return { ok: true, count: videoUrls.length, restarted: shouldRestart };
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+});
 
 ipcMain.handle('android-stop-worker', () => {
   if (!workerProc) return { ok: true };
@@ -205,7 +246,7 @@ ipcMain.handle('android-stop-worker', () => {
 app.whenReady().then(() => {
   mainWindow = new BrowserWindow({
     width: 960,
-    height: 760,
+    height: 850,
     minWidth: 820,
     minHeight: 650,
     resizable: true,
