@@ -1304,7 +1304,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
                 // Normalize price: "17990000.00" → "17990000", "₫17,990,000" → "17990000"
                 const normalizePrice = (str) => {
                     if (!str) return '';
-                    const cleaned = str.replace(/\.\d+$/, '').replace(/[^\d]/g, '');
+                    const cleaned = String(str).replace(/\.\d+$/, '').replace(/[^\d]/g, '');
                     return cleaned.replace(/^0+/, '') || '0';
                 };
                 const shopeeNormPrice = normalizePrice(shopeePrice);
@@ -1999,7 +1999,7 @@ async function fetchAffiliateUrl(
 
     const normPrice = (str) => {
         if (!str) return '';
-        return str.replace(/\.\d+$/, '').replace(/[^\d]/g, '').replace(/^0+/, '') || '0';
+        return String(str).replace(/\.\d+$/, '').replace(/[^\d]/g, '').replace(/^0+/, '') || '0';
     };
     const normTitle = (s) => (s || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
 
@@ -2258,6 +2258,240 @@ async function fetchAffiliateUrl(
 
 // ==================== Job Execution ====================
 
+function extractMarketplaceListingIdentity(productUrl) {
+    try {
+        const url = new URL(productUrl);
+        if (/lazada\./i.test(url.hostname)) {
+            const match = decodeURIComponent(url.pathname)
+                .match(/-i(\d+)-s(\d+)\.html/i);
+            if (match) {
+                return {
+                    marketplace: 'lazada',
+                    productId: match[1],
+                    offerId: match[2],
+                };
+            }
+        }
+    } catch {}
+    return null;
+}
+
+function findExactOfferIndex(offers, productUrl) {
+    const identity = extractMarketplaceListingIdentity(productUrl);
+    if (!identity) return -1;
+    return (offers || []).findIndex(offer => {
+        const rawOfferId = String(offer?.itemId?.rawMerchantOfferId || '');
+        if (rawOfferId === identity.offerId) return true;
+        const targetIdentity = extractMarketplaceListingIdentity(offer?.targetUrl || '');
+        return targetIdentity?.productId === identity.productId
+            && targetIdentity?.offerId === identity.offerId;
+    });
+}
+
+async function bootstrapStudioWriteSession(
+    page,
+    videoId,
+    productUrl,
+    api,
+    retryCount = 0,
+) {
+    await page.waitForLoadState('domcontentloaded', { timeout: 20_000 });
+    const productsButton = page.getByRole('button', {
+        name: /^(Products|Sản phẩm),/i,
+    }).first();
+    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+
+    try {
+        await Promise.race([
+            editButton.waitFor({ state: 'visible', timeout: 20_000 }),
+            productsButton.waitFor({ state: 'visible', timeout: 20_000 }),
+        ]);
+        if (!await editButton.isVisible().catch(() => false)) {
+            await productsButton.waitFor({ state: 'visible', timeout: 15_000 });
+            await productsButton.evaluate(element => element.click());
+        }
+        await editButton.waitFor({ state: 'visible', timeout: 10_000 });
+    } catch (error) {
+        if (retryCount >= 1) throw error;
+        log('Studio product controls were not ready; reloading once.');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
+        api.invalidateWriteSession();
+        return bootstrapStudioWriteSession(
+            page, videoId, productUrl, api, retryCount + 1,
+        );
+    }
+    await editButton.evaluate(element => element.click());
+
+    const search = page.locator('input#search-input.search-input');
+    await search.waitFor({ state: 'visible', timeout: 10_000 });
+    const selected = page.locator(
+        'ytshopping-product-picker-selected-product ytshopping-product',
+    );
+    while (await selected.count() > 0) {
+        await selected.first().hover();
+        await page.locator('ytcp-icon-button.delete-product-button').first()
+            .click({ force: true });
+        await page.waitForTimeout(100);
+    }
+
+    await search.fill(productUrl);
+    await search.press('Enter');
+    const searchResult = page.locator(
+        'ytshopping-product-picker-search-result:visible',
+    ).first();
+    await searchResult.waitFor({ state: 'visible', timeout: 15_000 });
+    const product = searchResult.locator('ytshopping-product').first();
+    await product.waitFor({ state: 'visible', timeout: 15_000 });
+    const tag = searchResult.locator(
+        'ytcp-icon-button.tag-product-button',
+    ).first();
+    const optionsLabel = product.locator('yt-formatted-string').filter({
+        hasText: /\d+\+?\s*options?/i,
+    }).first();
+    const hasOptions = await optionsLabel.isVisible({ timeout: 800 }).catch(() => false);
+
+    let exactOffer = null;
+    if (hasOptions) {
+        const identity = extractMarketplaceListingIdentity(productUrl);
+        if (identity) {
+            const searchPayload = await api.searchProductsRaw(videoId, productUrl);
+            const offerGroupItem = searchPayload?.shoppingProducts?.items?.[0];
+            const offersPayload = await api.getOffersForOfferGroupRaw(
+                videoId,
+                offerGroupItem,
+            );
+            const offers = offersPayload?.offersForOfferGroup?.items || [];
+            const exactIndex = findExactOfferIndex(offers, productUrl);
+            if (exactIndex < 0) {
+                throw createWorkerError(
+                    `YouTube Shopping không có đúng listing ${identity.offerId} trong nhóm ${offers.length} lựa chọn.`,
+                    'EXACT_OFFER_NOT_FOUND',
+                    'product-selection',
+                    false,
+                );
+            }
+            exactOffer = offers[exactIndex];
+            log(`Resolved exact marketplace offer ${identity.offerId} by API (${exactIndex + 1}/${offers.length}).`);
+        }
+    }
+    let writeTokenTag = tag;
+    if (hasOptions) {
+        writeTokenTag = null;
+        const results = page.locator(
+            'ytshopping-product-picker-search-result:visible',
+        );
+        for (let index = 1; index < await results.count(); index++) {
+            const candidateProduct = results.nth(index)
+                .locator('ytshopping-product').first();
+            await candidateProduct.hover();
+            const candidateTag = results.nth(index)
+                .locator('ytcp-icon-button.tag-product-button').first();
+            if (await candidateTag.isVisible({ timeout: 1000 }).catch(() => false)) {
+                writeTokenTag = candidateTag;
+                break;
+            }
+        }
+        if (!writeTokenTag) {
+            throw createWorkerError(
+                'Không tìm được sản phẩm tạm để tạo mã xác thực ghi của YouTube Studio.',
+                'WRITE_TOKEN_PRODUCT_NOT_FOUND',
+                'authentication',
+                true,
+            );
+        }
+    } else {
+        await product.hover();
+    }
+    await writeTokenTag.waitFor({ state: 'visible', timeout: 15_000 });
+    await writeTokenTag.evaluate(element => {
+        const button = element.shadowRoot?.querySelector('button')
+            || element.querySelector('button')
+            || element;
+        button.click();
+    });
+    await page.waitForFunction(() => {
+        const next = document.querySelector('ytcp-button#picker-next-button button');
+        return next && !next.disabled && next.getAttribute('aria-disabled') !== 'true';
+    }, null, { timeout: 10_000 });
+
+    await clickPickerNextButton(page);
+    await clickPickerDoneButton(page);
+    const save = page.locator('ytcp-button#save button').first();
+    try {
+        await page.waitForFunction(() => {
+            const button = document.querySelector('ytcp-button#save button');
+            return button && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+        }, null, { timeout: 4_000 });
+    } catch (error) {
+        if (retryCount >= 1) throw error;
+        log('Studio page state was stale after API cleanup; reloading once.');
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
+        api.invalidateWriteSession();
+        return bootstrapStudioWriteSession(
+            page, videoId, productUrl, api, retryCount + 1,
+        );
+    }
+    await save.click({ force: true });
+    await waitForSaveToFinish(page, save);
+
+    for (let attempt = 0; attempt < 30 && !api.hasWriteSession(); attempt++) {
+        await page.waitForTimeout(100);
+    }
+    if (!api.hasWriteSession()) {
+        log(`Studio write capture state: captured=${Boolean(api.writeSession)}, attestation=${Boolean(api.writeSession?.body?.attestationResponseData)}`);
+        throw createWorkerError(
+            'Không lấy được xác thực ghi từ YouTube Studio sau khi lưu.',
+            'WRITE_SESSION_NOT_READY',
+            'authentication',
+            true,
+        );
+    }
+    return { exactOffer };
+}
+
+async function cleanupStudioProductsUi(page) {
+    await page.waitForLoadState('domcontentloaded', { timeout: 20_000 });
+    const productsButton = page.getByRole('button', {
+        name: /^(Products|Sản phẩm),/i,
+    }).first();
+    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+    await Promise.race([
+        editButton.waitFor({ state: 'visible', timeout: 20_000 }),
+        productsButton.waitFor({ state: 'visible', timeout: 20_000 }),
+    ]);
+    if (!await editButton.isVisible().catch(() => false)) {
+        await productsButton.evaluate(element => element.click());
+    }
+    await editButton.waitFor({ state: 'visible', timeout: 10_000 });
+    await editButton.evaluate(element => element.click());
+
+    const search = page.locator('input#search-input.search-input');
+    await search.waitFor({ state: 'visible', timeout: 10_000 });
+    const selected = page.locator(
+        'ytshopping-product-picker-selected-product ytshopping-product',
+    );
+    while (await selected.count() > 0) {
+        await selected.first().hover();
+        await page.locator('ytcp-icon-button.delete-product-button').first()
+            .click({ force: true });
+        await page.waitForTimeout(100);
+    }
+
+    const done = page.locator(
+        'ytcp-button#picker-save-button button, ytcp-button#picker-done-button button, button[aria-label="Done"], button[aria-label="Xong"]',
+    ).first();
+    await done.waitFor({ state: 'visible', timeout: 10_000 });
+    await done.click({ force: true });
+
+    const save = page.locator('ytcp-button#save button').first();
+    await page.waitForFunction(() => {
+        const button = document.querySelector('ytcp-button#save button');
+        return button && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+    }, null, { timeout: 10_000 });
+    await save.click({ force: true });
+    await waitForSaveToFinish(page, save);
+}
+
 async function discoverShoppingItemId(page, productUrl) {
     const productsButton = page.locator(
         'button:has(div.ytcpButtonShapeImpl__button-text-content)',
@@ -2340,14 +2574,27 @@ async function executeStudioApiJob(
     let primaryError = null;
 
     try {
-        const discoverStarted = Date.now();
-        const { shoppingItemId } = await api.searchProduct(videoId, productUrl);
-        log(`API product discovery: ${shoppingItemId}`);
-        log(`API product discovery took ${Date.now() - discoverStarted}ms`);
-
         const addStarted = Date.now();
-        await api.updateProducts(videoId, [shoppingItemId]);
+        api.invalidateWriteSession();
+        log('Creating a fresh Studio write token with one automatic save.');
+        const { exactOffer } = await bootstrapStudioWriteSession(
+            page,
+            videoId,
+            productUrl,
+            api,
+        );
         productAdded = true;
+        let shoppingItemId = exactOffer?.itemId?.rawMerchantOfferId
+            || api.getWriteShoppingItemId();
+        if (exactOffer?.itemId) {
+            const exactUpdateStarted = Date.now();
+            await api.updateProducts(videoId, [exactOffer.itemId]);
+            log(`API exact-offer update took ${Date.now() - exactUpdateStarted}ms`);
+        }
+        if (!shoppingItemId) {
+            const discovered = await api.searchProduct(videoId, productUrl);
+            shoppingItemId = discovered.shoppingItemId;
+        }
         log(`API add took ${Date.now() - addStarted}ms`);
 
         const affiliateStarted = Date.now();
@@ -2362,6 +2609,19 @@ async function executeStudioApiJob(
                 retryDelayMs: 500,
             },
         );
+        const expectedIdentity = extractMarketplaceListingIdentity(productUrl);
+        const actualIdentity = extractMarketplaceListingIdentity(data.affiliateUrl);
+        if (expectedIdentity && (
+            actualIdentity?.productId !== expectedIdentity.productId
+            || actualIdentity?.offerId !== expectedIdentity.offerId
+        )) {
+            throw createWorkerError(
+                `YouTube trả về listing ${actualIdentity?.offerId || 'không xác định'} thay vì ${expectedIdentity.offerId}.`,
+                'AFFILIATE_LISTING_MISMATCH',
+                'affiliate-validation',
+                true,
+            );
+        }
         log(`API affiliate lookup took ${Date.now() - affiliateStarted}ms`);
         return {
             ...data,
@@ -2375,19 +2635,27 @@ async function executeStudioApiJob(
         primaryError = error;
         throw error;
     } finally {
-        if (productAdded) {
+        if (productAdded || api.hasWriteSession()) {
             const removeStarted = Date.now();
             try {
-                await api.updateProducts(videoId, []);
-                log(`API cleanup took ${Date.now() - removeStarted}ms`);
+                await cleanupStudioProductsUi(page);
+                log(`Studio cleanup took ${Date.now() - removeStarted}ms`);
             } catch (error) {
-                log(`API cleanup failed: ${shortErrorMessage(error)}`);
-                if (primaryError) {
-                    primaryError.cleanupError = shortErrorMessage(error);
-                    primaryError.cleanupSucceeded = false;
-                } else {
-                    throw error;
+                log(`Studio cleanup failed: ${shortErrorMessage(error)}; trying API fallback.`);
+                try {
+                    await api.updateProducts(videoId, []);
+                    log(`API cleanup fallback took ${Date.now() - removeStarted}ms`);
+                } catch (fallbackError) {
+                    log(`API cleanup fallback failed: ${shortErrorMessage(fallbackError)}`);
+                    if (primaryError) {
+                        primaryError.cleanupError = shortErrorMessage(fallbackError);
+                        primaryError.cleanupSucceeded = false;
+                    } else {
+                        throw fallbackError;
+                    }
                 }
+            } finally {
+                api.invalidateWriteSession();
             }
         }
     }

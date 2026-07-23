@@ -211,6 +211,15 @@ function stopOwnedWorker() {
 ipcMain.handle('api-status', async () => {
   const panel = await getPanelStatus();
   const config = loadConfig();
+  const combinedLogs = new Map();
+  for (const item of [...(panel?.logs || []), ...recentLogs]) {
+    const normalized = {
+      time: item?.time || '',
+      message: String(item?.message || ''),
+      level: item?.level || (/error|failed|lỗi|thất bại/i.test(item?.message || '') ? 'error' : 'info'),
+    };
+    combinedLogs.set(`${normalized.time}|${normalized.message}`, normalized);
+  }
   return {
     hostname: os.hostname(),
     relayUrl: process.env.WORKER_SERVER_URL || panel?.serverUrl || 'wss://voucheryoutube.vn',
@@ -223,7 +232,7 @@ ipcMain.handle('api-status', async () => {
     apiReadyCount: panel?.apiReadyCount || 0,
     jobStats: panel?.jobStats || { total: 0, success: 0, failed: 0 },
     videoUrls: Array.isArray(config.video_urls) ? config.video_urls : [],
-    logs: recentLogs,
+    logs: [...combinedLogs.values()].slice(-250),
   };
 });
 

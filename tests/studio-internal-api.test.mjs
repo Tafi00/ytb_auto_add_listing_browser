@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    buildOfferGroupBody,
     buildProductSearchBody,
     buildProductSelectionBody,
     extractShoppingItemId,
@@ -10,6 +11,40 @@ import {
     selectStudioHeaders,
     StudioApiError,
 } from '../src/studio-internal-api.js';
+
+test('builds an offer-group API payload from a GPC search result', () => {
+    const body = buildOfferGroupBody({
+        context: { client: { clientName: 62 } },
+        videoId: 'VNa64icfGAg',
+        offerGroupItem: {
+            itemId: {
+                gpcIdWithMerchantScope: {
+                    gpcId: '6853547794971194620',
+                    merchantConstraints: ['116709387'],
+                },
+                itemMetadata: {
+                    tagCreationContext: {
+                        creatorTagging: { urlSearch: true },
+                    },
+                },
+            },
+        },
+    });
+    assert.deepEqual(
+        body.getOffersForOfferGroupRequest.offerGroupId,
+        {
+            gpcIdWithMerchantScope: {
+                gpcId: '6853547794971194620',
+                merchantConstraints: ['116709387'],
+            },
+        },
+    );
+    assert.equal(
+        body.getOffersForOfferGroupRequest
+            .tagCreationContext.creatorTagging.urlSearch,
+        true,
+    );
+});
 
 test('extracts item id from YouTube VE sibling key', () => {
     assert.equal(
@@ -97,12 +132,34 @@ test('does not forward cookies or unrelated headers', () => {
         Authorization: 'SAPISIDHASH redacted',
         Cookie: 'must-not-leak',
         'X-Goog-AuthUser': '0',
+        'X-YouTube-Delegation-Context': 'delegation-token',
         'Content-Length': '999',
     });
     assert.equal(selected.authorization, 'SAPISIDHASH redacted');
     assert.equal(selected['x-goog-authuser'], '0');
+    assert.equal(selected['x-youtube-delegation-context'], 'delegation-token');
     assert.equal(selected.cookie, undefined);
     assert.equal(selected['content-length'], undefined);
+});
+
+test('treats an authentication challenge inside HTTP 200 as an error', async () => {
+    const response = {
+        ok: () => true,
+        status: () => 200,
+        text: async () => JSON.stringify({
+            responseContext: {
+                webResponseContextExtensionData: {
+                    challenge: { type: 'CHALLENGE_PROMPT_TYPE_AUTHENTICATE' },
+                },
+            },
+        }),
+    };
+    await assert.rejects(
+        () => parseStudioResponse(response, 'Add YouTube product'),
+        error => error instanceof StudioApiError
+            && error.code === 'AUTH_CHALLENGE'
+            && error.stage === 'authentication',
+    );
 });
 
 test('reports Bad Gateway text without a JSON parse exception', async () => {

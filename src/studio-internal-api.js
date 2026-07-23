@@ -14,6 +14,11 @@ const FORWARDED_HEADER_NAMES = new Set([
     'x-origin',
     'x-youtube-client-name',
     'x-youtube-client-version',
+    'x-youtube-delegation-context',
+    'x-youtube-page-cl',
+    'x-youtube-page-label',
+    'x-youtube-time-zone',
+    'x-youtube-utc-offset',
 ]);
 
 export class StudioApiError extends Error {
@@ -153,6 +158,36 @@ export function buildProductSearchBody({ context, delegationContext, videoId, pr
     };
 }
 
+export function buildOfferGroupBody({
+    context,
+    delegationContext,
+    videoId,
+    offerGroupItem,
+}) {
+    const groupId = offerGroupItem?.itemId?.gpcIdWithMerchantScope;
+    if (!groupId?.gpcId) throw new Error('A GPC offer group is required');
+    return {
+        context,
+        ...(delegationContext ? { delegationContext } : {}),
+        getOffersForOfferGroupRequest: {
+            shoppingDescriptor: {
+                editDescriptor: { externalVideoId: videoId },
+            },
+            offerGroupId: {
+                gpcIdWithMerchantScope: groupId,
+            },
+            tagCreationContext: offerGroupItem?.itemId?.itemMetadata
+                ?.tagCreationContext || {
+                creatorTagging: {
+                    urlSearch: true,
+                    taggingTool: 'TAGGING_TOOL_PRODUCT_PICKER',
+                    clientInterface: 'CLIENT_INTERFACE_WEB_CREATOR',
+                },
+            },
+        },
+    };
+}
+
 export function findProductClusterMid(value) {
     const seen = new Set();
 
@@ -218,8 +253,23 @@ export async function parseStudioResponse(response, operation = 'YouTube Studio 
     }
 
     try {
-        return JSON.parse(text);
-    } catch {
+        const payload = JSON.parse(text);
+        const challengeType = payload?.responseContext
+            ?.webResponseContextExtensionData?.challenge?.type;
+        if (challengeType) {
+            throw new StudioApiError(
+                'YouTube Studio yêu cầu làm mới xác thực ghi. Worker sẽ tự khởi tạo lại ở lần xử lý tiếp theo.',
+                {
+                    code: 'AUTH_CHALLENGE',
+                    stage: 'authentication',
+                    retryable: true,
+                    status,
+                },
+            );
+        }
+        return payload;
+    } catch (error) {
+        if (error instanceof StudioApiError) throw error;
         const detail = text.replace(/\s+/g, ' ').trim().slice(0, 120) || 'empty response';
         const info = operationErrorInfo(operation, status);
         throw new StudioApiError(
@@ -237,6 +287,7 @@ export class StudioInternalApi {
     constructor(page) {
         this.page = page;
         this.session = null;
+        this.writeSession = null;
         this.waiters = new Set();
         this.onRequest = request => void this.captureRequest(request);
     }
@@ -279,6 +330,13 @@ export class StudioInternalApi {
             delegationContext: body.delegationContext,
             headers,
         };
+        if (request.url().includes('/video_manager/metadata_update')) {
+            this.writeSession = {
+                capturedAt: Date.now(),
+                body: structuredClone(body),
+                headers,
+            };
+        }
         for (const resolve of this.waiters) resolve(this.session);
         this.waiters.clear();
     }
@@ -305,25 +363,60 @@ export class StudioInternalApi {
         });
     }
 
+    hasWriteSession(maxAgeMs = 5 * 60_000) {
+        return Boolean(
+            this.writeSession
+            && Date.now() - this.writeSession.capturedAt < maxAgeMs
+            && this.writeSession.body?.attestationResponseData,
+        );
+    }
+
+    getWriteShoppingItemId() {
+        const items = this.writeSession?.body?.productsSelection?.shoppingItemIds || [];
+        for (const item of items) {
+            const value = typeof item === 'object' ? item?.productClusterMid : item;
+            if (/^\d+$/.test(String(value || ''))) return String(value);
+        }
+        return null;
+    }
+
+    invalidateWriteSession() {
+        this.writeSession = null;
+    }
+
     async updateProducts(videoId, shoppingItemIds) {
         const session = await this.waitUntilReady();
+        if (!this.hasWriteSession()) {
+            throw new StudioApiError(
+                'Chưa có phiên xác thực ghi của YouTube Studio.',
+                {
+                    code: 'WRITE_SESSION_NOT_READY',
+                    stage: 'authentication',
+                    retryable: true,
+                },
+            );
+        }
         const operation = shoppingItemIds.length
             ? 'Add YouTube product'
             : 'Remove YouTube products';
-        const body = buildProductSelectionBody({
+        const selection = buildProductSelectionBody({
             context: session.context,
             delegationContext: session.delegationContext,
             videoId,
             shoppingItemIds,
-        });
+        }).productsSelection;
+        const body = structuredClone(this.writeSession.body);
+        body.encryptedVideoId = videoId;
+        body.productsSelection = selection;
         try {
             const response = await this.page.request.post(METADATA_UPDATE_URL, {
-                headers: session.headers,
+                headers: this.writeSession.headers,
                 data: body,
                 timeout: 10_000,
             });
             return await parseStudioResponse(response, operation);
         } catch (error) {
+            if (error?.code === 'AUTH_CHALLENGE') this.writeSession = null;
             throw wrapStudioError(error, operation);
         }
     }
@@ -355,6 +448,27 @@ export class StudioInternalApi {
             shoppingItemId: findProductClusterMid(result),
             response: result,
         };
+    }
+
+    async getOffersForOfferGroupRaw(videoId, offerGroupItem) {
+        const session = await this.waitUntilReady();
+        const body = buildOfferGroupBody({
+            context: session.context,
+            delegationContext: session.delegationContext,
+            videoId,
+            offerGroupItem,
+        });
+        const operation = 'Get YouTube Shopping offers';
+        try {
+            const response = await this.page.request.post(SHOPPING_SETTINGS_URL, {
+                headers: session.headers,
+                data: body,
+                timeout: 10_000,
+            });
+            return await parseStudioResponse(response, operation);
+        } catch (error) {
+            throw wrapStudioError(error, operation);
+        }
     }
 }
 
