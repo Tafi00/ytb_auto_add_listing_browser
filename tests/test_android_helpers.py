@@ -1,4 +1,5 @@
 import unittest
+import asyncio
 from unittest.mock import patch
 from urllib.error import HTTPError
 
@@ -7,6 +8,7 @@ from android_worker.affiliate import (
     product_similarity,
 )
 from android_worker.youtube_studio import extract_video_id, studio_url
+from android_worker.worker import AndroidWorker
 
 
 class AndroidHelperTests(unittest.TestCase):
@@ -74,6 +76,22 @@ class AndroidHelperTests(unittest.TestCase):
         self.assertEqual(len(products), 1)
         self.assertEqual(urlopen_mock.call_count, 2)
         sleep_mock.assert_called_once()
+
+    @patch("android_worker.worker.fetch_public_products")
+    def test_cleanup_verification_uses_exact_identity(self, fetch_mock):
+        fetch_mock.return_value = {
+            "lazada:3332640654:16333304915": "https://lazada.vn/another-a17-i3332640654-s16333304915.html"
+        }
+        worker = AndroidWorker({"cleanup_verify_timeout": 1})
+        asyncio.run(
+            worker.verify_removed(
+                "VNa64icfGAg",
+                "https://lazada.vn/original-a17-i3237396474-s15582798079.html",
+                baseline_count=0,
+                expected_identity="lazada:3189247573:15178609102",
+            )
+        )
+        fetch_mock.assert_called_once()
 
 
 if __name__ == "__main__":

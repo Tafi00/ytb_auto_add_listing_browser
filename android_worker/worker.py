@@ -116,11 +116,28 @@ class AndroidWorker:
             f"Hết thời gian chờ sản phẩm xuất hiện trên public shelf; đang thấy {len(last)} sản phẩm"
         )
 
-    async def verify_removed(self, video_id: str, product_url: str):
+    async def verify_removed(
+        self,
+        video_id: str,
+        product_url: str,
+        baseline_count: int | None = None,
+        expected_identity: str | None = None,
+    ):
         end = time.monotonic() + self.cleanup_verify_timeout
         while time.monotonic() < end:
             current = await asyncio.to_thread(fetch_public_products, video_id)
-            if not any(product_similarity(url, product_url) >= 0.45 for url in current.values()):
+            if expected_identity and expected_identity not in current:
+                return
+            if baseline_count is not None and len(current) <= baseline_count:
+                return
+            if (
+                not expected_identity
+                and baseline_count is None
+                and not any(
+                    product_similarity(url, product_url) >= 0.45
+                    for url in current.values()
+                )
+            ):
                 return
             await asyncio.sleep(self.poll_seconds)
         raise RuntimeError("Đã bấm gỡ nhưng public shelf vẫn còn sản phẩm")
@@ -132,6 +149,8 @@ class AndroidWorker:
         product_url: str,
         job_id: str,
         baseline_selected_count: int | None,
+        baseline_count: int | None = None,
+        expected_identity: str | None = None,
         attempts: int = 3,
     ):
         last_error = None
@@ -144,7 +163,12 @@ class AndroidWorker:
                     job_id,
                     baseline_selected_count,
                 )
-                await self.verify_removed(video_id, product_url)
+                await self.verify_removed(
+                    video_id,
+                    product_url,
+                    baseline_count=baseline_count,
+                    expected_identity=expected_identity,
+                )
                 return
             except Exception as error:
                 last_error = error
@@ -210,7 +234,13 @@ class AndroidWorker:
                     self.journal.write(job_id, "CLEANUP_PENDING")
                     try:
                         await self.cleanup_with_retries(
-                            device, video_id, product_url, job_id, baseline_selected_count
+                            device,
+                            video_id,
+                            product_url,
+                            job_id,
+                            baseline_selected_count,
+                            baseline_count=len(before),
+                            expected_identity=new_identity,
                         )
                         self.journal.write(job_id, "VERIFIED_CLEAN")
                     except Exception as cleanup_error:
@@ -243,6 +273,8 @@ class AndroidWorker:
                     str(product_url),
                     str(job_id),
                     item.get("baseline_selected_count"),
+                    baseline_count=len(item.get("baseline") or []),
+                    expected_identity=item.get("product_identity"),
                 )
                 self.journal.write(str(job_id), "VERIFIED_CLEAN", recovered=True)
             except Exception as error:
