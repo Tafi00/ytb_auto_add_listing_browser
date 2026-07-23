@@ -84,9 +84,33 @@ class StudioAutomation:
 
     def open_editor(self, video_id: str):
         target = studio_url(video_id)
-        if self.current_video_id == video_id and self._exists(resourceId=SAVE_BUTTON_ID):
-            self.log(f"[{self.serial}] Dùng lại màn hình video {video_id}")
-            return
+        if self.current_video_id == video_id:
+            if self._exists(resourceId=SAVE_BUTTON_ID):
+                self.log(f"[{self.serial}] Dùng lại màn hình video {video_id}")
+                return
+
+            # A failed search can leave Studio inside Tag products. Return to
+            # the already-open editor instead of launching the same deep-link.
+            done = self.d(description="Done")
+            if not done.exists:
+                done = self.d(text="Done")
+            if done.exists:
+                done.click()
+                editor = self._wait_any(
+                    [{"text": "Edit video"}, {"resourceId": SAVE_BUTTON_ID}], timeout=8
+                )
+                if editor is not None:
+                    self.log(f"[{self.serial}] Quay lại editor video {video_id}")
+                    return
+
+            for _ in range(2):
+                self.d.press("back")
+                editor = self._wait_any(
+                    [{"text": "Edit video"}, {"resourceId": SAVE_BUTTON_ID}], timeout=4
+                )
+                if editor is not None:
+                    self.log(f"[{self.serial}] Quay lại editor video {video_id}")
+                    return
 
         self.log(f"[{self.serial}] Mở Studio video {video_id}")
         for attempt in range(2):
