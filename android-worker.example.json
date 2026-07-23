@@ -12,7 +12,7 @@
     }
   ],
   "ui_timeout": 30,
-  "affiliate_poll_seconds": 6,
+  "affiliate_poll_seconds": 1,
   "affiliate_poll_timeout": 120,
   "cleanup_verify_timeout": 90,
   "journal_dir": "data/android-jobs",

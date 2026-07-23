@@ -218,16 +218,45 @@ function getLocalAndroidWorkerUrls() {
 }
 
 // Send a job to worker and wait for result
+class WorkerJobError extends Error {
+  constructor(message, {
+    code = 'WORKER_ERROR',
+    stage = 'worker',
+    retryable = false,
+    cleanupSucceeded,
+    cleanupError,
+  } = {}) {
+    super(message);
+    this.name = 'WorkerJobError';
+    this.code = code;
+    this.stage = stage;
+    this.retryable = retryable;
+    this.cleanupSucceeded = cleanupSucceeded;
+    this.cleanupError = cleanupError;
+  }
+}
+
 function sendJobToWorker(worker, jobId, targetUrl, productUrl, affiliateFallbackUrl = null) {
   return new Promise((resolve, reject) => {
     if (!worker?.ws || worker.ws.readyState !== 1) {
-      reject(new Error('Worker chưa kết nối'));
+      reject(new WorkerJobError('API worker chưa kết nối relay.', {
+        code: 'WORKER_DISCONNECTED',
+        stage: 'relay',
+        retryable: true,
+      }));
       return;
     }
 
     const timeout = setTimeout(() => {
       delete worker.pendingJobs[jobId];
-      reject(new Error(`Worker timeout (${Math.round(WORKER_JOB_TIMEOUT_MS / 1000)}s)`));
+      reject(new WorkerJobError(
+        `API worker xử lý quá ${Math.round(WORKER_JOB_TIMEOUT_MS / 1000)} giây.`,
+        {
+          code: 'WORKER_TIMEOUT',
+          stage: 'worker',
+          retryable: true,
+        },
+      ));
     }, WORKER_JOB_TIMEOUT_MS);
 
     worker.pendingJobs[jobId] = { resolve, reject, timeout };
@@ -616,10 +645,32 @@ app.post('/api/get-affiliate', async (req, res) => {
     }, { waitTimeoutMs: QUEUE_WAIT_TIMEOUT_MS });
   } catch (e) {
     console.error(`[API] get-affiliate error: ${e.message}`);
-    const safeMessage = e.message.includes('không gắn giỏ')
+    const knownWorkerError = e instanceof WorkerJobError;
+    const code = e.code || (/queue/i.test(e.message) ? 'QUEUE_TIMEOUT' : 'RELAY_ERROR');
+    const stage = e.stage || (/queue/i.test(e.message) ? 'queue' : 'relay');
+    const retryable = knownWorkerError ? e.retryable : true;
+    const safeMessage = knownWorkerError
       ? e.message
-      : `Có lỗi xảy ra, vui lòng thử lại sau. (Chi tiết: ${e.message.substring(0, 150)})`;
-    finishJson({ error: safeMessage }, 500);
+      : 'Relay không thể hoàn tất yêu cầu lúc này. Vui lòng thử lại.';
+    const status = code === 'PRODUCT_NOT_FOUND'
+      ? 422
+      : code === 'YOUTUBE_RATE_LIMIT'
+        ? 429
+        : ['WORKER_TIMEOUT', 'QUEUE_TIMEOUT'].includes(code)
+          ? 504
+          : ['WORKER_DISCONNECTED', 'VIDEO_NOT_READY', 'AUTH_SESSION_NOT_READY', 'AUTH_REQUIRED'].includes(code)
+            ? 503
+            : 500;
+    finishJson({
+      error: safeMessage,
+      code,
+      stage,
+      retryable,
+      ...(e.cleanupSucceeded === false ? {
+        cleanupSucceeded: false,
+        cleanupError: e.cleanupError || 'Không thể xác nhận đã gỡ sản phẩm.',
+      } : {}),
+    }, status);
   }
 });
 
@@ -836,7 +887,13 @@ workerWss.on('connection', (ws, req) => {
               metadata: msg.metadata || {},
             });
           } else {
-            pending.reject(new Error(msg.error || 'Worker job failed'));
+            pending.reject(new WorkerJobError(msg.error || 'API worker xử lý thất bại.', {
+              code: msg.errorCode || 'WORKER_ERROR',
+              stage: msg.errorStage || 'worker',
+              retryable: Boolean(msg.retryable),
+              cleanupSucceeded: msg.cleanupSucceeded,
+              cleanupError: msg.cleanupError,
+            }));
           }
         }
 
@@ -856,7 +913,11 @@ workerWss.on('connection', (ws, req) => {
     // Reject all pending jobs
     for (const [jobId, pending] of Object.entries(worker.pendingJobs)) {
       clearTimeout(pending.timeout);
-      pending.reject(new Error('Worker disconnected'));
+      pending.reject(new WorkerJobError('API worker bị ngắt kết nối khi đang xử lý.', {
+        code: 'WORKER_DISCONNECTED',
+        stage: 'relay',
+        retryable: true,
+      }));
     }
     connectedWorkers.delete(workerId);
     console.log(`[Worker WS] Worker disconnected: ${workerId} (total: ${connectedWorkers.size})`);

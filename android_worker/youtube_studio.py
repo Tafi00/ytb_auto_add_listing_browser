@@ -248,7 +248,7 @@ class StudioAutomation:
         time.sleep(0.35)
         for attempt in range(1, 4):
             save = self._wait_any(
-                [{"resourceId": SAVE_BUTTON_ID, "enabled": True}], timeout=8
+                [{"resourceId": SAVE_BUTTON_ID, "enabled": True}], timeout=3
             )
             if save is None:
                 if allow_already_saved and self._exists(resourceId=SAVE_BUTTON_ID):
@@ -262,19 +262,26 @@ class StudioAutomation:
             try:
                 save.click()
             except Exception as error:
-                if "StaleObjectException" not in str(error):
+                if not any(
+                    name in str(error)
+                    for name in ("StaleObjectException", "UiObjectNotFoundException")
+                ):
                     raise
 
-            end = time.time() + 8
+            end = time.time() + 1.2
             while time.time() < end:
                 try:
                     current = self.d(resourceId=SAVE_BUTTON_ID)
                     if not current.exists or not current.info.get("enabled", False):
                         return True
                 except Exception as error:
-                    if "StaleObjectException" not in str(error):
+                    if not any(
+                        name in str(error)
+                        for name in ("StaleObjectException", "UiObjectNotFoundException")
+                    ):
                         raise
-                time.sleep(0.35)
+                    return True
+                time.sleep(0.2)
             self.log(f"[{self.serial}] Save chưa nhận click, thử lại {attempt}/3")
         raise RuntimeError("YouTube Studio không xác nhận Save")
 
@@ -334,10 +341,49 @@ class StudioAutomation:
             self.mutation_started = False
             return False
 
-        selected.click()
-        if self._wait_any([{"description": "Select product"}], timeout=10) is None:
-            raise RuntimeError("Không xác nhận được thao tác bỏ chọn sản phẩm")
-        done = self._wait_any([{"text": "Done"}, {"description": "Done"}], timeout=10)
+        removed_count = 0
+        while removed_count < 20:
+            selected_results = self.d(description="Deselect product")
+            before_count = selected_results.count
+            if before_count == 0:
+                break
+            selected_results[0].click()
+            removed_count += 1
+            end = time.time() + 4
+            while time.time() < end:
+                if self.d(description="Deselect product").count < before_count:
+                    break
+                time.sleep(0.2)
+        if self.d(description="Deselect product").count:
+            raise RuntimeError("Cleanup chưa bỏ chọn hết các biến thể sản phẩm")
+        self.log(f"[{self.serial}] Đã bỏ chọn {removed_count} kết quả sản phẩm")
+        done = self._wait_any([{"text": "Done"}, {"description": "Done"}], timeout=3)
+        if done is None:
+            # With zero selected products Studio hides the footer on the
+            # search-results screen. Back returns to Tag products/editor while
+            # preserving the deselection.
+            self.d.press("back")
+            if self._wait_any(
+                [{"text": "Edit video"}, {"resourceId": SAVE_BUTTON_ID}], timeout=4
+            ) is not None:
+                self._save_editor()
+                self.mutation_started = False
+                return True
+            done = self._wait_any(
+                [{"text": "Done"}, {"description": "Done"}], timeout=5
+            )
+            if (
+                done is None
+                and self._exists(className="android.widget.EditText")
+                and self._exists(description="Back")
+            ):
+                self.d.press("back")
+                if self._wait_any(
+                    [{"text": "Edit video"}, {"resourceId": SAVE_BUTTON_ID}], timeout=5
+                ) is not None:
+                    self._save_editor()
+                    self.mutation_started = False
+                    return True
         if done is None:
             raise RuntimeError("Cleanup không tìm thấy nút Done")
         done.click()

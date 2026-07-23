@@ -9,6 +9,7 @@ import fs from 'fs';
 import os from 'os';
 import http from 'http';
 import WebSocket from 'ws';
+import { StudioInternalApi } from './studio-internal-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -25,6 +26,9 @@ const ENABLE_BROWSER_PUBLIC_FALLBACK = process.env.ENABLE_BROWSER_PUBLIC_FALLBAC
 const USE_DIRECT_SHOPEE_AFFILIATE = process.env.USE_DIRECT_SHOPEE_AFFILIATE !== '0';
 const USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK = process.env.USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK !== '0';
 const USE_DIRECT_LAZADA_AFFILIATE = process.env.USE_DIRECT_LAZADA_AFFILIATE !== '0';
+const USE_STUDIO_INTERNAL_API = process.env.USE_STUDIO_INTERNAL_API === '1';
+const USE_LOCAL_STUDIO_API_URLS =
+    USE_STUDIO_INTERNAL_API && process.env.STUDIO_API_USE_LOCAL_URLS !== '0';
 const LAZADA_YOUTUBE_EXLAZ = process.env.LAZADA_YOUTUBE_EXLAZ || 'd_2:mm_254241245_236353075_2194553061:vn2880030:00:';
 
 // State
@@ -39,6 +43,41 @@ let _playwrightChromium = null;
 let recentLogs = []; // Keep last 100 logs for control panel
 let jobStats = { total: 0, success: 0, failed: 0 };
 const pagesWithDialogHandler = new WeakSet();
+
+function getRegistrationInfo() {
+    if (!USE_STUDIO_INTERNAL_API) {
+        return { workerType: 'browser', capabilities: [] };
+    }
+    // Compatibility with the currently deployed relay: local video pools are
+    // still discovered under workerType=android. The capability and job
+    // metadata distinguish this API implementation.
+    return {
+        workerType: 'android',
+        capabilities: ['local-video-pool', 'internal-metadata-api'],
+    };
+}
+
+function loadLocalStudioApiUrls() {
+    const apiConfigPath = path.resolve(__dirname, '..', 'studio-api.json');
+    const androidConfigPath = path.resolve(__dirname, '..', 'android-worker.json');
+    try {
+        const configPath = fs.existsSync(apiConfigPath) ? apiConfigPath : androidConfigPath;
+        const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
+        return [...new Set(
+            (Array.isArray(config.video_urls) ? config.video_urls : [])
+                .map(value => String(value || '').trim())
+                .filter(Boolean),
+        )];
+    } catch (error) {
+        console.error(`Không đọc được video_urls local cho API worker: ${error.message}`);
+        return [];
+    }
+}
+
+function saveLocalStudioApiUrls(urls) {
+    const configPath = path.resolve(__dirname, '..', 'studio-api.json');
+    fs.writeFileSync(configPath, `${JSON.stringify({ video_urls: urls }, null, 2)}\n`, 'utf8');
+}
 
 // ==================== Playwright & Chrome ====================
 
@@ -80,6 +119,55 @@ function shortErrorMessage(error) {
         .replace(/(?:browserContext\.newPage:\s*){2,}/g, 'browserContext.newPage: ')
         .replace(/(?:page\.(?:close|evaluate|removeListener|title):\s*){2,}/g, '')
         .slice(0, 500);
+}
+
+function createWorkerError(message, code, stage, retryable = false) {
+    const error = new Error(message);
+    error.code = code;
+    error.stage = stage;
+    error.retryable = retryable;
+    return error;
+}
+
+function serializeJobError(error) {
+    const raw = shortErrorMessage(error);
+    let code = error?.code || 'WORKER_ERROR';
+    let stage = error?.stage || 'worker';
+    let retryable = Boolean(error?.retryable);
+    let message = raw;
+
+    if (!error?.code && /affiliate|public shelf|product shelf/i.test(raw)) {
+        code = 'AFFILIATE_NOT_READY';
+        stage = 'affiliate-lookup';
+        retryable = true;
+        message = 'YouTube đã nhận sản phẩm nhưng link affiliate công khai chưa cập nhật kịp. Vui lòng thử lại.';
+    } else if (!error?.code && /No browser found|browser.*video URL/i.test(raw)) {
+        code = 'VIDEO_NOT_READY';
+        stage = 'browser-session';
+        retryable = true;
+        message = 'Tab video chưa sẵn sàng trên API worker.';
+    } else if (!error?.code && /Target page|Browser closed|Connection closed|CDP/i.test(raw)) {
+        code = 'BROWSER_DISCONNECTED';
+        stage = 'browser-session';
+        retryable = true;
+        message = 'Chrome nền bị mất kết nối. Worker sẽ mở lại phiên video.';
+    } else if (!error?.code && /timeout|timed out/i.test(raw)) {
+        code = 'WORKER_TIMEOUT';
+        stage = 'worker';
+        retryable = true;
+        message = 'Worker xử lý quá thời gian chờ.';
+    }
+
+    return {
+        error: message,
+        errorCode: code,
+        errorStage: stage,
+        retryable,
+        ...(error?.cleanupSucceeded === false ? {
+            cleanupSucceeded: false,
+            cleanupError: error.cleanupError || 'Không thể xác nhận đã gỡ sản phẩm.',
+        } : {}),
+    };
 }
 
 function isTargetClosedError(error) {
@@ -391,6 +479,10 @@ function findWorkerForTargetUrl(targetUrl) {
         : activeWorkers[0];
 }
 
+function workerProcessIsAlive(worker) {
+    return isProcessAlive(worker?.sharedApiOwner?.process || worker?.process);
+}
+
 async function getChromePage(targetUrl, reservedWorker = null) {
     const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
     let worker = reservedWorker || findWorkerForTargetUrl(targetUrl);
@@ -405,7 +497,7 @@ async function getChromePage(targetUrl, reservedWorker = null) {
     for (let attempt = 1; attempt <= 3; attempt++) {
         let browser = null;
         try {
-            if (!isProcessAlive(worker.process) || !await waitForDebugPort(worker.port, 3000)) {
+            if (!workerProcessIsAlive(worker) || !await waitForDebugPort(worker.port, 3000)) {
                 log(`[Recovery] Browser on port ${worker.port} is not reachable. Restarting...`);
                 worker = await restartWorkerBrowser(worker, 'debug port not reachable');
                 worker.busy = true;
@@ -436,7 +528,7 @@ async function getChromePage(targetUrl, reservedWorker = null) {
             forgetWorkerBrowser(worker, browser);
             log(`[Recovery] connectOverCDP failed on port ${worker.port} (attempt ${attempt}/3): ${shortErrorMessage(e)}`);
 
-            if (!isProcessAlive(worker.process) || isTargetClosedError(e)) {
+            if (!workerProcessIsAlive(worker) || isTargetClosedError(e)) {
                 const reason = isTargetClosedError(e)
                     ? 'CDP target closed while connecting'
                     : 'Chrome process exited while connecting';
@@ -500,7 +592,9 @@ async function recoverWorkerPage(browser, context, worker, reason) {
         await page.goto(worker.url, { waitUntil: 'commit', timeout: 30000 }).catch(() => { });
     });
     await page.waitForTimeout(2000);
-    await closeExtraPages(context, page);
+    if (!USE_STUDIO_INTERNAL_API) {
+        await closeExtraPages(context, page);
+    }
     worker.lastRecoveredAt = Date.now();
     worker.lastRefreshAt = Date.now();
 
@@ -1820,7 +1914,14 @@ async function fetchPublicVideoHtmlFromBrowser(browser, publicUrl) {
     }
 }
 
-async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, providedAffiliateFallbackUrl = null) {
+async function fetchAffiliateUrl(
+    videoUrl,
+    expectedProductUrl,
+    browser = null,
+    providedAffiliateFallbackUrl = null,
+    options = {},
+) {
+    const forcePublicShelf = options.forcePublicShelf === true;
     const videoIdMatch = videoUrl.match(/\/video\/([^/]+)\//);
     if (!videoIdMatch) throw new Error('Could not extract video ID from URL');
     const videoId = videoIdMatch[1];
@@ -1852,7 +1953,7 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
         }
     }
 
-    if (USE_DIRECT_SHOPEE_AFFILIATE && expectedDomainAliases?.some(alias => alias.includes('shopee') || alias.includes('shp.ee'))) {
+    if (!forcePublicShelf && USE_DIRECT_SHOPEE_AFFILIATE && expectedDomainAliases?.some(alias => alias.includes('shopee') || alias.includes('shp.ee'))) {
         const directAffiliateUrl = await buildFallbackAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
         if (directAffiliateUrl) {
             const directMetadata = {
@@ -1868,7 +1969,8 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
     }
 
     if (
-        USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK
+        !forcePublicShelf
+        && USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK
         && expectedDomainAliases?.some(alias => alias.includes('lazada') || alias.includes('lzd.co'))
         && isLikelyLazadaAffiliateUrl(providedAffiliateFallbackUrl)
     ) {
@@ -1883,7 +1985,7 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
         return { affiliateUrl: providedAffiliateFallbackUrl, metadata: fallbackMetadata };
     }
 
-    if (USE_DIRECT_LAZADA_AFFILIATE && expectedDomainAliases?.some(alias => alias.includes('lazada') || alias.includes('lzd.co'))) {
+    if (!forcePublicShelf && USE_DIRECT_LAZADA_AFFILIATE && expectedDomainAliases?.some(alias => alias.includes('lazada') || alias.includes('lzd.co'))) {
         const directLazadaUrl = buildDirectLazadaAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
         if (directLazadaUrl) {
             const directMetadata = {
@@ -1907,10 +2009,15 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
     let affiliateUrl = null;
     let metadata = { title: '', price: '', image: '' };
 
-    const maxAttempts = 18;
+    const maxAttempts = Number.isInteger(options.maxAttempts)
+        ? Math.max(1, options.maxAttempts)
+        : 18;
+    const retryDelayMs = Number.isInteger(options.retryDelayMs)
+        ? Math.max(0, options.retryDelayMs)
+        : null;
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
         if (attempt > 1) {
-            const delay = attempt <= 3 ? 1500 : attempt <= 7 ? 3000 : 5000;
+            const delay = retryDelayMs ?? (attempt <= 3 ? 1500 : attempt <= 7 ? 3000 : 5000);
             log(`Attempt ${attempt} fetchAffiliateUrl retrying after ${delay}ms...`);
             await new Promise(r => setTimeout(r, delay));
         }
@@ -2106,7 +2213,9 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
     }
 
     if (!affiliateUrl) {
-        const fallbackAffiliateUrl = await buildFallbackAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
+        const fallbackAffiliateUrl = forcePublicShelf
+            ? null
+            : await buildFallbackAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
         if (fallbackAffiliateUrl) {
             affiliateUrl = fallbackAffiliateUrl;
             metadata = {
@@ -2116,7 +2225,7 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
                 fallback: true,
             };
             log(`YouTube product shelf still unavailable; using constructed Shopee fallback URL: ${affiliateUrl.slice(0, 180)}...`);
-        } else if (USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK && isLikelyLazadaAffiliateUrl(providedAffiliateFallbackUrl)) {
+        } else if (!forcePublicShelf && USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK && isLikelyLazadaAffiliateUrl(providedAffiliateFallbackUrl)) {
             affiliateUrl = providedAffiliateFallbackUrl;
             metadata = {
                 title: expectedInfo?.title || metadata.title || '',
@@ -2126,7 +2235,7 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
                 source: 'provided-lazada-affiliate',
             };
             log(`YouTube product shelf still unavailable; using provided Lazada affiliate URL: ${String(affiliateUrl).slice(0, 180)}...`);
-        } else if (USE_DIRECT_LAZADA_AFFILIATE) {
+        } else if (!forcePublicShelf && USE_DIRECT_LAZADA_AFFILIATE) {
             const directLazadaUrl = buildDirectLazadaAffiliateUrl(expectedProductUrl, expectedInfo, videoId);
             if (directLazadaUrl) {
                 affiliateUrl = directLazadaUrl;
@@ -2152,6 +2261,141 @@ async function fetchAffiliateUrl(videoUrl, expectedProductUrl, browser = null, p
 
 // ==================== Job Execution ====================
 
+async function discoverShoppingItemId(page, productUrl) {
+    const productsButton = page.locator(
+        'button:has(div.ytcpButtonShapeImpl__button-text-content)',
+    ).filter({
+        hasText: /(Sáº£n pháº©m|Products|tagged product|sáº£n pháº©m Ä‘Ã£ gáº¯n)/i,
+    }).first();
+    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+
+    let search = page.locator('input#search-input.search-input');
+    if (!await search.isVisible({ timeout: 300 }).catch(() => false)
+        && !await editButton.isVisible({ timeout: 1000 }).catch(() => false)) {
+        await productsButton.waitFor({ state: 'visible', timeout: 10_000 });
+        await productsButton.click({ force: true });
+    }
+    if (!await search.isVisible({ timeout: 300 }).catch(() => false)) {
+        await editButton.waitFor({ state: 'visible', timeout: 8_000 });
+        await editButton.click({ force: true });
+    }
+
+    search = page.locator('input#search-input.search-input');
+    await search.waitFor({ state: 'visible', timeout: 8_000 });
+    await search.fill(productUrl);
+    await search.press('Enter');
+
+    const result = page.locator(
+        'ytshopping-product-picker-search-result[ve-sibling-key]',
+    ).first();
+    await result.waitFor({ state: 'visible', timeout: 10_000 });
+    const veSiblingKey = await result.getAttribute('ve-sibling-key');
+    const shoppingItemId = extractShoppingItemId(veSiblingKey);
+    log(`API product discovery: ${shoppingItemId}`);
+
+    const close = page.locator(
+        'ytcp-icon-button[aria-label="Close"], button[aria-label="Close"]',
+    ).last();
+    if (await close.isVisible({ timeout: 300 }).catch(() => false)) {
+        await close.click({ force: true }).catch(() => { });
+    } else {
+        await page.keyboard.press('Escape').catch(() => { });
+    }
+    return shoppingItemId;
+}
+
+async function warmStudioApiSession(worker, page) {
+    const existing = worker.studioApi;
+    if (
+        existing?.page === page
+        && existing.session
+        && Date.now() - existing.session.capturedAt < 5 * 60_000
+    ) return existing;
+
+    existing?.stop();
+    const api = new StudioInternalApi(page).start();
+    worker.studioApi = api;
+    await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
+    await api.waitUntilReady(10_000);
+    return api;
+}
+
+async function executeStudioApiJob(
+    worker,
+    page,
+    browser,
+    targetUrl,
+    productUrl,
+    providedAffiliateFallbackUrl,
+) {
+    const match = targetUrl.match(/\/video\/([^/]+)\//);
+    if (!match) {
+        throw createWorkerError(
+            'URL YouTube Studio không chứa video ID hợp lệ.',
+            'INVALID_VIDEO_URL',
+            'validation',
+            false,
+        );
+    }
+    const videoId = match[1];
+    const api = await warmStudioApiSession(worker, page);
+    let productAdded = false;
+    let primaryError = null;
+
+    try {
+        const discoverStarted = Date.now();
+        const { shoppingItemId } = await api.searchProduct(videoId, productUrl);
+        log(`API product discovery: ${shoppingItemId}`);
+        log(`API product discovery took ${Date.now() - discoverStarted}ms`);
+
+        const addStarted = Date.now();
+        await api.updateProducts(videoId, [shoppingItemId]);
+        productAdded = true;
+        log(`API add took ${Date.now() - addStarted}ms`);
+
+        const affiliateStarted = Date.now();
+        const data = await fetchAffiliateUrl(
+            targetUrl,
+            productUrl,
+            browser,
+            providedAffiliateFallbackUrl,
+            {
+                forcePublicShelf: true,
+                maxAttempts: 3,
+                retryDelayMs: 500,
+            },
+        );
+        log(`API affiliate lookup took ${Date.now() - affiliateStarted}ms`);
+        return {
+            ...data,
+            metadata: {
+                ...(data.metadata || {}),
+                workerType: 'studio-api',
+                shoppingItemId,
+            },
+        };
+    } catch (error) {
+        primaryError = error;
+        throw error;
+    } finally {
+        if (productAdded) {
+            const removeStarted = Date.now();
+            try {
+                await api.updateProducts(videoId, []);
+                log(`API cleanup took ${Date.now() - removeStarted}ms`);
+            } catch (error) {
+                log(`API cleanup failed: ${shortErrorMessage(error)}`);
+                if (primaryError) {
+                    primaryError.cleanupError = shortErrorMessage(error);
+                    primaryError.cleanupSucceeded = false;
+                } else {
+                    throw error;
+                }
+            }
+        }
+    }
+}
+
 async function executeJob(jobId, targetUrl, productUrl, providedAffiliateFallbackUrl = null) {
     const jobStart = Date.now();
     log(`Job START: ${productUrl} on tab: ${targetUrl}`);
@@ -2160,12 +2404,28 @@ async function executeJob(jobId, targetUrl, productUrl, providedAffiliateFallbac
     let page = null;
     let worker = findWorkerForTargetUrl(targetUrl);
     if (!worker) {
-        return { success: false, error: `No browser found for URL: ${targetUrl}` };
+        return {
+            success: false,
+            ...serializeJobError(createWorkerError(
+                'Tab video chưa sẵn sàng trên API worker.',
+                'VIDEO_NOT_READY',
+                'browser-session',
+                true,
+            )),
+        };
     }
 
     const lockOwner = `job:${jobId}`;
     if (!await acquireCdpLock(worker, lockOwner, { wait: true, timeout: 20000 })) {
-        return { success: false, error: 'Browser đang bận kiểm tra, vui lòng thử lại.' };
+        return {
+            success: false,
+            ...serializeJobError(createWorkerError(
+                'Video đang xử lý một job khác. Vui lòng thử lại.',
+                'WORKER_BUSY',
+                'queue',
+                true,
+            )),
+        };
     }
 
     worker.busy = true;
@@ -2178,6 +2438,20 @@ async function executeJob(jobId, targetUrl, productUrl, providedAffiliateFallbac
 
         await page.bringToFront().catch(() => { });
         await page.waitForTimeout(300);
+
+        if (USE_STUDIO_INTERNAL_API) {
+            const data = await executeStudioApiJob(
+                worker,
+                page,
+                browser,
+                targetUrl,
+                productUrl,
+                providedAffiliateFallbackUrl,
+            );
+            log(`Total API job time: ${Date.now() - jobStart}ms`);
+            log(`Affiliate URL: ${data.affiliateUrl}`);
+            return { success: true, affiliateUrl: data.affiliateUrl, metadata: data.metadata };
+        }
 
         await addProduct(page, productUrl);
         const addProductTime = Date.now() - jobStart;
@@ -2202,7 +2476,7 @@ async function executeJob(jobId, targetUrl, productUrl, providedAffiliateFallbac
         } catch (reloadErr) {
             log(`Failed to reload page: ${shortErrorMessage(reloadErr)}`);
         }
-        return { success: false, error: shortErrorMessage(e) };
+        return { success: false, ...serializeJobError(e) };
     } finally {
         await disconnectBrowser(browser);
         if (worker) {
@@ -2241,9 +2515,41 @@ async function openBrowsers(urls) {
         // Dirs to skip when cloning (cache = large & unnecessary)
         const SKIP_DIRS = ['Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'GrShaderCache',
             'ShaderCache', 'Service Worker', 'ScriptCache', 'component_crx_cache', 'Sessions'];
+        let sharedApiOwner = null;
 
         for (let i = 0; i < urls.length; i++) {
             const url = urls[i];
+            if (USE_STUDIO_INTERNAL_API && sharedApiOwner) {
+                try {
+                    const browser = await connectWorkerBrowser(sharedApiOwner);
+                    const context = browser.contexts()[0];
+                    const page = await context.newPage();
+                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+                    const worker = {
+                        process: null,
+                        port: sharedApiOwner.port,
+                        url,
+                        sessionDir: sharedApiOwner.sessionDir,
+                        busy: false,
+                        restarting: false,
+                        cdpLocked: null,
+                        cdpBrowser: browser,
+                        healthMisses: 0,
+                        lastRefreshAt: Date.now(),
+                        lastRecoveredAt: 0,
+                        sharedApiOwner,
+                    };
+                    activeWorkers.push(worker);
+                    log(`API tab ${i} opened in shared Chrome for URL: ${url}`);
+                    const started = Date.now();
+                    await warmStudioApiSession(worker, page);
+                    log(`API session ${i} warmed in ${Date.now() - started}ms`);
+                } catch (error) {
+                    log(`Failed to open shared API tab ${i}: ${shortErrorMessage(error)}`);
+                }
+                continue;
+            }
+
             const port = startPort + i;
             const sessionDir = path.join(sessionsDir, `worker-${i}`);
             const browserDataDir = path.join(sessionDir, 'browser-data');
@@ -2270,7 +2576,7 @@ async function openBrowsers(urls) {
 
             try {
                 const child = await launchBrowser(url, port, sessionDir);
-                activeWorkers.push({
+                const worker = {
                     process: child,
                     port,
                     url,
@@ -2282,8 +2588,20 @@ async function openBrowsers(urls) {
                     healthMisses: 0,
                     lastRefreshAt: Date.now(),
                     lastRecoveredAt: 0,
-                });
+                };
+                activeWorkers.push(worker);
+                if (USE_STUDIO_INTERNAL_API && !sharedApiOwner) sharedApiOwner = worker;
                 log(`Browser ${i} opened on port ${port} for URL: ${url}`);
+                if (USE_STUDIO_INTERNAL_API) {
+                    try {
+                        const chromePage = await getChromePage(url, worker);
+                        const started = Date.now();
+                        await warmStudioApiSession(worker, chromePage.page);
+                        log(`API session ${i} warmed in ${Date.now() - started}ms`);
+                    } catch (error) {
+                        log(`API session ${i} chưa sẵn sàng: ${shortErrorMessage(error)}`);
+                    }
+                }
             } catch (e) {
                 log(`Failed to launch browser ${i}: ${e.message}`);
             }
@@ -2325,10 +2643,12 @@ function connect() {
         reconnectDelay = 1000;
 
         // Register with server
+        const registration = getRegistrationInfo();
         ws.send(JSON.stringify({
             type: 'register',
             urls: activeWorkers.map(w => w.url),
             hostname: os.hostname(),
+            ...registration,
         }));
         log(`Registered ${activeWorkers.length} browser URL(s) with server`);
     });
@@ -2340,6 +2660,10 @@ function connect() {
             if (msg.type === 'config-update') {
                 // Server sends updated URLs
                 const newUrls = msg.urls || [];
+                if (USE_LOCAL_STUDIO_API_URLS) {
+                    log('API worker dùng video_urls local; bỏ qua danh sách video trên server');
+                    return;
+                }
                 log(`Nhận cấu hình mới: ${newUrls.length} URLs`);
 
                 // Check if URLs changed
@@ -2350,10 +2674,12 @@ function connect() {
 
                     // Re-register with new URLs
                     if (ws.readyState === WebSocket.OPEN) {
+                        const registration = getRegistrationInfo();
                         ws.send(JSON.stringify({
                             type: 'register',
                             urls: activeWorkers.map(w => w.url),
                             hostname: os.hostname(),
+                            ...registration,
                         }));
                     }
                 } else if (newUrls.length > 0 && activeWorkers.length === 0) {
@@ -2362,10 +2688,12 @@ function connect() {
                     await openBrowsers(newUrls);
 
                     if (ws.readyState === WebSocket.OPEN) {
+                        const registration = getRegistrationInfo();
                         ws.send(JSON.stringify({
                             type: 'register',
                             urls: activeWorkers.map(w => w.url),
                             hostname: os.hostname(),
+                            ...registration,
                         }));
                     }
                 }
@@ -2382,7 +2710,7 @@ function connect() {
                 try {
                     result = await executeJob(jobId, targetUrl, productUrl, affiliateFallbackUrl);
                 } catch (e) {
-                    result = { success: false, error: shortErrorMessage(e) };
+                    result = { success: false, ...serializeJobError(e) };
                     log(`Job failed before result handler: ${result.error}`);
                 }
                 if (result.success) jobStats.success++; else jobStats.failed++;
@@ -2447,6 +2775,7 @@ setInterval(() => {
 setInterval(async () => {
     if (browsersOpening) return;
     for (const worker of activeWorkers) {
+        if (worker.sharedApiOwner) continue;
         if (worker.busy || worker.restarting || worker.cdpLocked) continue;
         if (!isProcessAlive(worker.process)) {
             await restartWorkerBrowser(worker, 'Chrome process exited').catch(e => {
@@ -2460,6 +2789,7 @@ setInterval(async () => {
 setInterval(async () => {
     if (browsersOpening) return;
     for (const worker of activeWorkers) {
+        if (worker.sharedApiOwner) continue;
         if (worker.busy || worker.restarting) continue;
         const lockOwner = 'watchdog-dialog';
         if (!await acquireCdpLock(worker, lockOwner, { wait: false })) continue;
@@ -2509,9 +2839,12 @@ setInterval(async () => {
         let browser = null;
 
         try {
-            if (!isProcessAlive(worker.process)) {
+            const processOwner = worker.sharedApiOwner || worker;
+            if (!isProcessAlive(processOwner.process)) {
                 worker.healthMisses = 0;
-                await restartWorkerBrowser(worker, 'health check found Chrome process exited');
+                if (!worker.sharedApiOwner) {
+                    await restartWorkerBrowser(worker, 'health check found Chrome process exited');
+                }
                 continue;
             }
 
@@ -2539,7 +2872,9 @@ setInterval(async () => {
                 targetPage = await recoverWorkerPage(browser, context, worker, 'Chrome Aw Snap / Out of Memory');
             }
 
-            await closeExtraPages(context, targetPage);
+            if (!USE_STUDIO_INTERNAL_API) {
+                await closeExtraPages(context, targetPage);
+            }
 
             if (Date.now() - (worker.lastRefreshAt || 0) > PAGE_IDLE_REFRESH_MS) {
                 log(`[Watchdog] Periodic refresh on port ${worker.port} to release YouTube Studio memory`);
@@ -2579,10 +2914,12 @@ async function restartBrowsers() {
 
         // Re-register with server
         if (ws && ws.readyState === WebSocket.OPEN) {
+            const registration = getRegistrationInfo();
             ws.send(JSON.stringify({
                 type: 'register',
                 urls: activeWorkers.map(w => w.url),
                 hostname: os.hostname(),
+                ...registration,
             }));
         }
         log('Restart browsers hoàn tất!');
@@ -2751,6 +3088,20 @@ function getControlPanelHTML() {
             gap: 8px;
             flex-wrap: wrap;
         }
+        .video-urls {
+            width: 100%;
+            min-height: 110px;
+            resize: vertical;
+            box-sizing: border-box;
+            margin: 10px 0;
+            padding: 12px;
+            border: 1px solid #2a2a4a;
+            border-radius: 8px;
+            background: #0a0a18;
+            color: #e0e0e0;
+            font-family: Consolas, monospace;
+            font-size: 12px;
+        }
         .browser-list {
             list-style: none;
         }
@@ -2902,6 +3253,14 @@ function getControlPanelHTML() {
             </div>
         </div>
 
+        <div class="card" id="apiVideosCard">
+            <div class="card-title">Video YouTube local cho API worker</div>
+            <textarea class="video-urls" id="videoUrls" placeholder="Mỗi dòng một URL YouTube Studio"></textarea>
+            <div class="actions">
+                <button class="btn btn-primary" onclick="saveVideoUrls()">Lưu & mở browsers</button>
+            </div>
+        </div>
+
         <!-- Active Browsers -->
         <div class="card">
             <div class="card-title">Browsers đang chạy</div>
@@ -2942,6 +3301,11 @@ function getControlPanelHTML() {
                 document.getElementById('browserCount').textContent = data.browsers.length;
                 document.getElementById('jobSuccess').textContent = data.jobStats.success;
                 document.getElementById('jobFailed').textContent = data.jobStats.failed;
+                const videoUrls = document.getElementById('videoUrls');
+                if (data.apiMode && document.activeElement !== videoUrls) {
+                    videoUrls.value = (data.localUrls || []).join('\\n');
+                }
+                document.getElementById('apiVideosCard').style.display = data.apiMode ? '' : 'none';
 
                 // Mode badge
                 const badge = document.getElementById('modeBadge');
@@ -3019,6 +3383,23 @@ function getControlPanelHTML() {
             }
         }
 
+        async function saveVideoUrls() {
+            try {
+                const videoUrls = document.getElementById('videoUrls').value;
+                const res = await fetch('/api/video-urls', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ videoUrls }),
+                });
+                const data = await res.json();
+                if (!res.ok) throw new Error(data.error || 'Không thể lưu');
+                showToast('Đã mở ' + data.count + ' API browser');
+                await fetchStatus();
+            } catch (e) {
+                showToast('Lỗi: ' + e.message, 'error');
+            }
+        }
+
         // Auto refresh every 2s
         fetchStatus();
         refreshTimer = setInterval(fetchStatus, 2000);
@@ -3048,10 +3429,52 @@ function startControlPanel() {
                 headless: headlessMode,
                 connectionEnabled,
                 wsConnected: ws && ws.readyState === WebSocket.OPEN,
+                apiMode: USE_STUDIO_INTERNAL_API,
+                localUrls: currentUrls,
                 browsers: activeWorkers.map(w => ({ port: w.port, url: w.url })),
+                apiReadyCount: activeWorkers.filter(worker => Boolean(worker.studioApi?.session)).length,
                 jobStats,
                 logs: recentLogs.slice(-50),
             }));
+        } else if (url.pathname === '/api/video-urls' && req.method === 'POST') {
+            if (!USE_STUDIO_INTERNAL_API) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Worker chưa chạy ở chế độ Studio API' }));
+                return;
+            }
+            try {
+                let raw = '';
+                for await (const chunk of req) {
+                    raw += chunk;
+                    if (raw.length > 100_000) throw new Error('Dữ liệu quá lớn');
+                }
+                const value = JSON.parse(raw || '{}').videoUrls || '';
+                const urls = [...new Set(
+                    String(value).split(/\r?\n/)
+                        .map(item => item.trim())
+                        .filter(Boolean),
+                )];
+                if (urls.some(item => !/^https:\/\/studio\.youtube\.com\/video\/[^/]+\/edit(?:[?#].*)?$/.test(item))) {
+                    throw new Error('Mỗi dòng phải là URL YouTube Studio dạng /video/ID/edit');
+                }
+                currentUrls = urls;
+                saveLocalStudioApiUrls(urls);
+                await openBrowsers(urls);
+                if (ws && ws.readyState === WebSocket.OPEN) {
+                    const registration = getRegistrationInfo();
+                    ws.send(JSON.stringify({
+                        type: 'register',
+                        urls: activeWorkers.map(worker => worker.url),
+                        hostname: os.hostname(),
+                        ...registration,
+                    }));
+                }
+                res.writeHead(200, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ ok: true, count: activeWorkers.length, urls }));
+            } catch (error) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: error.message }));
+            }
         } else if (url.pathname === '/api/toggle-headless' && req.method === 'POST') {
             headlessMode = !headlessMode;
             log(`Chuyển sang mode: ${headlessMode ? 'HEADLESS' : 'HEADED'}`);
@@ -3063,6 +3486,59 @@ function startControlPanel() {
             await restartBrowsers().catch(e => log(`Lỗi restart: ${e.message}`));
             res.writeHead(200, { 'Content-Type': 'application/json' });
             res.end(JSON.stringify({ message: `Đã restart ${activeWorkers.length} browser(s)` }));
+        } else if (url.pathname === '/api/shutdown' && req.method === 'POST') {
+            const remoteAddress = req.socket.remoteAddress || '';
+            if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remoteAddress)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Local access only' }));
+                return;
+            }
+            res.writeHead(200, { 'Content-Type': 'application/json' });
+            res.end(JSON.stringify({ ok: true }));
+            setTimeout(() => process.kill(process.pid, 'SIGINT'), 50);
+        } else if (url.pathname === '/api/test-job' && req.method === 'POST') {
+            const remoteAddress = req.socket.remoteAddress || '';
+            if (!['127.0.0.1', '::1', '::ffff:127.0.0.1'].includes(remoteAddress)) {
+                res.writeHead(403, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Local access only' }));
+                return;
+            }
+            if (!USE_STUDIO_INTERNAL_API) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: 'Worker is not running in Studio API mode' }));
+                return;
+            }
+            try {
+                let raw = '';
+                for await (const chunk of req) {
+                    raw += chunk;
+                    if (raw.length > 100_000) throw new Error('Request body too large');
+                }
+                const body = JSON.parse(raw || '{}');
+                const productUrl = String(body.productUrl || '').trim();
+                const targetUrl = String(body.targetUrl || currentUrls[0] || '').trim();
+                if (!/^https?:\/\//.test(productUrl)) throw new Error('productUrl is required');
+                if (!targetUrl) throw new Error('No local video URL is configured');
+
+                jobStats.total++;
+                const startedAt = Date.now();
+                const result = await executeJob(
+                    `local-test-${Date.now()}`,
+                    targetUrl,
+                    productUrl,
+                    body.affiliateFallbackUrl || null,
+                );
+                if (result.success) jobStats.success++; else jobStats.failed++;
+                res.writeHead(result.success ? 200 : 502, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({
+                    ...result,
+                    targetUrl,
+                    elapsedMs: Date.now() - startedAt,
+                }));
+            } catch (error) {
+                res.writeHead(400, { 'Content-Type': 'application/json' });
+                res.end(JSON.stringify({ error: shortErrorMessage(error) }));
+            }
         } else if (url.pathname === '/api/toggle-connection' && req.method === 'POST') {
             if (connectionEnabled) {
                 disconnect();
@@ -3112,6 +3588,11 @@ async function main() {
     console.log('');
 
     startControlPanel();
+    if (USE_LOCAL_STUDIO_API_URLS) {
+        currentUrls = loadLocalStudioApiUrls();
+        log(`API worker đọc ${currentUrls.length} video URL local`);
+        if (currentUrls.length > 0) await openBrowsers(currentUrls);
+    }
     connect();
 }
 

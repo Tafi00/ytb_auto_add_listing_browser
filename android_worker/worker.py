@@ -40,7 +40,7 @@ class AndroidWorker:
         self.config = config
         self.server_url = os.getenv("WORKER_SERVER_URL", config.get("server_url", "ws://localhost:3002"))
         self.token = os.getenv("WORKER_AUTH_TOKEN", config.get("worker_auth_token", "default-worker-token"))
-        self.poll_seconds = float(config.get("affiliate_poll_seconds", 6))
+        self.poll_seconds = float(config.get("affiliate_poll_seconds", 1))
         self.poll_timeout = float(config.get("affiliate_poll_timeout", 120))
         self.cleanup_verify_timeout = float(config.get("cleanup_verify_timeout", 90))
         self.journal = JobJournal(config.get("journal_dir", "data/android-jobs"))
@@ -209,7 +209,7 @@ class AndroidWorker:
                     await asyncio.sleep(2)
         raise RuntimeError(str(last_error or "Cleanup thất bại"))
 
-    async def execute_job(self, message: dict[str, Any]) -> dict[str, Any]:
+    async def execute_job(self, message: dict[str, Any], early_result=None) -> dict[str, Any]:
         job_id = str(message["jobId"])
         target_url = str(message["targetUrl"])
         product_url = str(message["productUrl"])
@@ -221,6 +221,7 @@ class AndroidWorker:
             added = False
             new_identity = None
             baseline_selected_count = None
+            result_sent = False
             try:
                 self.journal.write(
                     job_id, "RECEIVED", target_url=target_url, product_url=product_url,
@@ -248,8 +249,15 @@ class AndroidWorker:
                 return_payload = {
                     "success": True,
                     "affiliateUrl": result.url,
-                    "metadata": {"videoId": video_id, "deviceSerial": device.serial},
+                    "metadata": {
+                        "videoId": video_id,
+                        "deviceSerial": device.serial,
+                        "cleanupPending": True,
+                    },
                 }
+                if early_result is not None:
+                    await early_result(return_payload)
+                    result_sent = True
             except Exception as error:
                 added = added or device.automation.mutation_started
                 device.automation.capture(job_id, "job-error")
@@ -276,10 +284,15 @@ class AndroidWorker:
                     except Exception as cleanup_error:
                         device.automation.capture(job_id, "cleanup-error")
                         self.journal.write(job_id, "CLEANUP_PENDING", cleanup_error=str(cleanup_error))
-                        return_payload = {
-                            "success": False,
-                            "error": f"Đã xử lý sản phẩm nhưng cleanup chưa hoàn tất: {cleanup_error}",
-                        }
+                        if result_sent:
+                            await self.log_remote(
+                                f"{job_id}: đã trả affiliate nhưng cleanup nền lỗi: {cleanup_error}"
+                            )
+                        else:
+                            return_payload = {
+                                "success": False,
+                                "error": f"Đã xử lý sản phẩm nhưng cleanup chưa hoàn tất: {cleanup_error}",
+                            }
                 device.lock.release()
             return return_payload
 
@@ -331,11 +344,21 @@ class AndroidWorker:
 
     async def handle_job(self, message: dict[str, Any]):
         job_id = message.get("jobId", "unknown")
+        sent = False
+
+        async def send_result(payload):
+            nonlocal sent
+            if sent:
+                return
+            await self.send({"type": "job-result", "jobId": job_id, **payload})
+            sent = True
+
         try:
-            result = await self.execute_job(message)
+            result = await self.execute_job(message, early_result=send_result)
         except Exception as error:
             result = {"success": False, "error": str(error)}
-        await self.send({"type": "job-result", "jobId": job_id, **result})
+        if not sent:
+            await send_result(result)
 
     async def run_connection(self):
         ws_url = f"{self.server_url.rstrip('/')}/ws/worker?token={self.token}"

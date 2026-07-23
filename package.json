@@ -13,7 +13,11 @@
     "worker": "node src/worker.js",
     "android-worker": "python -m android_worker.worker --config android-worker.json",
     "test:android": "python -m unittest discover -s tests -p \"test_android_*.py\"",
+    "test:studio-api": "node --test tests/studio-internal-api.test.mjs tests/web-response.test.mjs",
     "launcher": "electron src/launcher.js",
+    "api-tool": "electron src/studio-api-launcher.js",
+    "api-worker": "node scripts/start-studio-api-worker.mjs",
+    "build-api-tool": "electron-builder --win portable --config electron-builder.api.yml && node scripts/copy-studio-api-config.mjs",
     "build-launcher": "electron-builder --win portable"
   },
   "dependencies": {
@@ -45,6 +49,9 @@
       "src/launcher.js",
       "src/launcher.html",
       "src/worker.js",
+      "src/studio-internal-api.js",
+      "src/studio-api-launcher.js",
+      "src/studio-api-launcher.html",
       "src/config.js",
       "src/logger.js",
       "android_worker/**/*.py",

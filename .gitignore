@@ -8,6 +8,7 @@ data/
 dist/
 *.exe
 android-worker.json
+studio-api.json
 data/android-jobs/
 data/android-artifacts/
 __pycache__/
