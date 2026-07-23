@@ -47,6 +47,9 @@
       "src/worker.js",
       "src/config.js",
       "src/logger.js",
+      "android_worker/**/*.py",
+      "android-worker.example.json",
+      "requirements-android.txt",
       "package.json"
     ],
     "extraResources": [

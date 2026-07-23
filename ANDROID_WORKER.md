@@ -62,3 +62,10 @@ PREFER_ANDROID_WORKERS=1
 
 Giữ browser worker tắt nếu chỉ muốn dùng LDPlayer. Nếu chạy đồng thời, relay ưu
 tiên Android worker; đặt `PREFER_ANDROID_WORKERS=0` để trở về thứ tự kết nối cũ.
+
+## Danh sách video local
+
+Khai báo các video mặc định của Android worker trong `android-worker.json` bằng
+trường `video_urls`. Android worker bỏ qua `config-update` từ server; relay dùng
+danh sách worker đã đăng ký để chuyển job xuống. Cấu hình URL trong admin chỉ còn
+là phương án dự phòng cho browser worker cũ.

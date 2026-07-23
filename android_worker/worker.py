@@ -44,7 +44,11 @@ class AndroidWorker:
         self.cleanup_verify_timeout = float(config.get("cleanup_verify_timeout", 90))
         self.journal = JobJournal(config.get("journal_dir", "data/android-jobs"))
         self.devices: list[DeviceSlot] = []
-        self.current_urls: list[str] = []
+        self.current_urls: list[str] = [
+            str(url).strip()
+            for url in config.get("video_urls", [])
+            if str(url).strip()
+        ]
         self.video_locks: dict[str, asyncio.Lock] = {}
         self.ws = None
 
@@ -254,7 +258,13 @@ class AndroidWorker:
             "urls": self.current_urls,
             "hostname": socket.gethostname(),
             "devices": [device.serial for device in self.devices],
-            "capabilities": ["studio-deeplink", "add", "affiliate-diff", "cleanup"],
+            "capabilities": [
+                "studio-deeplink",
+                "add",
+                "affiliate-diff",
+                "cleanup",
+                "local-video-pool",
+            ],
         })
 
     async def handle_job(self, message: dict[str, Any]):
@@ -274,8 +284,9 @@ class AndroidWorker:
             async for raw in ws:
                 message = json.loads(raw)
                 if message.get("type") == "config-update":
-                    self.current_urls = list(message.get("urls") or [])
-                    await self.register()
+                    # Android workers own their video pool locally. Server-side
+                    # config updates are only retained for legacy browser workers.
+                    continue
                 elif message.get("type") == "execute-job":
                     asyncio.create_task(self.handle_job(message))
                 elif message.get("type") == "heartbeat-ack":

@@ -206,6 +206,17 @@ function getWorkerReadyUrls(configUrls) {
   return configUrls.filter(url => !!getAvailableWorker(url));
 }
 
+function getLocalAndroidWorkerUrls() {
+  const urls = [];
+  for (const worker of connectedWorkers.values()) {
+    if (worker?.ws?.readyState !== 1) continue;
+    if (worker.info?.workerType !== 'android') continue;
+    if (!worker.info?.capabilities?.includes('local-video-pool')) continue;
+    urls.push(...(worker.info?.urls || []));
+  }
+  return [...new Set(urls)];
+}
+
 // Send a job to worker and wait for result
 function sendJobToWorker(worker, jobId, targetUrl, productUrl, affiliateFallbackUrl = null) {
   return new Promise((resolve, reject) => {
@@ -265,6 +276,7 @@ app.put('/api/job-config', auth, async (req, res) => {
   const urlPattern = /https?:\/\/[^\s]+/g;
   const urls = url.match(urlPattern) || [];
   for (const [id, worker] of connectedWorkers) {
+    if (worker.info?.capabilities?.includes('local-video-pool')) continue;
     try {
       worker.ws.send(JSON.stringify({ type: 'config-update', urls }));
     } catch { }
@@ -498,12 +510,16 @@ app.post('/api/get-affiliate', async (req, res) => {
     clientCooldowns.set(rateLimitKey, Date.now());
   }
 
-  const config = loadJobConfig();
-  if (!config.url) return res.status(400).json({ error: 'No Video URL configured in admin' });
-
   const urlPattern = /https?:\/\/[^\s]+/g;
-  const urls = config.url.match(urlPattern) || [];
-  if (urls.length === 0) return res.status(400).json({ error: 'No Video URL configured in admin' });
+  const localAndroidUrls = getLocalAndroidWorkerUrls();
+  const config = loadJobConfig();
+  const serverUrls = config.url ? config.url.match(urlPattern) || [] : [];
+  const urls = localAndroidUrls.length > 0 ? localAndroidUrls : serverUrls;
+  if (urls.length === 0) {
+    return res.status(400).json({
+      error: 'Android worker chưa cấu hình video_urls local và server cũng chưa có Video URL.',
+    });
+  }
 
     if (!isWorkerConnected()) return res.status(400).json({ error: 'Worker chưa kết nối. Vui lòng chạy worker trên máy Windows.' });
 
