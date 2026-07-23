@@ -42,6 +42,30 @@ class AndroidHelperTests(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertEqual(result.identity, "lazada:3:4")
 
+    def test_new_similar_variant_is_detected_when_shelf_grows(self):
+        baseline_url = (
+            "https://www.lazada.vn/products/samsung-galaxy-a17-5g-4-128gb-"
+            "i3332640654-s16333304915.html?sub_aff_id=old"
+        )
+        submitted = (
+            "https://www.lazada.vn/products/samsung-galaxy-a17-5g-8gb128gb-"
+            "i3237396474-s15582798079.html"
+        )
+        affiliate = (
+            "https://www.lazada.vn/products/samsung-galaxy-a17-5g-8gb128gb-"
+            "i3189247573-s15178609101.html?sub_aff_id=YT3-new"
+        )
+        result = find_new_product(
+            {"lazada:3332640654:16333304915": baseline_url},
+            {
+                "lazada:3332640654:16333304915": baseline_url,
+                "lazada:3189247573:15178609101": affiliate,
+            },
+            submitted,
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.url, affiliate)
+
     def test_catalog_sku_rotation_matches_same_product_family(self):
         submitted = (
             "https://www.lazada.vn/products/moi-2025-dien-thoai-samsung-galaxy-a17-"

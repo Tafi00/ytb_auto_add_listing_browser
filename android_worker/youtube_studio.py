@@ -242,32 +242,40 @@ class StudioAutomation:
         return count
 
     def _save_editor(self, allow_already_saved: bool = False):
-        save = self._wait_any([{"resourceId": SAVE_BUTTON_ID, "enabled": True}], timeout=15)
-        if save is None:
-            if allow_already_saved and self._exists(resourceId=SAVE_BUTTON_ID):
-                self.log(f"[{self.serial}] Save đang tắt; Studio có thể đã tự lưu ở bước Done")
-                return False
-            raise RuntimeError("Nút Save không được bật")
-        try:
-            save.click()
-        except Exception as error:
-            # The click may be delivered just before Compose replaces the
-            # button. Continue into state verification for that race.
-            if "StaleObjectException" not in str(error):
-                raise
-        end = time.time() + 30
-        while time.time() < end:
-            try:
-                current = self.d(resourceId=SAVE_BUTTON_ID)
-                if not current.exists or not current.info.get("enabled", False):
+        # Compose can expose an enabled Save before the transition overlay is
+        # gone, causing the first click to be silently dropped. Re-query and
+        # retry instead of waiting 30 seconds on the stale enabled state.
+        time.sleep(0.35)
+        for attempt in range(1, 4):
+            save = self._wait_any(
+                [{"resourceId": SAVE_BUTTON_ID, "enabled": True}], timeout=8
+            )
+            if save is None:
+                if allow_already_saved and self._exists(resourceId=SAVE_BUTTON_ID):
+                    self.log(
+                        f"[{self.serial}] Save đang tắt; Studio có thể đã tự lưu ở bước Done"
+                    )
+                    return False
+                if not self._exists(resourceId=SAVE_BUTTON_ID):
                     return True
+                continue
+            try:
+                save.click()
             except Exception as error:
-                # Studio replaces Save with a spinner, invalidating UiObject2.
-                # Re-query instead of treating this expected transition as a
-                # failed save.
                 if "StaleObjectException" not in str(error):
                     raise
-            time.sleep(0.5)
+
+            end = time.time() + 8
+            while time.time() < end:
+                try:
+                    current = self.d(resourceId=SAVE_BUTTON_ID)
+                    if not current.exists or not current.info.get("enabled", False):
+                        return True
+                except Exception as error:
+                    if "StaleObjectException" not in str(error):
+                        raise
+                time.sleep(0.35)
+            self.log(f"[{self.serial}] Save chưa nhận click, thử lại {attempt}/3")
         raise RuntimeError("YouTube Studio không xác nhận Save")
 
     def add_product(self, video_id: str, product_url: str, job_id: str, on_mutation=None):

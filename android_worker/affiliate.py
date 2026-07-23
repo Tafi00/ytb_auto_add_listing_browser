@@ -152,11 +152,17 @@ def find_new_product(
         baseline_ids = set(before)
         baseline_urls = []
 
+    shelf_grew = len(current) > len(baseline_ids)
     candidates = []
     for identity, url in current.items():
         if identity in baseline_ids:
             continue
-        if any(product_similarity(url, old) >= 0.55 for old in baseline_urls):
+        # When the shelf has gained an item, a new SKU from the same product
+        # family is legitimate (for example two Galaxy A17 variants). Similarity
+        # filtering is only needed when identities rotated without count growth.
+        if not shelf_grew and any(
+            product_similarity(url, old) >= 0.55 for old in baseline_urls
+        ):
             continue
         score = product_similarity(url, expected_url) if expected_url else 0.0
         candidates.append((score, identity, url))
