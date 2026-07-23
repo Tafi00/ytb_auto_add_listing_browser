@@ -8,7 +8,7 @@
   "devices": [
     {
       "serial": "emulator-5554",
-      "video_ids": []
+      "video_url": "https://studio.youtube.com/video/VIDEO_ID/edit"
     }
   ],
   "ui_timeout": 30,

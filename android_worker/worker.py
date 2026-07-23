@@ -27,11 +27,12 @@ for stream in (sys.stdout, sys.stderr):
 class DeviceSlot:
     serial: str
     automation: StudioAutomation
-    allowed_video_ids: set[str] = field(default_factory=set)
+    video_id: str
+    video_url: str
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def accepts(self, video_id: str) -> bool:
-        return not self.allowed_video_ids or video_id in self.allowed_video_ids
+        return self.video_id == video_id
 
 
 class AndroidWorker:
@@ -44,11 +45,20 @@ class AndroidWorker:
         self.cleanup_verify_timeout = float(config.get("cleanup_verify_timeout", 90))
         self.journal = JobJournal(config.get("journal_dir", "data/android-jobs"))
         self.devices: list[DeviceSlot] = []
-        self.current_urls: list[str] = [
-            str(url).strip()
-            for url in config.get("video_urls", [])
-            if str(url).strip()
+        configured_devices = list(config.get("devices", []))
+        fallback_urls = [
+            str(url).strip() for url in config.get("video_urls", []) if str(url).strip()
         ]
+        self.current_urls = []
+        for index, item in enumerate(configured_devices):
+            item_url = item.get("video_url", "") if isinstance(item, dict) else ""
+            url = str(item_url or (fallback_urls[index] if index < len(fallback_urls) else "")).strip()
+            if url:
+                self.current_urls.append(url)
+        if len(fallback_urls) > len(configured_devices):
+            raise ValueError(
+                f"Có {len(fallback_urls)} video nhưng chỉ cấu hình {len(configured_devices)} LDPlayer"
+            )
         self.video_locks: dict[str, asyncio.Lock] = {}
         self.ws = None
 
@@ -75,9 +85,17 @@ class AndroidWorker:
         # executable while importing on Windows.
         import uiautomator2 as u2
         artifacts = self.config.get("artifact_dir", "data/android-artifacts")
-        for item in self.config.get("devices", []):
+        fallback_urls = list(self.config.get("video_urls", []))
+        for index, item in enumerate(self.config.get("devices", [])):
             serial = item["serial"] if isinstance(item, dict) else str(item)
-            allowed = item.get("video_ids", []) if isinstance(item, dict) else []
+            item_url = item.get("video_url", "") if isinstance(item, dict) else ""
+            video_url = str(
+                item_url or (fallback_urls[index] if index < len(fallback_urls) else "")
+            ).strip()
+            if not video_url:
+                self.log(f"Bỏ qua {serial}: chưa gán video local")
+                continue
+            video_id = extract_video_id(video_url)
             self.log(f"Kết nối LDPlayer {serial}...")
             device = u2.connect(serial)
             info = device.info
@@ -89,9 +107,21 @@ class AndroidWorker:
                 logger=self.log,
                 ui_timeout=float(self.config.get("ui_timeout", 30)),
             )
-            self.devices.append(DeviceSlot(serial, automation, set(allowed)))
+            self.devices.append(DeviceSlot(serial, automation, video_id, video_url))
         if not self.devices:
-            raise RuntimeError("Chưa cấu hình LDPlayer nào trong devices")
+            raise RuntimeError("Chưa có cặp LDPlayer/video nào được cấu hình")
+
+    async def warm_fixed_editors(self):
+        async def warm(slot: DeviceSlot):
+            try:
+                await asyncio.to_thread(slot.automation.open_editor, slot.video_id)
+                self.log(f"{slot.serial} sẵn sàng với video {slot.video_id}")
+            except Exception as error:
+                # Keep the worker alive. The first job for this slot will use
+                # open_editor's clean-reload fallback.
+                self.log(f"{slot.serial} chưa mở được video {slot.video_id}: {error}")
+
+        await asyncio.gather(*(warm(slot) for slot in self.devices))
 
     async def acquire_device(self, video_id: str, timeout: float = 60) -> DeviceSlot:
         end = time.monotonic() + timeout
@@ -326,6 +356,7 @@ class AndroidWorker:
 
     async def run(self):
         self.connect_devices()
+        await self.warm_fixed_editors()
         await self.recover_pending_cleanup()
         delay = 1
         while True:

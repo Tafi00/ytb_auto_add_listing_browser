@@ -82,14 +82,27 @@ function listDevices() {
     const output = execFileSync(adb, ['devices', '-l'], {
       encoding: 'utf8', timeout: 8000, windowsHide: true,
     });
-    const configured = new Set((config.devices || []).map(item => typeof item === 'string' ? item : item.serial));
+    const configDevices = config.devices || [];
+    const fallbackUrls = config.video_urls || [];
+    const configured = new Map(configDevices.map((item, index) => {
+      const serial = typeof item === 'string' ? item : item.serial;
+      const videoUrl = typeof item === 'object' && item.video_url
+        ? item.video_url
+        : fallbackUrls[index] || '';
+      return [serial, videoUrl];
+    }));
     const devices = output.split(/\r?\n/).slice(1).map(line => line.trim()).filter(Boolean).map(line => {
       const [serial, state = 'unknown'] = line.split(/\s+/, 3);
+      const videoUrl = configured.get(serial) || '';
+      const videoId = videoUrl.match(/(?:\/video\/|youtu\.be\/|[?&]v=|\/(?:shorts|live)\/)([A-Za-z0-9_-]{6,})/i)?.[1] || '';
       return {
         serial,
         state,
         model: state === 'device' ? getDeviceModel(adb, serial) : '—',
-        configured: configured.size === 0 || configured.has(serial),
+        configured: configured.has(serial),
+        assigned: !!videoUrl,
+        videoUrl,
+        videoId,
       };
     });
     return { adbFound: true, adbPath: adb, devices, error: '' };
@@ -111,6 +124,7 @@ function currentStatus() {
     pythonFound: !!findPython(),
     configFound: fs.existsSync(CONFIG_PATH),
     videoUrls: Array.isArray(config.video_urls) ? config.video_urls : [],
+    maxVideoUrls: Array.isArray(config.devices) ? config.devices.length : 0,
     ...deviceInfo,
     logs: recentLogs,
   };
@@ -181,7 +195,9 @@ async function startWorker() {
   if (!python) return { ok: false, error: 'Không tìm thấy Python' };
   if (!fs.existsSync(CONFIG_PATH)) return { ok: false, error: 'Thiếu android-worker.json' };
   const config = loadConfig();
-  const online = listDevices().devices.filter(device => device.state === 'device' && device.configured);
+  const online = listDevices().devices.filter(
+    device => device.state === 'device' && device.configured && device.assigned
+  );
   if (online.length === 0) return { ok: false, error: 'Không có LDPlayer đã cấu hình đang online' };
 
   const env = {
@@ -230,7 +246,19 @@ ipcMain.handle('android-save-video-urls', async (_, value) => {
   try {
     const videoUrls = normalizeVideoUrls(value);
     const config = loadConfig();
+    const devices = Array.isArray(config.devices) ? config.devices : [];
+    if (videoUrls.length > devices.length) {
+      throw new Error(
+        `Chỉ có ${devices.length} LDPlayer: tối đa ${devices.length} URL video`
+      );
+    }
     config.video_urls = videoUrls;
+    config.devices = devices.map((item, index) => {
+      const device = typeof item === 'string' ? { serial: item } : { ...item };
+      device.video_url = videoUrls[index] || '';
+      delete device.video_ids;
+      return device;
+    });
     fs.writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, 'utf8');
 
     const shouldRestart = !!workerProc;

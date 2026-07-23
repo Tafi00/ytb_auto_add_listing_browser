@@ -69,3 +69,8 @@ Khai báo các video mặc định của Android worker trong `android-worker.js
 trường `video_urls`. Android worker bỏ qua `config-update` từ server; relay dùng
 danh sách worker đã đăng ký để chuyển job xuống. Cấu hình URL trong admin chỉ còn
 là phương án dự phòng cho browser worker cũ.
+
+Mỗi phần tử trong `devices` được ghép cố định với URL cùng vị trí trong
+`video_urls` (hoặc trường `video_url` của chính thiết bị). Số URL không được vượt
+số LDPlayer. Worker mở editor một lần khi khởi động và tái sử dụng màn hình đó;
+deep-link chỉ được gọi lại khi không thể phục hồi trạng thái UI hiện tại.

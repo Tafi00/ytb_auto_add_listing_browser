@@ -93,6 +93,28 @@ class AndroidHelperTests(unittest.TestCase):
         )
         fetch_mock.assert_called_once()
 
+    def test_worker_pairs_each_device_with_one_local_video(self):
+        first = "https://studio.youtube.com/video/VNa64icfGAg/edit"
+        second = "https://studio.youtube.com/video/oCi1sPzCSc4/edit"
+        worker = AndroidWorker({
+            "video_urls": [first, second],
+            "devices": [
+                {"serial": "emulator-5554"},
+                {"serial": "emulator-5556"},
+            ],
+        })
+        self.assertEqual(worker.current_urls, [first, second])
+
+    def test_worker_rejects_more_videos_than_devices(self):
+        with self.assertRaisesRegex(ValueError, "2 video.*1 LDPlayer"):
+            AndroidWorker({
+                "video_urls": [
+                    "https://studio.youtube.com/video/VNa64icfGAg/edit",
+                    "https://studio.youtube.com/video/oCi1sPzCSc4/edit",
+                ],
+                "devices": [{"serial": "emulator-5554"}],
+            })
+
 
 if __name__ == "__main__":
     unittest.main()

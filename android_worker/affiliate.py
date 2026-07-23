@@ -123,6 +123,7 @@ def fetch_public_products(
             return extract_product_urls(body)
         except HTTPError as error:
             last_error = error
+            error.close()
             if error.code not in (429, 502, 503, 504) or attempt == attempts:
                 raise
         except (URLError, TimeoutError) as error:
