@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react';
 import { FiGlobe, FiZap, FiEdit3, FiFilm, FiAlertTriangle, FiList, FiFileText, FiPlus, FiX, FiTrash2, FiWifi, FiWifiOff } from 'react-icons/fi';
 import { api } from '../App';
+import { readJsonResponse } from '../response';
 
 const BrowserIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="20" height="20">
@@ -111,8 +112,8 @@ function Dashboard({ user, onLogout }) {
           method: 'POST',
           body: JSON.stringify({ productUrl: link, clientId: 'admin-test', bypassRateLimit: true }),
         });
-        const data = await res.json();
-        if (!res.ok) throw new Error(data.error || 'Request failed');
+        const data = await readJsonResponse(res);
+        if (!res.ok || data.error) throw new Error(data.error || 'Request failed');
         return data;
       }));
 

@@ -528,6 +528,32 @@ app.post('/api/get-affiliate', async (req, res) => {
       return res.status(503).json({ error: 'Tool chưa sẵn sàng: worker chưa mở browser đúng video URL. Vui lòng mở/restart browsers trong tool.' });
     }
 
+  // Keep the reverse-proxy connection active while the Android worker waits
+  // for YouTube propagation and verified cleanup. Whitespace before JSON is
+  // valid and prevents nginx/proxies from replacing the response with a plain
+  // text "Bad Gateway" page during a healthy long-running job.
+  let responseHeartbeat = null;
+  const stopResponseHeartbeat = () => {
+    if (responseHeartbeat) clearInterval(responseHeartbeat);
+    responseHeartbeat = null;
+  };
+  const finishJson = (payload, status = 200) => {
+    stopResponseHeartbeat();
+    if (res.writableEnded || res.destroyed) return;
+    if (!res.headersSent) {
+      res.status(status).json(payload);
+    } else {
+      res.end(JSON.stringify(payload));
+    }
+  };
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  responseHeartbeat = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) res.write(' ');
+  }, 10000);
+  res.on('close', stopResponseHeartbeat);
+
   try {
     // Select the tab (URL) that currently has the shortest queue
     let targetUrl = readyUrls[0];
@@ -570,7 +596,7 @@ app.post('/api/get-affiliate', async (req, res) => {
         }
       }
 
-      res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
+      finishJson({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
 
       // Save history to SQLite on success
       if (data.affiliateUrl) {
@@ -589,15 +615,11 @@ app.post('/api/get-affiliate', async (req, res) => {
       return data;
     }, { waitTimeoutMs: QUEUE_WAIT_TIMEOUT_MS });
   } catch (e) {
-    if (!res.headersSent) {
-      console.error(`[API] get-affiliate error: ${e.message}`);
-      const safeMessage = e.message.includes('không gắn giỏ')
-        ? e.message
-        : `Có lỗi xảy ra, vui lòng thử lại sau. (Chi tiết: ${e.message.substring(0, 150)})`;
-      res.status(500).json({ error: safeMessage });
-    } else {
-      console.error(`[API] get-affiliate background error after response sent: ${e.message}`);
-    }
+    console.error(`[API] get-affiliate error: ${e.message}`);
+    const safeMessage = e.message.includes('không gắn giỏ')
+      ? e.message
+      : `Có lỗi xảy ra, vui lòng thử lại sau. (Chi tiết: ${e.message.substring(0, 150)})`;
+    finishJson({ error: safeMessage }, 500);
   }
 });
 

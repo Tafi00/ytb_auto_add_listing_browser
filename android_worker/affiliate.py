@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from collections.abc import Iterable, Mapping
 from urllib.parse import unquote, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 
 URL_RE = re.compile(r"https?[^\"'<>\s{}]+", re.IGNORECASE)
@@ -99,20 +100,37 @@ def extract_product_urls(page: str) -> dict[str, str]:
     return found
 
 
-def fetch_public_products(video_id: str, timeout: float = 20) -> dict[str, str]:
+def fetch_public_products(
+    video_id: str,
+    timeout: float = 20,
+    attempts: int = 3,
+) -> dict[str, str]:
     url = f"https://www.youtube.com/watch?v={video_id}&hl=vi&gl=VN&_={int(time.time() * 1000)}"
-    request = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
-            "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
-            "Cache-Control": "no-cache",
-        },
-    )
-    with urlopen(request, timeout=timeout) as response:
-        body = response.read().decode("utf-8", errors="replace")
-    return extract_product_urls(body)
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        request = Request(
+            url,
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/131.0 Safari/537.36",
+                "Accept-Language": "vi-VN,vi;q=0.9,en;q=0.8",
+                "Cache-Control": "no-cache",
+            },
+        )
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                body = response.read().decode("utf-8", errors="replace")
+            return extract_product_urls(body)
+        except HTTPError as error:
+            last_error = error
+            if error.code not in (429, 502, 503, 504) or attempt == attempts:
+                raise
+        except (URLError, TimeoutError) as error:
+            last_error = error
+            if attempt == attempts:
+                raise
+        time.sleep(0.5 * attempt)
+    raise RuntimeError(f"Không tải được trang video: {last_error}")
 
 
 @dataclass(frozen=True)

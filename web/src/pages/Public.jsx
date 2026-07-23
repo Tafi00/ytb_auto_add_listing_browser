@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { FiLink, FiCopy, FiCheck, FiTrash2, FiAlertTriangle, FiMonitor, FiSmartphone, FiClock, FiPlay, FiArrowRight } from 'react-icons/fi';
 import { FaYoutube } from 'react-icons/fa';
+import { readJsonResponse } from '../response';
 
 const COOLDOWN_MS = 15000;
 
@@ -104,8 +105,8 @@ function Public() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ productUrl: productUrl.trim(), clientId: getClientId() }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || 'Có lỗi xảy ra');
+      const data = await readJsonResponse(res);
+      if (!res.ok || data.error) throw new Error(data.error || 'Có lỗi xảy ra');
       if (!data.affiliateUrl) {
         setError('Sản phẩm này không gắn giỏ được');
       } else {

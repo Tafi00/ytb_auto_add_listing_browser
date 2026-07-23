@@ -50,6 +50,7 @@ class StudioAutomation:
         self.log = logger
         self.ui_timeout = ui_timeout
         self.mutation_started = False
+        self.current_video_id: str | None = None
 
     def _exists(self, timeout: float = 0, **selector) -> bool:
         return bool(self.d(**selector).exists(timeout=timeout))
@@ -83,26 +84,34 @@ class StudioAutomation:
 
     def open_editor(self, video_id: str):
         target = studio_url(video_id)
+        if self.current_video_id == video_id and self._exists(resourceId=SAVE_BUTTON_ID):
+            self.log(f"[{self.serial}] Dùng lại màn hình video {video_id}")
+            return
+
         self.log(f"[{self.serial}] Mở Studio video {video_id}")
-        # Reusing MainActivity can retain a Compose bottom sheet from the prior
-        # job and make stale selectors pass. A clean app start is slower but
-        # deterministic and keeps jobs isolated.
-        self.d.app_stop(STUDIO_PACKAGE)
-        time.sleep(0.5)
-        self.d.shell(
-            [
-                "am", "start", "-W",
-                "-a", "android.intent.action.VIEW",
-                "-c", "android.intent.category.BROWSABLE",
-                "-d", target,
-                STUDIO_PACKAGE,
-            ]
-        )
-        editor = self._wait_any(
-            [{"text": "Edit video"}, {"resourceId": SAVE_BUTTON_ID}], timeout=45
-        )
-        if editor is None:
-            raise RuntimeError("YouTube Studio không mở được trang Edit video")
+        for attempt in range(2):
+            if attempt:
+                # A clean restart is only a fallback when direct navigation
+                # cannot recover the editor.
+                self.d.app_stop(STUDIO_PACKAGE)
+                time.sleep(0.35)
+            self.d.shell(
+                [
+                    "am", "start", "-W",
+                    "-a", "android.intent.action.VIEW",
+                    "-c", "android.intent.category.BROWSABLE",
+                    "-d", target,
+                    STUDIO_PACKAGE,
+                ]
+            )
+            editor = self._wait_any(
+                [{"text": "Edit video"}, {"resourceId": SAVE_BUTTON_ID}],
+                timeout=20 if attempt == 0 else 40,
+            )
+            if editor is not None:
+                self.current_video_id = video_id
+                return
+        raise RuntimeError("YouTube Studio không mở được trang Edit video")
 
     def _open_tag_products(self):
         if self._exists(text="Tag products") or self._exists(
@@ -110,17 +119,12 @@ class StudioAutomation:
         ):
             return
 
-        recycler = self.d(resourceId=EDITOR_LIST_ID)
-        if recycler.exists:
-            try:
-                recycler.fling.toEnd(max_swipes=12)
-            except Exception:
-                pass
-        # RecyclerView's fling.toEnd can stop one section early in this Studio
-        # version. Extra swipes are harmless at the real end.
-        for _ in range(6):
-            self.d.swipe_ext("up", scale=0.8)
-            time.sleep(0.15)
+        # Tagged products is near the bottom of Edit video. One long, targeted
+        # swipe is sufficient on the current Studio layout and avoids the old
+        # 12-fling + 6-swipe loop.
+        width, height = self.d.window_size()
+        self.d.swipe(width // 2, int(height * 0.84), width // 2, int(height * 0.18), 0.25)
+        time.sleep(0.35)
 
         # Some Studio releases expose this label, while Compose-only releases
         # draw it without accessibility text.
@@ -138,7 +142,6 @@ class StudioAutomation:
             # end of Edit video, Tagged products is the lowest full-width
             # clickable ViewGroup. Pick it from hierarchy instead of relying on
             # one fixed coordinate (which can hit More options on another DPI).
-            width, height = self.d.window_size()
             candidates = []
             hierarchy = ET.fromstring(self.d.dump_hierarchy(compressed=False))
             for node in hierarchy.iter("node"):
@@ -192,7 +195,7 @@ class StudioAutomation:
         # Until Compose swaps the Recently tagged feed for search results, an
         # old product's Select/Deselect button is still present. Never consume
         # those stale controls as the URL result.
-        time.sleep(3)
+        time.sleep(1)
 
     def _selected_product_count(self) -> int:
         view = self._wait_any(
@@ -266,7 +269,6 @@ class StudioAutomation:
         # cleanup instead.
         if self._wait_any([{"description": "Deselect product"}], timeout=10) is None:
             raise RuntimeError("Không xác nhận được sản phẩm đã được chọn")
-        time.sleep(2)
         self.mutation_started = True
         if on_mutation:
             on_mutation(None)
@@ -303,7 +305,6 @@ class StudioAutomation:
         selected.click()
         if self._wait_any([{"description": "Select product"}], timeout=10) is None:
             raise RuntimeError("Không xác nhận được thao tác bỏ chọn sản phẩm")
-        time.sleep(2)
         done = self._wait_any([{"text": "Done"}, {"description": "Done"}], timeout=10)
         if done is None:
             raise RuntimeError("Cleanup không tìm thấy nút Done")

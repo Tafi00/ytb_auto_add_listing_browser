@@ -1,7 +1,10 @@
 import unittest
+from unittest.mock import patch
+from urllib.error import HTTPError
 
 from android_worker.affiliate import (
-    extract_product_urls, find_new_product, product_identity, product_similarity,
+    extract_product_urls, fetch_public_products, find_new_product, product_identity,
+    product_similarity,
 )
 from android_worker.youtube_studio import extract_video_id, studio_url
 
@@ -49,6 +52,28 @@ class AndroidHelperTests(unittest.TestCase):
         flower = "https://www.lazada.vn/products/flower-knows-bot-highlight-i1-s2.html"
         self.assertGreaterEqual(product_similarity(submitted, rotated), 0.45)
         self.assertLess(product_similarity(submitted, flower), 0.45)
+
+    @patch("android_worker.affiliate.time.sleep")
+    @patch("android_worker.affiliate.urlopen")
+    def test_public_product_fetch_retries_bad_gateway(self, urlopen_mock, sleep_mock):
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                return False
+
+            def read(self):
+                return b'"https://www.lazada.vn/products/a-i1-s2.html?sub_aff_id=ok"'
+
+        urlopen_mock.side_effect = [
+            HTTPError("https://youtube.test", 502, "Bad Gateway", {}, None),
+            Response(),
+        ]
+        products = fetch_public_products("VNa64icfGAg", attempts=2)
+        self.assertEqual(len(products), 1)
+        self.assertEqual(urlopen_mock.call_count, 2)
+        sleep_mock.assert_called_once()
 
 
 if __name__ == "__main__":
