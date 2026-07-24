@@ -140,24 +140,44 @@ async function ensureConnection(enabled) {
 
 async function startWorker(mode) {
   const headed = mode === 'login';
+  const config = loadConfig();
+  let videoUrls;
+  try {
+    videoUrls = normalizeVideoUrls(config.video_urls || []);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
   let status = await getPanelStatus();
 
   if (status?.apiMode) {
     if (Boolean(status.headless) === headed) {
       await panelRequest('/api/toggle-headless', { method: 'POST', timeoutMs: 35_000 });
     }
+    const registeredUrls = Array.isArray(status.localUrls) ? status.localUrls : [];
+    const urlsChanged = JSON.stringify(registeredUrls) !== JSON.stringify(videoUrls);
+    const missingBrowsers = (status.browsers?.length || 0) !== videoUrls.length;
+    if (urlsChanged || missingBrowsers) {
+      addLog(`Đang đồng bộ ${videoUrls.length} video vào API worker...`);
+      await panelRequest('/api/video-urls', {
+        method: 'POST',
+        body: { videoUrls: videoUrls.join('\n') },
+        timeoutMs: 60_000,
+      });
+      status = await getPanelStatus();
+    }
+    if ((status?.browsers?.length || 0) !== videoUrls.length) {
+      throw new Error(
+        `Chrome chỉ mở được ${status?.browsers?.length || 0}/${videoUrls.length} video. `
+        + 'Hãy bấm Dừng rồi thử lại.',
+      );
+    }
     workerMode = mode;
     await ensureConnection(!headed);
     addLog(headed
-      ? 'Đã mở Chrome để đăng nhập. Hoàn tất đăng nhập rồi bấm “Chạy API nền”.'
+      ? `Đã mở ${videoUrls.length} cửa sổ Chrome để đăng nhập. Hoàn tất đăng nhập rồi bấm “Chạy API nền”.`
       : 'API worker đang chạy nền và đã kết nối relay.');
     emit('api-status-changed');
     return { ok: true };
-  }
-
-  const config = loadConfig();
-  if (!Array.isArray(config.video_urls) || !config.video_urls.length) {
-    return { ok: false, error: 'Hãy lưu ít nhất một URL video trước' };
   }
 
   const env = {
@@ -169,6 +189,7 @@ async function startWorker(mode) {
     HEADLESS: headed ? 'false' : 'true',
     CONTROL_PANEL_PORT: '19200',
     SESSIONS_DIR: './sessions',
+    STUDIO_API_CONFIG_PATH: CONFIG_PATH,
   };
 
   workerProc = spawn(process.execPath, [WORKER_PATH], {
@@ -182,6 +203,21 @@ async function startWorker(mode) {
   addLog(headed ? 'Đang mở Chrome cho lần đăng nhập đầu tiên...' : 'Đang khởi động API worker nền...');
 
   status = await waitForPanel();
+  if ((status?.browsers?.length || 0) !== videoUrls.length) {
+    addLog(`Đang đồng bộ ${videoUrls.length} video vào API worker...`);
+    await panelRequest('/api/video-urls', {
+      method: 'POST',
+      body: { videoUrls: videoUrls.join('\n') },
+      timeoutMs: 60_000,
+    });
+    status = await getPanelStatus();
+  }
+  if ((status?.browsers?.length || 0) !== videoUrls.length) {
+    throw new Error(
+      `Chrome chỉ mở được ${status?.browsers?.length || 0}/${videoUrls.length} video. `
+      + 'Hãy bấm Dừng rồi thử lại.',
+    );
+  }
   await ensureConnection(!headed);
   emit('api-status-changed');
   return { ok: true };

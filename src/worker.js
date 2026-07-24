@@ -55,8 +55,13 @@ function getRegistrationInfo() {
 }
 
 function loadLocalStudioApiUrls() {
-    const apiConfigPath = path.resolve(__dirname, '..', 'studio-api.json');
-    const androidConfigPath = path.resolve(__dirname, '..', 'android-worker.json');
+    const configRoot = process.env.STUDIO_API_CONFIG_PATH
+        ? path.dirname(path.resolve(process.env.STUDIO_API_CONFIG_PATH))
+        : process.cwd();
+    const apiConfigPath = process.env.STUDIO_API_CONFIG_PATH
+        ? path.resolve(process.env.STUDIO_API_CONFIG_PATH)
+        : path.resolve(configRoot, 'studio-api.json');
+    const androidConfigPath = path.resolve(configRoot, 'android-worker.json');
     try {
         const configPath = fs.existsSync(apiConfigPath) ? apiConfigPath : androidConfigPath;
         const config = JSON.parse(fs.readFileSync(configPath, 'utf8'));
@@ -72,7 +77,9 @@ function loadLocalStudioApiUrls() {
 }
 
 function saveLocalStudioApiUrls(urls) {
-    const configPath = path.resolve(__dirname, '..', 'studio-api.json');
+    const configPath = process.env.STUDIO_API_CONFIG_PATH
+        ? path.resolve(process.env.STUDIO_API_CONFIG_PATH)
+        : path.resolve(process.cwd(), 'studio-api.json');
     fs.writeFileSync(configPath, `${JSON.stringify({ video_urls: urls }, null, 2)}\n`, 'utf8');
 }
 
