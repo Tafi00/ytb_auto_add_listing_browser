@@ -23,6 +23,7 @@ import { WebSocketServer } from 'ws';
 import { SessionManager } from './session-manager.js';
 import { CONFIG } from './config.js';
 import { addHistory, getHistory, getTotalLinks, clearAllHistory } from './history-db.js';
+import { normalizeRelayJobError } from './relay-response.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -648,32 +649,10 @@ app.post('/api/get-affiliate', async (req, res) => {
     }, { waitTimeoutMs: QUEUE_WAIT_TIMEOUT_MS });
   } catch (e) {
     console.error(`[API] get-affiliate error: ${e.message}`);
-    const knownWorkerError = e instanceof WorkerJobError;
-    const code = e.code || (/queue/i.test(e.message) ? 'QUEUE_TIMEOUT' : 'RELAY_ERROR');
-    const stage = e.stage || (/queue/i.test(e.message) ? 'queue' : 'relay');
-    const retryable = knownWorkerError ? e.retryable : true;
-    const safeMessage = knownWorkerError
-      ? e.message
-      : 'Relay không thể hoàn tất yêu cầu lúc này. Vui lòng thử lại.';
-    const status = code === 'PRODUCT_NOT_FOUND'
-      ? 422
-      : code === 'YOUTUBE_RATE_LIMIT'
-        ? 429
-        : ['WORKER_TIMEOUT', 'QUEUE_TIMEOUT'].includes(code)
-          ? 504
-          : ['WORKER_DISCONNECTED', 'VIDEO_NOT_READY', 'AUTH_SESSION_NOT_READY', 'AUTH_REQUIRED'].includes(code)
-            ? 503
-            : 500;
-    finishJson({
-      error: safeMessage,
-      code,
-      stage,
-      retryable,
-      ...(e.cleanupSucceeded === false ? {
-        cleanupSucceeded: false,
-        cleanupError: e.cleanupError || 'Không thể xác nhận đã gỡ sản phẩm.',
-      } : {}),
-    }, status);
+    const response = normalizeRelayJobError(e, {
+      knownWorkerError: e instanceof WorkerJobError,
+    });
+    finishJson(response.payload, response.status);
   }
 });
 

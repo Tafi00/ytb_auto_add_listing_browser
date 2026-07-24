@@ -11,7 +11,9 @@ import http from 'http';
 import WebSocket from 'ws';
 import {
     extractMarketplaceListingIdentity,
+    findBestContentMatch,
     findExactOfferIndex,
+    MarketplaceOfferCache,
     StudioInternalApi,
 } from './studio-internal-api.js';
 
@@ -34,6 +36,12 @@ const USE_STUDIO_INTERNAL_API = process.env.USE_STUDIO_INTERNAL_API === '1';
 const USE_LOCAL_STUDIO_API_URLS =
     USE_STUDIO_INTERNAL_API && process.env.STUDIO_API_USE_LOCAL_URLS !== '0';
 const LAZADA_YOUTUBE_EXLAZ = process.env.LAZADA_YOUTUBE_EXLAZ || 'd_2:mm_254241245_236353075_2194553061:vn2880030:00:';
+const PRODUCT_FOUND_CACHE_TTL_MS = parseInt(
+    process.env.PRODUCT_FOUND_CACHE_TTL_MS || `${6 * 60 * 60_000}`,
+);
+const PRODUCT_NOT_FOUND_CACHE_TTL_MS = parseInt(
+    process.env.PRODUCT_NOT_FOUND_CACHE_TTL_MS || `${15 * 60_000}`,
+);
 
 // State
 let ws = null;
@@ -47,6 +55,10 @@ let _playwrightChromium = null;
 let recentLogs = []; // Keep last 100 logs for control panel
 let jobStats = { total: 0, success: 0, failed: 0 };
 const pagesWithDialogHandler = new WeakSet();
+const marketplaceOfferCache = new MarketplaceOfferCache({
+    successTtlMs: PRODUCT_FOUND_CACHE_TTL_MS,
+    notFoundTtlMs: PRODUCT_NOT_FOUND_CACHE_TTL_MS,
+});
 
 function getRegistrationInfo() {
     if (!USE_STUDIO_INTERNAL_API) {
@@ -551,8 +563,14 @@ function setupPageDialogHandler(page, port) {
     if (pagesWithDialogHandler.has(page)) return;
     pagesWithDialogHandler.add(page);
     page.on('dialog', async (dialog) => {
-        log(`[Port ${port}] Unexpected dialog: "${dialog.message()}" — auto-dismissing`);
-        await dialog.dismiss().catch(() => { });
+        const type = dialog.type();
+        const action = type === 'beforeunload' ? 'accepting navigation' : 'auto-dismissing';
+        log(`[Port ${port}] Unexpected ${type} dialog: "${dialog.message()}" — ${action}`);
+        if (type === 'beforeunload') {
+            await dialog.accept().catch(() => { });
+        } else {
+            await dialog.dismiss().catch(() => { });
+        }
     });
 }
 
@@ -1096,9 +1114,14 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     // Setup dialog handler to auto-dismiss YouTube Studio alerts (e.g. "Sorry, we were not able to save your video")
     let dialogDismissed = false;
     const dialogHandler = (dialog) => {
-        log(`Dialog detected: "${dialog.message()}" — auto-dismissing`);
-        dialogDismissed = true;
-        dialog.dismiss().catch(() => { });
+        const type = dialog.type();
+        log(`Dialog detected (${type}): "${dialog.message()}"`);
+        if (type === 'beforeunload') {
+            dialog.accept().catch(() => { });
+        } else {
+            dialogDismissed = true;
+            dialog.dismiss().catch(() => { });
+        }
     };
     page.on('dialog', dialogHandler);
 
@@ -2273,6 +2296,115 @@ async function fetchAffiliateUrl(
 
 // ==================== Job Execution ====================
 
+function attachGroupUiSelection(offer, offerGroupItem, variantIndex) {
+    const selectedOffer = structuredClone(offer);
+    selectedOffer._workerUiSelection = {
+        type: 'offer-group-variant',
+        variantIndex,
+        rawMerchantOfferId: String(
+            selectedOffer?.itemId?.rawMerchantOfferId || '',
+        ),
+        gpcId: String(
+            offerGroupItem?.itemId?.gpcIdWithMerchantScope?.gpcId || '',
+        ),
+    };
+    return selectedOffer;
+}
+
+async function selectExactOfferGroupVariant(page, product, exactOffer) {
+    const selection = exactOffer?._workerUiSelection;
+    if (
+        selection?.type !== 'offer-group-variant'
+        || !Number.isInteger(selection.variantIndex)
+        || selection.variantIndex < 0
+    ) {
+        return false;
+    }
+
+    const productTitle = product.locator(
+        'div.product-title.style-scope.ytshopping-product[role="button"]',
+    ).first();
+    await productTitle.waitFor({ state: 'visible', timeout: 5_000 });
+    await productTitle.click();
+
+    const offerGroupLabel = page.locator(
+        '.ytshoppingProductDetailsOfferGroupLabelContent:visible',
+    ).first();
+    await offerGroupLabel.waitFor({ state: 'visible', timeout: 5_000 });
+    await offerGroupLabel.click();
+
+    // The component itself uses a zero-sized host, so Playwright does not
+    // consider `ytshopping-variant-selection` visible even while its dialog is
+    // open. Anchor all actions to its real dialog instead.
+    const variantPanel = page.locator('ytshopping-variant-selection').last();
+    await variantPanel.waitFor({ state: 'attached', timeout: 5_000 });
+    const variantDialog = variantPanel.locator(
+        'xpath=ancestor::tp-yt-paper-dialog[1]',
+    );
+    await variantDialog.waitFor({ state: 'visible', timeout: 5_000 });
+
+    const automaticSwitch = variantPanel.locator(
+        'ytcp-switch button[role="switch"]',
+    ).first();
+    if (
+        await automaticSwitch.getAttribute('aria-checked').catch(() => null)
+        === 'true'
+    ) {
+        await automaticSwitch.click();
+    }
+
+    const variantCards = variantPanel.locator(
+        'ytshopping-variant-selection-product',
+    );
+    await variantCards.first().waitFor({ state: 'visible', timeout: 5_000 });
+    const variantCount = await variantCards.count();
+    if (selection.variantIndex >= variantCount) {
+        throw createWorkerError(
+            `Danh sách phiên bản YouTube đã thay đổi (${variantCount} phiên bản, cần vị trí ${selection.variantIndex + 1}).`,
+            'EXACT_VARIANT_NOT_FOUND',
+            'product-selection',
+            true,
+        );
+    }
+
+    const card = variantCards.nth(selection.variantIndex);
+    const cardText = await card.innerText().catch(() => '');
+    const expectedTitle = String(exactOffer?.title || '').trim();
+    const normalizeTitle = value => String(value || '')
+        .normalize('NFC')
+        .replace(/\s+/g, ' ')
+        .trim()
+        .toLocaleLowerCase();
+    if (
+        expectedTitle
+        && !normalizeTitle(cardText).includes(normalizeTitle(expectedTitle))
+    ) {
+        throw createWorkerError(
+            'Thứ tự phiên bản sản phẩm trên YouTube đã thay đổi. Vui lòng thử lại.',
+            'EXACT_VARIANT_ORDER_CHANGED',
+            'product-selection',
+            true,
+        );
+    }
+
+    const variantTag = card.locator('ytcp-icon-button#tag-button').first();
+    await variantTag.waitFor({ state: 'visible', timeout: 5_000 });
+    await variantTag.click();
+
+    const confirmTag = variantDialog.locator(
+        'ytcp-button#tag-button button',
+    ).last();
+    await confirmTag.waitFor({ state: 'visible', timeout: 5_000 });
+    await confirmTag.evaluate(button => button.click());
+
+    await variantDialog.waitFor({ state: 'hidden', timeout: 5_000 });
+    log(
+        `Selected exact offer-group variant ${selection.variantIndex + 1}/${variantCount}`
+        + ` (${selection.rawMerchantOfferId || 'unknown offer'}).`,
+    );
+    return true;
+}
+
 async function resolveExactMarketplaceOffer(
     api,
     videoId,
@@ -2282,9 +2414,25 @@ async function resolveExactMarketplaceOffer(
     const identity = extractMarketplaceListingIdentity(listingIdentityUrl);
     if (!identity) return null;
 
+    const cached = marketplaceOfferCache.get(listingIdentityUrl);
+    if (cached?.status === 'found') {
+        log(`Resolved exact marketplace offer ${identity.offerId} from cache.`);
+        return cached.offer;
+    }
+    if (cached?.status === 'not_found') {
+        log(`Skipping repeated catalog lookup for unavailable offer ${identity.offerId}.`);
+        throw createWorkerError(
+            'Sản phẩm này không gắn giỏ được',
+            'PRODUCT_NOT_FOUND',
+            'product-selection',
+            false,
+        );
+    }
+
     const searchPayload = await api.searchProductsRaw(videoId, productUrl);
     const searchItems = searchPayload?.shoppingProducts?.items || [];
     if (searchItems.length === 0) {
+        marketplaceOfferCache.setNotFound(listingIdentityUrl);
         throw createWorkerError(
             'Sản phẩm này không gắn giỏ được',
             'PRODUCT_NOT_FOUND',
@@ -2295,13 +2443,16 @@ async function resolveExactMarketplaceOffer(
     const directIndex = findExactOfferIndex(searchItems, listingIdentityUrl);
     if (directIndex >= 0) {
         log(`Resolved exact marketplace offer ${identity.offerId} directly (${directIndex + 1}/${searchItems.length}).`);
-        return searchItems[directIndex];
+        const exactOffer = searchItems[directIndex];
+        marketplaceOfferCache.setFound(listingIdentityUrl, exactOffer);
+        return exactOffer;
     }
 
     const offerGroupItem = searchItems.find(
         item => item?.itemId?.gpcIdWithMerchantScope?.gpcId,
     );
     if (!offerGroupItem) {
+        marketplaceOfferCache.setNotFound(listingIdentityUrl);
         throw createWorkerError(
             'Sản phẩm này không gắn giỏ được',
             'PRODUCT_NOT_FOUND',
@@ -2310,22 +2461,102 @@ async function resolveExactMarketplaceOffer(
         );
     }
 
-    const offersPayload = await api.getOffersForOfferGroupRaw(
-        videoId,
-        offerGroupItem,
-    );
-    const offers = offersPayload?.offersForOfferGroup?.items || [];
-    const exactIndex = findExactOfferIndex(offers, listingIdentityUrl);
-    if (exactIndex < 0) {
-        throw createWorkerError(
-            'Sản phẩm này không gắn giỏ được',
-            'PRODUCT_NOT_FOUND',
-            'product-selection',
-            false,
-        );
+    const fallbackTitle = String(offerGroupItem.title || '').trim();
+    const groupStarted = Date.now();
+    const [groupResult, titleResult, productInfoResult] = await Promise.allSettled([
+        api.getOffersForOfferGroupRaw(videoId, offerGroupItem),
+        fallbackTitle
+            ? api.searchProductsRaw(videoId, fallbackTitle, { maxResults: 200 })
+            : Promise.resolve(null),
+        getProductInfo(listingIdentityUrl),
+    ]);
+
+    let offers = [];
+    if (groupResult.status === 'fulfilled') {
+        offers = groupResult.value?.offersForOfferGroup?.items || [];
+        const exactIndex = findExactOfferIndex(offers, listingIdentityUrl);
+        if (exactIndex >= 0) {
+            const exactOffer = attachGroupUiSelection(
+                offers[exactIndex],
+                offerGroupItem,
+                exactIndex,
+            );
+            marketplaceOfferCache.setFound(listingIdentityUrl, exactOffer);
+            log(`Resolved exact marketplace offer ${identity.offerId} by API (${exactIndex + 1}/${offers.length}) in ${Date.now() - groupStarted}ms.`);
+            return exactOffer;
+        }
     }
-    log(`Resolved exact marketplace offer ${identity.offerId} by API (${exactIndex + 1}/${offers.length}).`);
-    return offers[exactIndex];
+
+    let titleItems = [];
+    if (titleResult.status === 'fulfilled') {
+        titleItems = titleResult.value?.shoppingProducts?.items || [];
+        const exactIndex = findExactOfferIndex(titleItems, listingIdentityUrl);
+        if (exactIndex >= 0) {
+            const exactOffer = titleItems[exactIndex];
+            marketplaceOfferCache.setFound(listingIdentityUrl, exactOffer);
+            log(`Resolved exact marketplace offer ${identity.offerId} by expanded title search (${exactIndex + 1}/${titleItems.length}) in ${Date.now() - groupStarted}ms.`);
+            return exactOffer;
+        }
+    }
+
+    const expectedInfo = productInfoResult.status === 'fulfilled'
+        ? productInfoResult.value
+        : null;
+    const contentMatch = findBestContentMatch(
+        [...offers, ...titleItems, ...searchItems],
+        expectedInfo,
+        listingIdentityUrl,
+    );
+    if (contentMatch) {
+        const matchedOffer = structuredClone(contentMatch.item);
+        const groupVariantIndex = offers.indexOf(contentMatch.item);
+        if (groupVariantIndex >= 0) {
+            matchedOffer._workerUiSelection = attachGroupUiSelection(
+                contentMatch.item,
+                offerGroupItem,
+                groupVariantIndex,
+            )._workerUiSelection;
+        }
+        const matchedIdentity = extractMarketplaceListingIdentity(
+            matchedOffer.targetUrl || '',
+        );
+        matchedOffer._workerResolution = {
+            matchType: 'content',
+            originalOfferId: identity.offerId,
+            matchedOfferId: matchedIdentity?.offerId
+                || matchedOffer.itemId?.rawMerchantOfferId
+                || '',
+            matchedUrl: matchedOffer.targetUrl || '',
+            score: Number(contentMatch.score.toFixed(4)),
+            titleScore: Number(contentMatch.titleScore.toFixed(4)),
+            priceDiffRatio: contentMatch.priceDiffRatio == null
+                ? null
+                : Number(contentMatch.priceDiffRatio.toFixed(4)),
+        };
+        marketplaceOfferCache.setFound(listingIdentityUrl, matchedOffer);
+        log(
+            `Exact offer ${identity.offerId} is unavailable; using high-confidence content match `
+            + `${matchedOffer._workerResolution.matchedOfferId || '(unknown)'} `
+            + `(title=${matchedOffer._workerResolution.titleScore}, `
+            + `priceDiff=${matchedOffer._workerResolution.priceDiffRatio ?? 'n/a'}).`,
+        );
+        return matchedOffer;
+    }
+
+    if (groupResult.status === 'rejected') {
+        throw groupResult.reason;
+    }
+    if (titleResult.status === 'rejected') {
+        log(`Expanded title search failed; exact offer was not in the offer group: ${shortErrorMessage(titleResult.reason)}`);
+    }
+
+    marketplaceOfferCache.setNotFound(listingIdentityUrl);
+    throw createWorkerError(
+        'Sản phẩm này không gắn giỏ được',
+        'PRODUCT_NOT_FOUND',
+        'product-selection',
+        false,
+    );
 }
 
 async function bootstrapStudioWriteSession(
@@ -2335,31 +2566,109 @@ async function bootstrapStudioWriteSession(
     api,
     retryCount = 0,
     listingIdentityUrl = productUrl,
+    preResolvedExactOffer = null,
+    onProductMutation = null,
 ) {
-    await page.waitForLoadState('domcontentloaded', { timeout: 20_000 });
-    const productsButton = page.locator(
-        'ytcp-button#products-description-button:visible',
-    ).first();
-    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit:visible').first();
+    const editorUrl = `https://studio.youtube.com/video/${videoId}/edit`;
+    const maxControlRecoveryAttempts = 3;
+    let productsButton;
+    let editButton;
+    let controlsReady = false;
+    let lastControlsError = null;
 
-    try {
-        const initialControlsTimeout = retryCount === 0 ? 3_500 : 20_000;
-        await Promise.race([
-            editButton.waitFor({ state: 'visible', timeout: initialControlsTimeout }),
-            productsButton.waitFor({ state: 'visible', timeout: initialControlsTimeout }),
-        ]);
-        if (!await editButton.isVisible().catch(() => false)) {
-            await productsButton.waitFor({ state: 'visible', timeout: 5_000 });
-            await clickStudioControl(productsButton);
+    for (
+        let controlsAttempt = retryCount;
+        controlsAttempt < maxControlRecoveryAttempts;
+        controlsAttempt++
+    ) {
+        try {
+            await page.waitForLoadState('domcontentloaded', { timeout: 20_000 })
+                .catch(() => { });
+            if (page.isClosed()) {
+                throw new Error('Target page has been closed');
+            }
+
+            productsButton = page.locator(
+                'ytcp-button#products-description-button:visible',
+            ).first();
+            editButton = page.locator(
+                'ytcp-icon-button#shopping-toolbar-edit:visible',
+            ).first();
+
+            const controlsTimeout = controlsAttempt === 0 ? 12_000 : 25_000;
+            await Promise.race([
+                editButton.waitFor({ state: 'visible', timeout: controlsTimeout }),
+                productsButton.waitFor({ state: 'visible', timeout: controlsTimeout }),
+            ]);
+            if (!await editButton.isVisible().catch(() => false)) {
+                await clickStudioControl(productsButton);
+                await editButton.waitFor({ state: 'visible', timeout: 8_000 });
+            }
+            controlsReady = true;
+            if (controlsAttempt > 0) {
+                log(`Studio product controls recovered on attempt ${controlsAttempt + 1}/${maxControlRecoveryAttempts}.`);
+            }
+            break;
+        } catch (error) {
+            lastControlsError = error;
+            if (isTargetClosedError(error) || page.isClosed()) throw error;
+
+            const currentUrl = page.url();
+            const bodyText = await page.locator('body').innerText({ timeout: 2_000 })
+                .catch(() => '');
+            if (
+                /accounts\.google\.com|\/signin/i.test(currentUrl)
+                || /sign in to youtube|đăng nhập vào youtube/i.test(bodyText)
+            ) {
+                throw createWorkerError(
+                    'Phiên YouTube Studio đã đăng xuất. Hãy đăng nhập lại browser worker.',
+                    'STUDIO_LOGIN_REQUIRED',
+                    'authentication',
+                    false,
+                );
+            }
+
+            if (controlsAttempt + 1 >= maxControlRecoveryAttempts) break;
+
+            api.invalidateWriteSession();
+            await page.keyboard.press('Escape').catch(() => { });
+            if (controlsAttempt === 0) {
+                log('Studio product controls were not ready; reloading the editor.');
+                await page.reload({ waitUntil: 'domcontentloaded', timeout: 30_000 })
+                    .catch(async reloadError => {
+                        log(`Studio reload did not finish: ${shortErrorMessage(reloadError)}. Reopening the video editor.`);
+                        await page.goto(editorUrl, {
+                            waitUntil: 'domcontentloaded',
+                            timeout: 30_000,
+                        });
+                    });
+            } else {
+                log('Studio product controls are still unavailable; reopening the exact video editor URL.');
+                await page.goto(editorUrl, {
+                    waitUntil: 'domcontentloaded',
+                    timeout: 30_000,
+                }).catch(async gotoError => {
+                    log(`Studio editor reopen did not finish: ${shortErrorMessage(gotoError)}. Retrying from a blank page.`);
+                    await page.goto('about:blank', {
+                        waitUntil: 'commit',
+                        timeout: 10_000,
+                    });
+                    await page.goto(editorUrl, {
+                        waitUntil: 'domcontentloaded',
+                        timeout: 30_000,
+                    });
+                });
+            }
+            await page.waitForTimeout(1_500);
         }
-        await editButton.waitFor({ state: 'visible', timeout: 5_000 });
-    } catch (error) {
-        if (retryCount >= 1) throw error;
-        log('Studio product controls were not ready; reloading once.');
-        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
-        api.invalidateWriteSession();
-        return bootstrapStudioWriteSession(
-            page, videoId, productUrl, api, retryCount + 1, listingIdentityUrl,
+    }
+
+    if (!controlsReady) {
+        throw createWorkerError(
+            `YouTube Studio chưa tải được phần sản phẩm sau ${maxControlRecoveryAttempts} lần phục hồi: ${shortErrorMessage(lastControlsError)}`,
+            'STUDIO_CONTROLS_NOT_READY',
+            'product-selection',
+            true,
         );
     }
     await clickStudioControl(editButton);
@@ -2378,12 +2687,13 @@ async function bootstrapStudioWriteSession(
 
     await search.fill(productUrl);
     await search.press('Enter');
-    const exactOffer = await resolveExactMarketplaceOffer(
-        api,
-        videoId,
-        productUrl,
-        listingIdentityUrl,
-    );
+    const exactOffer = preResolvedExactOffer
+        || await resolveExactMarketplaceOffer(
+            api,
+            videoId,
+            productUrl,
+            listingIdentityUrl,
+        );
     const searchResult = page.locator(
         'ytshopping-product-picker-search-result:visible',
     ).first();
@@ -2393,46 +2703,65 @@ async function bootstrapStudioWriteSession(
     const tag = searchResult.locator(
         'ytcp-icon-button.tag-product-button',
     ).first();
-    const optionsLabel = product.locator('yt-formatted-string').filter({
-        hasText: /\d+\+?\s*options?/i,
-    }).first();
-    const hasOptions = await optionsLabel.isVisible({ timeout: 800 }).catch(() => false);
 
-    let writeTokenTag = tag;
-    if (hasOptions) {
-        writeTokenTag = null;
-        const results = page.locator(
-            'ytshopping-product-picker-search-result:visible',
-        );
-        for (let index = 1; index < await results.count(); index++) {
-            const candidateProduct = results.nth(index)
-                .locator('ytshopping-product').first();
-            await candidateProduct.hover();
-            const candidateTag = results.nth(index)
-                .locator('ytcp-icon-button.tag-product-button').first();
-            if (await candidateTag.isVisible({ timeout: 1000 }).catch(() => false)) {
-                writeTokenTag = candidateTag;
-                break;
-            }
+    const rawMerchantOfferId = String(
+        exactOffer?.itemId?.rawMerchantOfferId || '',
+    );
+    let taggedExactOffer = false;
+    if (rawMerchantOfferId) {
+        const directResult = page.locator(
+            `ytshopping-product-picker-search-result[ve-sibling-key$="-${rawMerchantOfferId}"]:visible`,
+        ).first();
+        if (await directResult.isVisible({ timeout: 500 }).catch(() => false)) {
+            const directProduct = directResult.locator('ytshopping-product').first();
+            await directProduct.hover();
+            const directTag = directResult.locator(
+                'ytcp-icon-button.tag-product-button',
+            ).first();
+            await directTag.waitFor({ state: 'visible', timeout: 5_000 });
+            await directTag.evaluate(element => {
+                const button = element.shadowRoot?.querySelector('button')
+                    || element.querySelector('button')
+                    || element;
+                button.click();
+            });
+            taggedExactOffer = true;
+            log(`Selected direct exact merchant offer ${rawMerchantOfferId}.`);
         }
-        if (!writeTokenTag) {
+    }
+
+    if (!taggedExactOffer && exactOffer?._workerUiSelection) {
+        taggedExactOffer = await selectExactOfferGroupVariant(
+            page,
+            product,
+            exactOffer,
+        );
+    }
+
+    if (!taggedExactOffer) {
+        const firstVeSiblingKey = await searchResult.getAttribute('ve-sibling-key');
+        const firstResultIsGroup = /^\d+:\d+$/.test(
+            String(firstVeSiblingKey || ''),
+        );
+        if (firstResultIsGroup && rawMerchantOfferId) {
             throw createWorkerError(
-                'Không tìm được sản phẩm tạm để tạo mã xác thực ghi của YouTube Studio.',
-                'WRITE_TOKEN_PRODUCT_NOT_FOUND',
-                'authentication',
+                `Không chọn được đúng merchant offer ${rawMerchantOfferId} trong nhóm sản phẩm.`,
+                'EXACT_VARIANT_NOT_FOUND',
+                'product-selection',
                 true,
             );
         }
-    } else {
+
         await product.hover();
+        await tag.waitFor({ state: 'visible', timeout: 15_000 });
+        await tag.evaluate(element => {
+            const button = element.shadowRoot?.querySelector('button')
+                || element.querySelector('button')
+                || element;
+            button.click();
+        });
     }
-    await writeTokenTag.waitFor({ state: 'visible', timeout: 15_000 });
-    await writeTokenTag.evaluate(element => {
-        const button = element.shadowRoot?.querySelector('button')
-            || element.querySelector('button')
-            || element;
-        button.click();
-    });
+    onProductMutation?.();
     await page.waitForFunction(() => {
         const next = document.querySelector('ytcp-button#picker-next-button button');
         return next && !next.disabled && next.getAttribute('aria-disabled') !== 'true';
@@ -2453,7 +2782,14 @@ async function bootstrapStudioWriteSession(
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
         api.invalidateWriteSession();
         return bootstrapStudioWriteSession(
-            page, videoId, productUrl, api, retryCount + 1, listingIdentityUrl,
+            page,
+            videoId,
+            productUrl,
+            api,
+            retryCount + 1,
+            listingIdentityUrl,
+            preResolvedExactOffer,
+            onProductMutation,
         );
     }
     await save.click({ force: true });
@@ -2646,23 +2982,22 @@ async function executeStudioApiJob(
         log(`Resolved ${listingIdentity.marketplace} listing identity: ${listingIdentity.offerId}`);
     }
     let productAdded = false;
-    let uiBootstrapStarted = false;
+    let uiProductMutationStarted = false;
     let primaryError = null;
 
     try {
         const addStarted = Date.now();
-        let exactOffer = null;
+        let exactOffer = await resolveExactMarketplaceOffer(
+            api,
+            videoId,
+            productUrl,
+            listingIdentityUrl,
+        );
         let usedCachedWriteSession = api.hasWriteSession();
 
         if (usedCachedWriteSession) {
             log('Reusing the existing Studio write session.');
             try {
-                exactOffer = await resolveExactMarketplaceOffer(
-                    api,
-                    videoId,
-                    productUrl,
-                    listingIdentityUrl,
-                );
                 const cachedItemId = exactOffer?.itemId
                     || (await api.searchProduct(videoId, productUrl)).shoppingItemId;
                 await api.updateProducts(videoId, [cachedItemId]);
@@ -2677,7 +3012,6 @@ async function executeStudioApiJob(
 
         if (!usedCachedWriteSession) {
             log('Creating a fresh Studio write token with one automatic save.');
-            uiBootstrapStarted = true;
             ({ exactOffer } = await bootstrapStudioWriteSession(
                 page,
                 videoId,
@@ -2685,16 +3019,34 @@ async function executeStudioApiJob(
                 api,
                 0,
                 listingIdentityUrl,
+                exactOffer,
+                () => {
+                    uiProductMutationStarted = true;
+                },
             ));
             productAdded = true;
         }
 
-        let shoppingItemId = exactOffer?.itemId?.rawMerchantOfferId
+        const expectedShoppingItemId = String(
+            exactOffer?.itemId?.rawMerchantOfferId || '',
+        );
+        let shoppingItemId = expectedShoppingItemId
             || api.getWriteShoppingItemId();
         if (!usedCachedWriteSession && exactOffer?.itemId) {
-            const exactUpdateStarted = Date.now();
-            await api.updateProducts(videoId, [exactOffer.itemId]);
-            log(`API exact-offer ${exactOffer.itemId.rawMerchantOfferId || '(unknown)'} update took ${Date.now() - exactUpdateStarted}ms`);
+            const capturedShoppingItemId = api.getWriteShoppingItemId();
+            if (
+                expectedShoppingItemId
+                && capturedShoppingItemId === expectedShoppingItemId
+            ) {
+                log(
+                    `Initial Studio save already contains exact offer `
+                    + `${expectedShoppingItemId}; skipping duplicate API update.`,
+                );
+            } else {
+                const exactUpdateStarted = Date.now();
+                await api.updateProducts(videoId, [exactOffer.itemId]);
+                log(`API exact-offer ${expectedShoppingItemId || '(unknown)'} update took ${Date.now() - exactUpdateStarted}ms`);
+            }
         }
         if (!shoppingItemId) {
             const discovered = await api.searchProduct(videoId, productUrl);
@@ -2702,28 +3054,62 @@ async function executeStudioApiJob(
         }
         log(`API add took ${Date.now() - addStarted}ms`);
 
+        const resolutionMetadata = exactOffer?._workerResolution || null;
+        const expectedIdentity = resolutionMetadata?.matchedUrl
+            ? extractMarketplaceListingIdentity(resolutionMetadata.matchedUrl)
+            : listingIdentity;
+
         const affiliateStarted = Date.now();
-        const data = await fetchAffiliateUrl(
-            targetUrl,
-            productUrl,
-            browser,
-            providedAffiliateFallbackUrl,
-            {
-                forcePublicShelf: true,
-                maxAttempts: 3,
-                retryDelayMs: 500,
-            },
-        );
-        const expectedIdentity = listingIdentity;
-        let actualIdentity = extractMarketplaceListingIdentity(data.affiliateUrl);
-        if (expectedIdentity && !actualIdentity) {
-            const resolvedAffiliateUrl = await resolveProductOriginUrl(
-                data.affiliateUrl,
-                null,
+        let data = null;
+        let actualIdentity = null;
+        const shelfSyncAttempts = 3;
+        for (
+            let shelfAttempt = 1;
+            shelfAttempt <= shelfSyncAttempts;
+            shelfAttempt++
+        ) {
+            if (shelfAttempt > 1) {
+                const delay = 750 * (shelfAttempt - 1);
+                log(
+                    `Public shelf still has a stale listing; retrying exact-offer `
+                    + `verification after ${delay}ms (${shelfAttempt}/${shelfSyncAttempts}).`,
+                );
+                await pageSafeDelay(page, delay);
+            }
+
+            data = await fetchAffiliateUrl(
+                targetUrl,
+                productUrl,
+                browser,
+                providedAffiliateFallbackUrl,
+                {
+                    forcePublicShelf: true,
+                    maxAttempts: shelfAttempt === 1 ? 3 : 1,
+                    retryDelayMs: 500,
+                },
             );
-            actualIdentity = extractMarketplaceListingIdentity(resolvedAffiliateUrl);
-            if (actualIdentity) {
-                log(`Resolved affiliate listing identity: ${actualIdentity.offerId}`);
+            actualIdentity = extractMarketplaceListingIdentity(data.affiliateUrl);
+            if (expectedIdentity && !actualIdentity) {
+                const resolvedAffiliateUrl = await resolveProductOriginUrl(
+                    data.affiliateUrl,
+                    null,
+                );
+                actualIdentity = extractMarketplaceListingIdentity(
+                    resolvedAffiliateUrl,
+                );
+                if (actualIdentity) {
+                    log(`Resolved affiliate listing identity: ${actualIdentity.offerId}`);
+                }
+            }
+
+            if (
+                !expectedIdentity
+                || (
+                    actualIdentity?.productId === expectedIdentity.productId
+                    && actualIdentity?.offerId === expectedIdentity.offerId
+                )
+            ) {
+                break;
             }
         }
         if (expectedIdentity && (
@@ -2744,13 +3130,16 @@ async function executeStudioApiJob(
                 ...(data.metadata || {}),
                 workerType: 'studio-api',
                 shoppingItemId,
+                ...(resolutionMetadata ? {
+                    productMatch: resolutionMetadata,
+                } : {}),
             },
         };
     } catch (error) {
         primaryError = error;
         throw error;
     } finally {
-        if (uiBootstrapStarted || productAdded || api.hasWriteSession()) {
+        if (uiProductMutationStarted || productAdded) {
             const removeStarted = Date.now();
             try {
                 await cleanupStudioProductsApi(api, videoId);
@@ -2844,15 +3233,19 @@ async function executeJob(jobId, targetUrl, productUrl, providedAffiliateFallbac
         return { success: true, affiliateUrl: data.affiliateUrl, metadata: data.metadata };
     } catch (e) {
         log(`Error during job: ${shortErrorMessage(e)}`);
-        try {
-            if (page && browser && await isChromeCrashPage(page)) {
-                await recoverWorkerPage(browser, browser.contexts()[0], worker, 'Chrome crash after job error');
-            } else if (page) {
-                await page.reload({ waitUntil: 'commit', timeout: 15000 });
-                log('Page reloaded after error');
+        if (e?.code === 'PRODUCT_NOT_FOUND') {
+            log('Catalog miss is non-retryable; keeping the Studio page unchanged.');
+        } else {
+            try {
+                if (page && browser && await isChromeCrashPage(page)) {
+                    await recoverWorkerPage(browser, browser.contexts()[0], worker, 'Chrome crash after job error');
+                } else if (page) {
+                    await page.reload({ waitUntil: 'commit', timeout: 15000 });
+                    log('Page reloaded after error');
+                }
+            } catch (reloadErr) {
+                log(`Failed to reload page: ${shortErrorMessage(reloadErr)}`);
             }
-        } catch (reloadErr) {
-            log(`Failed to reload page: ${shortErrorMessage(reloadErr)}`);
         }
         return { success: false, ...serializeJobError(e) };
     } finally {
@@ -3171,8 +3564,14 @@ setInterval(async () => {
                     let hadDialog = false;
                     const handler = (dialog) => {
                         hadDialog = true;
-                        log(`[Watchdog] Dialog on port ${worker.port}: "${dialog.message()}" — dismissing & reloading`);
-                        dialog.dismiss().catch(() => { });
+                        const type = dialog.type();
+                        const action = type === 'beforeunload' ? 'accepting navigation' : 'dismissing';
+                        log(`[Watchdog] ${type} dialog on port ${worker.port}: "${dialog.message()}" — ${action}`);
+                        if (type === 'beforeunload') {
+                            dialog.accept().catch(() => { });
+                        } else {
+                            dialog.dismiss().catch(() => { });
+                        }
                     };
                     page.on('dialog', handler);
 

@@ -7,8 +7,10 @@ import {
     buildProductSelectionBody,
     extractMarketplaceListingIdentity,
     extractShoppingItemId,
+    findBestContentMatch,
     findExactOfferIndex,
     findProductClusterMid,
+    MarketplaceOfferCache,
     parseStudioResponse,
     selectStudioHeaders,
     StudioApiError,
@@ -46,6 +48,62 @@ test('identifies exact Shopee listing and offer option', () => {
         { itemId: { rawMerchantOfferId: '111' } },
         { itemId: { rawMerchantOfferId: '43700187569' } },
     ], productUrl), 1);
+});
+
+test('accepts a high-confidence same-marketplace title and price fallback', () => {
+    const productUrl = 'https://shopee.vn/product/1668757188/41429607892';
+    const result = findBestContentMatch([
+        {
+            title: 'Kem dưỡng ẩm Embryolisse Lait Creme Concentre 75ml',
+            price: { amountMicros: '660000000000' },
+            targetUrl: 'https://shopee.vn/product/659308161/41161480256',
+            itemId: {
+                rawMerchantOfferId: '41161480256',
+                merchantIdentifier: { merchantId: '123' },
+            },
+        },
+        {
+            title: 'Đèn bàn học LED cao cấp',
+            price: { amountMicros: '660000000000' },
+            targetUrl: 'https://shopee.vn/product/1/2',
+            itemId: {
+                rawMerchantOfferId: '2',
+                merchantIdentifier: { merchantId: '456' },
+            },
+        },
+    ], {
+        title: 'Sữa Dưỡng Ẩm Siêu Phục Hồi Embryolisse Lait Creme Concentre 75ml',
+        price: '660.000 ₫',
+    }, productUrl);
+
+    assert.equal(result.item.itemId.rawMerchantOfferId, '41161480256');
+    assert.ok(result.titleScore >= 0.68);
+    assert.equal(result.priceDiffRatio, 0);
+});
+
+test('rejects content fallbacks with a weak title or materially different price', () => {
+    const productUrl = 'https://shopee.vn/product/1668757188/41429607892';
+    const weakTitle = findBestContentMatch([{
+        title: 'Kem chống nắng dưỡng da 75ml',
+        price: '660.000 ₫',
+        targetUrl: 'https://shopee.vn/product/1/2',
+        itemId: { rawMerchantOfferId: '2' },
+    }], {
+        title: 'Sữa Dưỡng Ẩm Embryolisse Lait Creme Concentre 75ml',
+        price: '660.000 ₫',
+    }, productUrl);
+    assert.equal(weakTitle, null);
+
+    const wrongPrice = findBestContentMatch([{
+        title: 'Sữa Dưỡng Ẩm Embryolisse Lait Creme Concentre 75ml',
+        price: '850.000 ₫',
+        targetUrl: 'https://shopee.vn/product/1/3',
+        itemId: { rawMerchantOfferId: '3' },
+    }], {
+        title: 'Sữa Dưỡng Ẩm Embryolisse Lait Creme Concentre 75ml',
+        price: '660.000 ₫',
+    }, productUrl);
+    assert.equal(wrongPrice, null);
 });
 
 test('captures a delayed metadata write using existing authenticated headers', async () => {
@@ -135,6 +193,43 @@ test('builds add and remove metadata payloads', () => {
     assert.deepEqual(remove.productsSelection.shoppingItemIds, []);
 });
 
+test('preserves the complete exact merchant offer payload', () => {
+    const exactItemId = {
+        rawMerchantOfferId: '24847812914',
+        itemType: 'SHOPPING_ITEM_TYPE_MERCHANT_SKU',
+        merchantIdentifier: { merchantId: '5615885343' },
+        itemMetadata: {
+            offerVersionId: 'offer-version',
+            offerDocid: '4585059275409005493',
+            tagCreationContext: {
+                creatorTagging: {
+                    urlSearch: true,
+                    taggingTool: 'TAGGING_TOOL_PRODUCT_PICKER',
+                    clientInterface: 'CLIENT_INTERFACE_WEB_CREATOR',
+                    variantDrilldown: true,
+                },
+            },
+            parentOfferGroupId: {
+                gpcIdWithMerchantScope: {
+                    gpcId: '14827274982343255922',
+                    merchantConstraints: ['115784110'],
+                },
+            },
+        },
+        loggingMetadata: { productSearchNonce: '79079066492311036' },
+    };
+    const body = buildProductSelectionBody({
+        context: { client: { clientName: 62 } },
+        videoId: 'vMLFUXBnbvY',
+        shoppingItemIds: [exactItemId],
+    });
+
+    assert.deepEqual(
+        body.productsSelection.shoppingItemIds,
+        [exactItemId],
+    );
+});
+
 test('builds a URL product search payload', () => {
     const body = buildProductSearchBody({
         context: { client: { clientName: 62 } },
@@ -158,6 +253,46 @@ test('builds a URL product search payload', () => {
             },
         },
     });
+});
+
+test('builds an expanded product search payload only when requested', () => {
+    const body = buildProductSearchBody({
+        context: { client: { clientName: 62 } },
+        videoId: 'VNa64icfGAg',
+        productUrl: 'Kem dưỡng ẩm Embryolisse',
+        maxResults: 200,
+    });
+    assert.equal(
+        body.searchShoppingProductsRequest.searchQuery.maxResults,
+        200,
+    );
+});
+
+test('caches exact offers and temporary catalog misses by listing identity', () => {
+    let now = 1_000;
+    const cache = new MarketplaceOfferCache({
+        successTtlMs: 1_000,
+        notFoundTtlMs: 100,
+        now: () => now,
+    });
+    const url = 'https://shopee.vn/product/1668757188/41429607892';
+    const offer = {
+        itemId: {
+            rawMerchantOfferId: '41429607892',
+            merchantIdentifier: { merchantId: '123' },
+        },
+    };
+
+    cache.setFound(url, offer);
+    offer.itemId.rawMerchantOfferId = 'changed';
+    assert.equal(cache.get(url).offer.itemId.rawMerchantOfferId, '41429607892');
+    now += 1_001;
+    assert.equal(cache.get(url), null);
+
+    cache.setNotFound(url);
+    assert.deepEqual(cache.get(url), { status: 'not_found', offer: null });
+    now += 101;
+    assert.equal(cache.get(url), null);
 });
 
 test('finds a product cluster id in nested search results', () => {

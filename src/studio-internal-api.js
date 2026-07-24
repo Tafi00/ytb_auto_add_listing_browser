@@ -135,6 +135,75 @@ export function extractMarketplaceListingIdentity(productUrl) {
     return null;
 }
 
+function cloneCacheValue(value) {
+    return value == null ? value : structuredClone(value);
+}
+
+export class MarketplaceOfferCache {
+    constructor({
+        successTtlMs = 6 * 60 * 60_000,
+        notFoundTtlMs = 15 * 60_000,
+        maxEntries = 1_000,
+        now = () => Date.now(),
+    } = {}) {
+        this.successTtlMs = successTtlMs;
+        this.notFoundTtlMs = notFoundTtlMs;
+        this.maxEntries = maxEntries;
+        this.now = now;
+        this.entries = new Map();
+    }
+
+    cacheKey(productUrl) {
+        const identity = extractMarketplaceListingIdentity(productUrl);
+        if (!identity) return null;
+        return `${identity.marketplace}:${identity.productId}:${identity.offerId}`;
+    }
+
+    get(productUrl) {
+        const key = this.cacheKey(productUrl);
+        if (!key) return null;
+        const entry = this.entries.get(key);
+        if (!entry) return null;
+        if (entry.expiresAt <= this.now()) {
+            this.entries.delete(key);
+            return null;
+        }
+        // Refresh insertion order so the size cap behaves as a small LRU cache.
+        this.entries.delete(key);
+        this.entries.set(key, entry);
+        return {
+            status: entry.status,
+            offer: cloneCacheValue(entry.offer),
+        };
+    }
+
+    setFound(productUrl, offer) {
+        this.set(productUrl, {
+            status: 'found',
+            offer: cloneCacheValue(offer),
+            expiresAt: this.now() + this.successTtlMs,
+        });
+    }
+
+    setNotFound(productUrl) {
+        this.set(productUrl, {
+            status: 'not_found',
+            offer: null,
+            expiresAt: this.now() + this.notFoundTtlMs,
+        });
+    }
+
+    set(productUrl, entry) {
+        const key = this.cacheKey(productUrl);
+        if (!key) return;
+        this.entries.delete(key);
+        this.entries.set(key, entry);
+        while (this.entries.size > this.maxEntries) {
+            this.entries.delete(this.entries.keys().next().value);
+        }
+    }
+}
+
 export function findExactOfferIndex(offers, productUrl) {
     const identity = extractMarketplaceListingIdentity(productUrl);
     if (!identity) return -1;
@@ -145,6 +214,151 @@ export function findExactOfferIndex(offers, productUrl) {
         return targetIdentity?.productId === identity.productId
             && targetIdentity?.offerId === identity.offerId;
     });
+}
+
+function normalizeProductText(value) {
+    return String(value || '')
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .toLowerCase()
+        .replace(/đ/g, 'd')
+        .replace(/[^a-z0-9]+/g, ' ')
+        .trim();
+}
+
+function productTitleSimilarity(expectedTitle, candidateTitle) {
+    const expected = normalizeProductText(expectedTitle);
+    const candidate = normalizeProductText(candidateTitle);
+    if (!expected || !candidate) return 0;
+    if (expected === candidate) return 1;
+
+    const expectedTokens = new Set(expected.split(' ').filter(token => token.length > 1));
+    const candidateTokens = new Set(candidate.split(' ').filter(token => token.length > 1));
+    if (expectedTokens.size === 0 || candidateTokens.size === 0) return 0;
+
+    let intersection = 0;
+    for (const token of expectedTokens) {
+        if (candidateTokens.has(token)) intersection++;
+    }
+    const expectedCoverage = intersection / expectedTokens.size;
+    const candidateCoverage = intersection / candidateTokens.size;
+    const union = expectedTokens.size + candidateTokens.size - intersection;
+    const jaccard = union > 0 ? intersection / union : 0;
+    return expectedCoverage * 0.5 + candidateCoverage * 0.25 + jaccard * 0.25;
+}
+
+function parseProductPrice(value, seen = new Set()) {
+    if (value == null) return null;
+    if (typeof value === 'number') return Number.isFinite(value) ? value : null;
+    if (typeof value === 'string') {
+        const digits = value.replace(/[^\d]/g, '');
+        return digits ? Number(digits) : null;
+    }
+    if (typeof value !== 'object' || seen.has(value)) return null;
+    seen.add(value);
+
+    for (const key of ['amountMicros', 'priceMicros', 'micros']) {
+        const micros = Number(value[key]);
+        if (Number.isFinite(micros) && micros > 0) return micros / 1_000_000;
+    }
+    for (const key of ['amount', 'price', 'value', 'lowPrice', 'highPrice']) {
+        const parsed = parseProductPrice(value[key], seen);
+        if (parsed != null) return parsed;
+    }
+    return null;
+}
+
+function findTextField(node, keys, seen = new Set()) {
+    if (!node || typeof node !== 'object' || seen.has(node)) return '';
+    seen.add(node);
+    for (const key of keys) {
+        if (typeof node[key] === 'string' && node[key].trim()) return node[key].trim();
+    }
+    for (const child of Object.values(node)) {
+        const found = findTextField(child, keys, seen);
+        if (found) return found;
+    }
+    return '';
+}
+
+export function findBestContentMatch(items, expectedInfo, productUrl) {
+    const expectedTitle = expectedInfo?.title || '';
+    if (!expectedTitle) return null;
+
+    const expectedIdentity = extractMarketplaceListingIdentity(productUrl);
+    const expectedPrice = parseProductPrice(expectedInfo?.price);
+    const expectedSeller = normalizeProductText(expectedInfo?.seller);
+    const expectedBrand = normalizeProductText(
+        typeof expectedInfo?.brand === 'string'
+            ? expectedInfo.brand
+            : expectedInfo?.brand?.name,
+    );
+    const candidates = [];
+
+    for (let index = 0; index < (items || []).length; index++) {
+        const item = items[index];
+        if (!item?.title || item?.itemId?.gpcIdWithMerchantScope) continue;
+
+        const targetIdentity = extractMarketplaceListingIdentity(item.targetUrl || '');
+        if (
+            expectedIdentity
+            && targetIdentity
+            && targetIdentity.marketplace !== expectedIdentity.marketplace
+        ) continue;
+
+        const titleScore = productTitleSimilarity(expectedTitle, item.title);
+        const candidatePrice = parseProductPrice(item.price);
+        const hasComparablePrice = expectedPrice != null && candidatePrice != null;
+        const priceDiffRatio = hasComparablePrice
+            ? Math.abs(candidatePrice - expectedPrice) / Math.max(expectedPrice, 1)
+            : null;
+        const candidateSeller = normalizeProductText(findTextField(item, [
+            'sellerName',
+            'merchantName',
+            'merchantDisplayName',
+            'storeName',
+        ]));
+        const candidateBrand = normalizeProductText(findTextField(item, [
+            'brandName',
+            'brand',
+        ]));
+        const sellerMatch = Boolean(
+            expectedSeller
+            && candidateSeller
+            && (expectedSeller.includes(candidateSeller) || candidateSeller.includes(expectedSeller)),
+        );
+        const brandMatch = Boolean(
+            expectedBrand
+            && candidateBrand
+            && (expectedBrand.includes(candidateBrand) || candidateBrand.includes(expectedBrand)),
+        );
+
+        const strongPriceMatch = priceDiffRatio != null && priceDiffRatio <= 0.08;
+        const eligible = hasComparablePrice
+            ? titleScore >= 0.68 && strongPriceMatch
+            : titleScore >= 0.9;
+        if (!eligible) continue;
+
+        const priceScore = priceDiffRatio == null
+            ? 0
+            : Math.max(0, 1 - priceDiffRatio / 0.08);
+        const score = titleScore * 0.72
+            + priceScore * 0.22
+            + (sellerMatch ? 0.04 : 0)
+            + (brandMatch ? 0.02 : 0);
+        candidates.push({
+            item,
+            index,
+            score,
+            titleScore,
+            priceDiffRatio,
+            sellerMatch,
+            brandMatch,
+        });
+    }
+
+    candidates.sort((a, b) => b.score - a.score || b.titleScore - a.titleScore);
+    return candidates[0] || null;
 }
 
 export function buildProductSelectionBody({
@@ -177,7 +391,13 @@ export function buildProductSelectionBody({
     };
 }
 
-export function buildProductSearchBody({ context, delegationContext, videoId, productUrl }) {
+export function buildProductSearchBody({
+    context,
+    delegationContext,
+    videoId,
+    productUrl,
+    maxResults,
+}) {
     if (!videoId) throw new Error('videoId is required');
     if (!productUrl) throw new Error('productUrl is required');
     if (!context || typeof context !== 'object') {
@@ -196,6 +416,9 @@ export function buildProductSearchBody({ context, delegationContext, videoId, pr
                 firstPartyQueryConfig: {},
                 thirdPartyQueryConfig: {},
                 productSourceRestrict: 'PRODUCT_SOURCE_ALL',
+                ...(Number.isInteger(maxResults) && maxResults > 0
+                    ? { maxResults }
+                    : {}),
             },
             tagCreationContext: {
                 creatorTagging: {
@@ -505,13 +728,14 @@ export class StudioInternalApi {
         }
     }
 
-    async searchProductsRaw(videoId, productUrl) {
+    async searchProductsRaw(videoId, productUrl, options = {}) {
         const session = await this.waitUntilReady();
         const body = buildProductSearchBody({
             context: session.context,
             delegationContext: session.delegationContext,
             videoId,
             productUrl,
+            maxResults: options.maxResults,
         });
         const operation = 'Search YouTube Shopping product';
         try {
