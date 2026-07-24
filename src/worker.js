@@ -2441,17 +2441,16 @@ async function resolveExactMarketplaceOffer(
         );
     }
     const directIndex = findExactOfferIndex(searchItems, listingIdentityUrl);
-    if (directIndex >= 0) {
-        log(`Resolved exact marketplace offer ${identity.offerId} directly (${directIndex + 1}/${searchItems.length}).`);
-        const exactOffer = searchItems[directIndex];
-        marketplaceOfferCache.setFound(listingIdentityUrl, exactOffer);
-        return exactOffer;
-    }
-
     const offerGroupItem = searchItems.find(
         item => item?.itemId?.gpcIdWithMerchantScope?.gpcId,
     );
     if (!offerGroupItem) {
+        if (directIndex >= 0) {
+            log(`Resolved exact marketplace offer ${identity.offerId} directly (${directIndex + 1}/${searchItems.length}); no offer group was returned.`);
+            const exactOffer = searchItems[directIndex];
+            marketplaceOfferCache.setFound(listingIdentityUrl, exactOffer);
+            return exactOffer;
+        }
         marketplaceOfferCache.setNotFound(listingIdentityUrl);
         throw createWorkerError(
             'Sản phẩm này không gắn giỏ được',
@@ -2485,6 +2484,18 @@ async function resolveExactMarketplaceOffer(
             log(`Resolved exact marketplace offer ${identity.offerId} by API (${exactIndex + 1}/${offers.length}) in ${Date.now() - groupStarted}ms.`);
             return exactOffer;
         }
+    }
+
+    // A URL search can expose an exact-looking merchant item outside the
+    // grouped result even though YouTube's public shelf resolves that outer
+    // item to another merchant offer. Always prefer the exact variant inside
+    // the offer group; only fall back to the outer result when the group does
+    // not contain the requested offer.
+    if (directIndex >= 0) {
+        log(`Offer group did not contain ${identity.offerId}; using direct marketplace result (${directIndex + 1}/${searchItems.length}).`);
+        const exactOffer = searchItems[directIndex];
+        marketplaceOfferCache.setFound(listingIdentityUrl, exactOffer);
+        return exactOffer;
     }
 
     let titleItems = [];
