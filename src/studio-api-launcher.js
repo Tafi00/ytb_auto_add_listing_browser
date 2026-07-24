@@ -21,6 +21,7 @@ let mainWindow = null;
 let workerProc = null;
 let workerMode = null;
 let recentLogs = [];
+let autoStartGeneration = 0;
 
 function emit(channel, data) {
   if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send(channel, data);
@@ -112,6 +113,28 @@ async function waitForPanel(timeoutMs = 25_000) {
   throw new Error('API worker không khởi động được');
 }
 
+async function waitForBrowserCount(expectedCount, timeoutMs = 60_000) {
+  const deadline = Date.now() + timeoutMs;
+  let status = null;
+  while (Date.now() < deadline) {
+    status = await getPanelStatus();
+    if ((status?.browsers?.length || 0) >= expectedCount) return status;
+    await new Promise(resolve => setTimeout(resolve, 500));
+  }
+  return status;
+}
+
+async function waitForApiReady(expectedCount, timeoutMs = 12_000) {
+  const deadline = Date.now() + timeoutMs;
+  let status = null;
+  while (Date.now() < deadline) {
+    status = await getPanelStatus();
+    if ((status?.apiReadyCount || 0) >= expectedCount) return status;
+    await new Promise(resolve => setTimeout(resolve, 750));
+  }
+  return status;
+}
+
 function attachWorkerLogs(proc) {
   const consume = (data, level) => {
     data.toString().split(/\r?\n/)
@@ -139,7 +162,7 @@ async function ensureConnection(enabled) {
 }
 
 async function startWorker(mode) {
-  const headed = mode === 'login';
+  const loginPhase = mode === 'login';
   const config = loadConfig();
   let videoUrls;
   try {
@@ -147,15 +170,17 @@ async function startWorker(mode) {
   } catch (error) {
     return { ok: false, error: error.message };
   }
+  const expectedBrowserCount = loginPhase ? 1 : videoUrls.length;
   let status = await getPanelStatus();
 
   if (status?.apiMode) {
-    if (Boolean(status.headless) === headed) {
-      await panelRequest('/api/toggle-headless', { method: 'POST', timeoutMs: 35_000 });
+    if (Boolean(status.primaryOnlyMode) !== loginPhase) {
+      await panelRequest('/api/toggle-primary-only', { method: 'POST', timeoutMs: 60_000 });
+      status = await getPanelStatus();
     }
     const registeredUrls = Array.isArray(status.localUrls) ? status.localUrls : [];
     const urlsChanged = JSON.stringify(registeredUrls) !== JSON.stringify(videoUrls);
-    const missingBrowsers = (status.browsers?.length || 0) !== videoUrls.length;
+    const missingBrowsers = (status.browsers?.length || 0) !== expectedBrowserCount;
     if (urlsChanged || missingBrowsers) {
       addLog(`Đang đồng bộ ${videoUrls.length} video vào API worker...`);
       await panelRequest('/api/video-urls', {
@@ -163,19 +188,19 @@ async function startWorker(mode) {
         body: { videoUrls: videoUrls.join('\n') },
         timeoutMs: 60_000,
       });
-      status = await getPanelStatus();
+      status = await waitForBrowserCount(expectedBrowserCount);
     }
-    if ((status?.browsers?.length || 0) !== videoUrls.length) {
+    if ((status?.browsers?.length || 0) !== expectedBrowserCount) {
       throw new Error(
-        `Chrome chỉ mở được ${status?.browsers?.length || 0}/${videoUrls.length} video. `
+        `Chrome chỉ mở được ${status?.browsers?.length || 0}/${expectedBrowserCount} video. `
         + 'Hãy bấm Dừng rồi thử lại.',
       );
     }
     workerMode = mode;
-    await ensureConnection(!headed);
-    addLog(headed
-      ? `Đã mở ${videoUrls.length} cửa sổ Chrome để đăng nhập. Hoàn tất đăng nhập rồi bấm “Chạy API nền”.`
-      : 'API worker đang chạy nền và đã kết nối relay.');
+    await ensureConnection(!loginPhase);
+    addLog(loginPhase
+      ? 'Đã mở browser gốc. Hãy đăng nhập YouTube Studio; tool sẽ tự mở các browser còn lại.'
+      : 'API worker đang chạy và đã kết nối relay.');
     emit('api-status-changed');
     return { ok: true };
   }
@@ -186,9 +211,9 @@ async function startWorker(mode) {
     WORKER_SERVER_URL: process.env.WORKER_SERVER_URL || 'wss://voucheryoutube.vn',
     USE_STUDIO_INTERNAL_API: '1',
     STUDIO_API_USE_LOCAL_URLS: '1',
-    HEADLESS: headed ? 'false' : 'true',
+    STUDIO_API_PRIMARY_ONLY: loginPhase ? '1' : '0',
     CONTROL_PANEL_PORT: '19200',
-    SESSIONS_DIR: './sessions',
+    SESSIONS_DIR: path.join(ROOT_DIR, 'sessions'),
     STUDIO_API_CONFIG_PATH: CONFIG_PATH,
   };
 
@@ -200,27 +225,76 @@ async function startWorker(mode) {
   });
   workerMode = mode;
   attachWorkerLogs(workerProc);
-  addLog(headed ? 'Đang mở Chrome cho lần đăng nhập đầu tiên...' : 'Đang khởi động API worker nền...');
+  addLog(loginPhase ? 'Đang mở Chrome cho lần đăng nhập đầu tiên...' : 'Đang khởi động API worker...');
 
   status = await waitForPanel();
-  if ((status?.browsers?.length || 0) !== videoUrls.length) {
+  const registeredUrls = Array.isArray(status?.localUrls) ? status.localUrls : [];
+  const urlsChanged = JSON.stringify(registeredUrls) !== JSON.stringify(videoUrls);
+  if (urlsChanged) {
     addLog(`Đang đồng bộ ${videoUrls.length} video vào API worker...`);
     await panelRequest('/api/video-urls', {
       method: 'POST',
       body: { videoUrls: videoUrls.join('\n') },
       timeoutMs: 60_000,
     });
-    status = await getPanelStatus();
+    status = await waitForBrowserCount(expectedBrowserCount);
+  } else if ((status?.browsers?.length || 0) !== expectedBrowserCount) {
+    status = await waitForBrowserCount(expectedBrowserCount);
   }
-  if ((status?.browsers?.length || 0) !== videoUrls.length) {
+  if ((status?.browsers?.length || 0) !== expectedBrowserCount) {
     throw new Error(
-      `Chrome chỉ mở được ${status?.browsers?.length || 0}/${videoUrls.length} video. `
+      `Chrome chỉ mở được ${status?.browsers?.length || 0}/${expectedBrowserCount} video. `
       + 'Hãy bấm Dừng rồi thử lại.',
     );
   }
-  await ensureConnection(!headed);
+  await ensureConnection(!loginPhase);
   emit('api-status-changed');
   return { ok: true };
+}
+
+async function promoteAfterLogin(generation) {
+  while (generation === autoStartGeneration) {
+    const status = await getPanelStatus();
+    if (!status?.apiMode) return;
+    if ((status.apiReadyCount || 0) >= 1) {
+      addLog('Đăng nhập đã sẵn sàng. Đang copy profile và mở các browser...');
+      const result = await startWorker('run');
+      if (!result.ok) addLog(result.error || 'Không thể chạy API', 'error');
+      else addLog('Bắt đầu thành công. Tất cả browser API đang hiển thị.');
+      emit('api-status-changed');
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 1500));
+  }
+}
+
+async function startAutomatic() {
+  const generation = ++autoStartGeneration;
+  const config = loadConfig();
+  let videoUrls;
+  try {
+    videoUrls = normalizeVideoUrls(config.video_urls || []);
+  } catch (error) {
+    return { ok: false, error: error.message };
+  }
+
+  let result = await startWorker('run');
+  if (!result.ok) return result;
+
+  const status = await waitForApiReady(videoUrls.length);
+  if ((status?.apiReadyCount || 0) >= videoUrls.length) {
+    addLog('Bắt đầu thành công. Tất cả browser API đã sẵn sàng.');
+    return { ok: true };
+  }
+
+  addLog('Profile chưa sẵn sàng. Đang mở browser gốc để đăng nhập...');
+  result = await startWorker('login');
+  if (!result.ok) return result;
+  void promoteAfterLogin(generation);
+  return {
+    ok: true,
+    warning: 'Hãy đăng nhập YouTube Studio trên browser vừa mở. Tool sẽ tự mở các browser còn lại.',
+  };
 }
 
 function stopOwnedWorker() {
@@ -261,7 +335,7 @@ ipcMain.handle('api-status', async () => {
     relayUrl: process.env.WORKER_SERVER_URL || panel?.serverUrl || 'wss://voucheryoutube.vn',
     running: Boolean(panel?.apiMode),
     owned: Boolean(workerProc),
-    mode: panel?.apiMode ? (panel.headless ? 'background' : 'login') : null,
+    mode: panel?.apiMode ? (panel.primaryOnlyMode ? 'login' : 'run') : null,
     relayConnected: Boolean(panel?.wsConnected),
     connectionEnabled: Boolean(panel?.connectionEnabled),
     browsers: panel?.browsers || [],
@@ -301,9 +375,16 @@ async function safeStartWorker(mode) {
   }
 }
 
-ipcMain.handle('api-start-login', () => safeStartWorker('login'));
-ipcMain.handle('api-start-background', () => safeStartWorker('background'));
+ipcMain.handle('api-start', async () => {
+  try {
+    return await startAutomatic();
+  } catch (error) {
+    addLog(error.message, 'error');
+    return { ok: false, error: error.message };
+  }
+});
 ipcMain.handle('api-stop', async () => {
+  autoStartGeneration++;
   try {
     const panel = await getPanelStatus();
     if (panel?.apiMode) {

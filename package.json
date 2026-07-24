@@ -1,6 +1,6 @@
 {
   "name": "yt-worker-launcher",
-  "version": "1.0.0",
+  "version": "1.0.8",
   "description": "YouTube Auto Listing - Worker Launcher",
   "main": "src/launcher.js",
   "type": "module",
@@ -17,7 +17,7 @@
     "launcher": "electron src/launcher.js",
     "api-tool": "electron src/studio-api-launcher.js",
     "api-worker": "node scripts/start-studio-api-worker.mjs",
-    "build-api-tool": "electron-builder --win portable --config electron-builder.api.yml && node scripts/copy-studio-api-config.mjs",
+    "build-api-tool": "electron-builder --win portable --x64 --config electron-builder.api.yml && node scripts/copy-studio-api-config.mjs",
     "build-launcher": "electron-builder --win portable"
   },
   "dependencies": {

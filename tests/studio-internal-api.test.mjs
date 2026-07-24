@@ -5,12 +5,72 @@ import {
     buildOfferGroupBody,
     buildProductSearchBody,
     buildProductSelectionBody,
+    extractMarketplaceListingIdentity,
     extractShoppingItemId,
+    findExactOfferIndex,
     findProductClusterMid,
     parseStudioResponse,
     selectStudioHeaders,
     StudioApiError,
+    StudioInternalApi,
 } from '../src/studio-internal-api.js';
+
+test('identifies exact Shopee listing and offer option', () => {
+    const productUrl = 'https://shopee.vn/product/360635088/43700187569';
+    assert.deepEqual(extractMarketplaceListingIdentity(productUrl), {
+        marketplace: 'shopee',
+        productId: '360635088',
+        offerId: '43700187569',
+    });
+    assert.deepEqual(
+        extractMarketplaceListingIdentity(
+            'https://shopee.vn/example-i.360635088.43700187569',
+        ),
+        {
+            marketplace: 'shopee',
+            productId: '360635088',
+            offerId: '43700187569',
+        },
+    );
+    assert.deepEqual(
+        extractMarketplaceListingIdentity(
+            'https://shopee.vn/opaanlp/1205404510/53611982297',
+        ),
+        {
+            marketplace: 'shopee',
+            productId: '1205404510',
+            offerId: '53611982297',
+        },
+    );
+    assert.equal(findExactOfferIndex([
+        { itemId: { rawMerchantOfferId: '111' } },
+        { itemId: { rawMerchantOfferId: '43700187569' } },
+    ], productUrl), 1);
+});
+
+test('captures a delayed metadata write using existing authenticated headers', async () => {
+    const page = { on() {}, off() {} };
+    const api = new StudioInternalApi(page);
+    api.session = {
+        capturedAt: Date.now(),
+        context: { client: {} },
+        headers: { authorization: 'SAPISIDHASH retained' },
+    };
+    const writeReady = api.waitForWriteSession(1_000);
+    await api.captureRequest({
+        method: () => 'POST',
+        url: () => 'https://studio.youtube.com/youtubei/v1/video_manager/metadata_update?alt=json',
+        postDataJSON: () => ({
+            encryptedVideoId: 'video-id',
+            attestationResponseData: { challenge: 'signed' },
+            productsSelection: { shoppingItemIds: [] },
+        }),
+        allHeaders: async () => ({ 'content-type': 'application/json' }),
+    });
+    const captured = await writeReady;
+    assert.equal(captured.headers.authorization, 'SAPISIDHASH retained');
+    assert.equal(api.hasWriteSession(), true);
+});
 
 test('builds an offer-group API payload from a GPC search result', () => {
     const body = buildOfferGroupBody({
@@ -88,6 +148,7 @@ test('builds a URL product search payload', () => {
         },
         searchQuery: {
             rawQuery: 'https://www.lazada.vn/products/example-i1-s2.html',
+            firstPartyQueryConfig: {},
             thirdPartyQueryConfig: {},
             productSourceRestrict: 'PRODUCT_SOURCE_ALL',
         },

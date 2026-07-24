@@ -9,7 +9,11 @@ import fs from 'fs';
 import os from 'os';
 import http from 'http';
 import WebSocket from 'ws';
-import { StudioInternalApi } from './studio-internal-api.js';
+import {
+    extractMarketplaceListingIdentity,
+    findExactOfferIndex,
+    StudioInternalApi,
+} from './studio-internal-api.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -17,7 +21,7 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const SERVER_URL = process.env.WORKER_SERVER_URL || 'ws://localhost:3002';
 const WORKER_AUTH_TOKEN = process.env.WORKER_AUTH_TOKEN || 'default-worker-token';
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './sessions';
-let headlessMode = process.env.HEADLESS === 'true';
+let primaryOnlyMode = process.env.STUDIO_API_PRIMARY_ONLY === '1';
 const CONTROL_PANEL_PORT = parseInt(process.env.CONTROL_PANEL_PORT || '19200');
 const BROWSER_HEALTH_INTERVAL_MS = parseInt(process.env.BROWSER_HEALTH_INTERVAL_MS || '15000');
 const PAGE_IDLE_REFRESH_MS = parseInt(process.env.PAGE_IDLE_REFRESH_MS || `${30 * 60 * 1000}`);
@@ -155,11 +159,16 @@ function serializeJobError(error) {
         stage = 'browser-session';
         retryable = true;
         message = 'Chrome nền bị mất kết nối. Worker sẽ mở lại phiên video.';
-    } else if (!error?.code && /timeout|timed out/i.test(raw)) {
-        code = 'WORKER_TIMEOUT';
-        stage = 'worker';
+    } else if (!error?.code && /locator\.|waiting for locator|waitForFunction/i.test(raw)) {
+        code = 'PRODUCT_ADD_FAILED';
+        stage = 'product-selection';
         retryable = true;
-        message = 'Worker xử lý quá thời gian chờ.';
+        message = 'YouTube Studio chưa tải xong phần sản phẩm. Worker đã làm mới trang; vui lòng thử lại.';
+    } else if (!error?.code && /timeout|timed out/i.test(raw)) {
+        code = 'YOUTUBE_API_TIMEOUT';
+        stage = 'youtube-api';
+        retryable = true;
+        message = 'YouTube Studio phản hồi quá chậm. Vui lòng thử lại.';
     }
 
     return {
@@ -441,17 +450,6 @@ async function launchBrowser(url, port, sessionDir) {
         '--window-size=1200,800',
     ];
 
-    if (headlessMode) {
-        args.push(
-            '--headless=new',                     // New headless - cùng engine render như headed
-            '--disable-gpu',                      // Tránh lỗi GPU trong headless
-            '--no-sandbox',                       // Cần cho headless trên một số môi trường
-            '--disable-blink-features=AutomationControlled', // Ẩn flag webdriver
-            '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36',
-        );
-        log('Running in HEADLESS mode (--headless=new)');
-    }
-
     const child = spawn(chromePath, args, {
         detached: false,
         stdio: ['ignore', 'pipe', 'pipe'],
@@ -679,7 +677,7 @@ async function getProductInfo(productUrl) {
     for (let attempt = 1; attempt <= 3; attempt++) {
         try {
             if (attempt > 1) {
-                const delay = attempt * 2000;
+                const delay = (attempt - 1) * 1000;
                 log(`getProductInfo retry ${attempt} after ${delay}ms...`);
                 await new Promise(r => setTimeout(r, delay));
             }
@@ -1072,8 +1070,9 @@ async function clickTagButtonPrecisely(page, tagBtn, label = 'Tag button') {
 
 async function waitForSaveToFinish(page, saveBtn) {
     await page.waitForFunction(() => {
-        const btn = document.querySelector('ytcp-button#save button');
-        const host = document.querySelector('ytcp-button#save');
+        const hosts = [...document.querySelectorAll('ytcp-button#save')];
+        const host = hosts.find(item => item.offsetParent !== null);
+        const btn = host?.querySelector('button');
         if (!btn) return false;
         return btn.disabled
             || btn.getAttribute('aria-disabled') === 'true'
@@ -1082,6 +1081,15 @@ async function waitForSaveToFinish(page, saveBtn) {
     }, null, { timeout: 15000 }).catch(() => { });
 
     await saveBtn.waitFor({ state: 'attached', timeout: 3000 }).catch(() => { });
+}
+
+async function clickStudioControl(locator) {
+    await locator.evaluate(element => {
+        const button = element.shadowRoot?.querySelector('button')
+            || element.querySelector('button')
+            || element;
+        button.click();
+    });
 }
 
 async function addProduct(page, productUrl, _retryCount = 0) {
@@ -1102,11 +1110,11 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     };
     const normalizeProductTitle = (s) => (s || '').normalize('NFC').replace(/\s+/g, ' ').trim().toLowerCase();
 
-    const btn = page.locator('button:has(div.ytcpButtonShapeImpl__button-text-content)').filter({
-        hasText: /(Sản phẩm|Products|tagged product|sản phẩm đã gắn)/i
-    }).first();
+    const btn = page.locator(
+        'ytcp-button#products-description-button:visible',
+    ).first();
 
-    const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+    const editBtn = page.locator('ytcp-icon-button#shopping-toolbar-edit:visible').first();
 
     try {
         await Promise.race([
@@ -1131,7 +1139,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     const editVisible = await editBtn.isVisible().catch(() => false);
     if (!editVisible) {
         await btn.waitFor({ state: 'attached', timeout: 15000 });
-        await btn.evaluate(b => b.click()).catch(async () => {
+        await clickStudioControl(btn).catch(async () => {
             await btn.click({ force: true }).catch(() => { });
         });
         log('Clicked Products row');
@@ -1139,7 +1147,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     }
 
     await editBtn.waitFor({ state: 'attached', timeout: 10000 });
-    await editBtn.evaluate(b => b.click()).catch(async () => {
+    await clickStudioControl(editBtn).catch(async () => {
         await editBtn.click({ force: true }).catch(() => { });
     });
     log('Clicked edit button');
@@ -1399,7 +1407,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     await clickPickerNextButton(page);
     await clickPickerDoneButton(page);
 
-    const saveBtn = page.locator('ytcp-button#save button').first();
+    const saveBtn = page.locator('ytcp-button#save:visible button:visible').first();
     await saveBtn.waitFor({ state: 'attached', timeout: 10000 });
     await page.waitForTimeout(500);
 
@@ -2265,34 +2273,59 @@ async function fetchAffiliateUrl(
 
 // ==================== Job Execution ====================
 
-function extractMarketplaceListingIdentity(productUrl) {
-    try {
-        const url = new URL(productUrl);
-        if (/lazada\./i.test(url.hostname)) {
-            const match = decodeURIComponent(url.pathname)
-                .match(/-i(\d+)-s(\d+)\.html/i);
-            if (match) {
-                return {
-                    marketplace: 'lazada',
-                    productId: match[1],
-                    offerId: match[2],
-                };
-            }
-        }
-    } catch {}
-    return null;
-}
+async function resolveExactMarketplaceOffer(
+    api,
+    videoId,
+    productUrl,
+    listingIdentityUrl,
+) {
+    const identity = extractMarketplaceListingIdentity(listingIdentityUrl);
+    if (!identity) return null;
 
-function findExactOfferIndex(offers, productUrl) {
-    const identity = extractMarketplaceListingIdentity(productUrl);
-    if (!identity) return -1;
-    return (offers || []).findIndex(offer => {
-        const rawOfferId = String(offer?.itemId?.rawMerchantOfferId || '');
-        if (rawOfferId === identity.offerId) return true;
-        const targetIdentity = extractMarketplaceListingIdentity(offer?.targetUrl || '');
-        return targetIdentity?.productId === identity.productId
-            && targetIdentity?.offerId === identity.offerId;
-    });
+    const searchPayload = await api.searchProductsRaw(videoId, productUrl);
+    const searchItems = searchPayload?.shoppingProducts?.items || [];
+    if (searchItems.length === 0) {
+        throw createWorkerError(
+            'Sản phẩm này không gắn giỏ được.',
+            'PRODUCT_NOT_FOUND',
+            'product-selection',
+            false,
+        );
+    }
+    const directIndex = findExactOfferIndex(searchItems, listingIdentityUrl);
+    if (directIndex >= 0) {
+        log(`Resolved exact marketplace offer ${identity.offerId} directly (${directIndex + 1}/${searchItems.length}).`);
+        return searchItems[directIndex];
+    }
+
+    const offerGroupItem = searchItems.find(
+        item => item?.itemId?.gpcIdWithMerchantScope?.gpcId,
+    );
+    if (!offerGroupItem) {
+        throw createWorkerError(
+            'Sản phẩm này không gắn giỏ được.',
+            'PRODUCT_NOT_FOUND',
+            'product-selection',
+            false,
+        );
+    }
+
+    const offersPayload = await api.getOffersForOfferGroupRaw(
+        videoId,
+        offerGroupItem,
+    );
+    const offers = offersPayload?.offersForOfferGroup?.items || [];
+    const exactIndex = findExactOfferIndex(offers, listingIdentityUrl);
+    if (exactIndex < 0) {
+        throw createWorkerError(
+            'Sản phẩm này không gắn giỏ được.',
+            'PRODUCT_NOT_FOUND',
+            'product-selection',
+            false,
+        );
+    }
+    log(`Resolved exact marketplace offer ${identity.offerId} by API (${exactIndex + 1}/${offers.length}).`);
+    return offers[exactIndex];
 }
 
 async function bootstrapStudioWriteSession(
@@ -2301,33 +2334,35 @@ async function bootstrapStudioWriteSession(
     productUrl,
     api,
     retryCount = 0,
+    listingIdentityUrl = productUrl,
 ) {
     await page.waitForLoadState('domcontentloaded', { timeout: 20_000 });
-    const productsButton = page.getByRole('button', {
-        name: /^(Products|Sản phẩm),/i,
-    }).first();
-    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+    const productsButton = page.locator(
+        'ytcp-button#products-description-button:visible',
+    ).first();
+    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit:visible').first();
 
     try {
+        const initialControlsTimeout = retryCount === 0 ? 3_500 : 20_000;
         await Promise.race([
-            editButton.waitFor({ state: 'visible', timeout: 20_000 }),
-            productsButton.waitFor({ state: 'visible', timeout: 20_000 }),
+            editButton.waitFor({ state: 'visible', timeout: initialControlsTimeout }),
+            productsButton.waitFor({ state: 'visible', timeout: initialControlsTimeout }),
         ]);
         if (!await editButton.isVisible().catch(() => false)) {
-            await productsButton.waitFor({ state: 'visible', timeout: 15_000 });
-            await productsButton.evaluate(element => element.click());
+            await productsButton.waitFor({ state: 'visible', timeout: 5_000 });
+            await clickStudioControl(productsButton);
         }
-        await editButton.waitFor({ state: 'visible', timeout: 10_000 });
+        await editButton.waitFor({ state: 'visible', timeout: 5_000 });
     } catch (error) {
         if (retryCount >= 1) throw error;
         log('Studio product controls were not ready; reloading once.');
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
         api.invalidateWriteSession();
         return bootstrapStudioWriteSession(
-            page, videoId, productUrl, api, retryCount + 1,
+            page, videoId, productUrl, api, retryCount + 1, listingIdentityUrl,
         );
     }
-    await editButton.evaluate(element => element.click());
+    await clickStudioControl(editButton);
 
     const search = page.locator('input#search-input.search-input');
     await search.waitFor({ state: 'visible', timeout: 10_000 });
@@ -2343,6 +2378,12 @@ async function bootstrapStudioWriteSession(
 
     await search.fill(productUrl);
     await search.press('Enter');
+    const exactOffer = await resolveExactMarketplaceOffer(
+        api,
+        videoId,
+        productUrl,
+        listingIdentityUrl,
+    );
     const searchResult = page.locator(
         'ytshopping-product-picker-search-result:visible',
     ).first();
@@ -2357,30 +2398,6 @@ async function bootstrapStudioWriteSession(
     }).first();
     const hasOptions = await optionsLabel.isVisible({ timeout: 800 }).catch(() => false);
 
-    let exactOffer = null;
-    if (hasOptions) {
-        const identity = extractMarketplaceListingIdentity(productUrl);
-        if (identity) {
-            const searchPayload = await api.searchProductsRaw(videoId, productUrl);
-            const offerGroupItem = searchPayload?.shoppingProducts?.items?.[0];
-            const offersPayload = await api.getOffersForOfferGroupRaw(
-                videoId,
-                offerGroupItem,
-            );
-            const offers = offersPayload?.offersForOfferGroup?.items || [];
-            const exactIndex = findExactOfferIndex(offers, productUrl);
-            if (exactIndex < 0) {
-                throw createWorkerError(
-                    `YouTube Shopping không có đúng listing ${identity.offerId} trong nhóm ${offers.length} lựa chọn.`,
-                    'EXACT_OFFER_NOT_FOUND',
-                    'product-selection',
-                    false,
-                );
-            }
-            exactOffer = offers[exactIndex];
-            log(`Resolved exact marketplace offer ${identity.offerId} by API (${exactIndex + 1}/${offers.length}).`);
-        }
-    }
     let writeTokenTag = tag;
     if (hasOptions) {
         writeTokenTag = null;
@@ -2423,10 +2440,11 @@ async function bootstrapStudioWriteSession(
 
     await clickPickerNextButton(page);
     await clickPickerDoneButton(page);
-    const save = page.locator('ytcp-button#save button').first();
+    const save = page.locator('ytcp-button#save:visible button:visible').first();
     try {
         await page.waitForFunction(() => {
-            const button = document.querySelector('ytcp-button#save button');
+            const buttons = [...document.querySelectorAll('ytcp-button#save button')];
+            const button = buttons.find(item => item.offsetParent !== null);
             return button && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
         }, null, { timeout: 4_000 });
     } catch (error) {
@@ -2435,48 +2453,58 @@ async function bootstrapStudioWriteSession(
         await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
         api.invalidateWriteSession();
         return bootstrapStudioWriteSession(
-            page, videoId, productUrl, api, retryCount + 1,
+            page, videoId, productUrl, api, retryCount + 1, listingIdentityUrl,
         );
     }
     await save.click({ force: true });
     await waitForSaveToFinish(page, save);
 
-    for (let attempt = 0; attempt < 30 && !api.hasWriteSession(); attempt++) {
-        await page.waitForTimeout(100);
-    }
-    if (!api.hasWriteSession()) {
+    try {
+        await api.waitForWriteSession(10_000);
+    } catch (error) {
         log(`Studio write capture state: captured=${Boolean(api.writeSession)}, attestation=${Boolean(api.writeSession?.body?.attestationResponseData)}`);
-        throw createWorkerError(
-            'Không lấy được xác thực ghi từ YouTube Studio sau khi lưu.',
-            'WRITE_SESSION_NOT_READY',
-            'authentication',
-            true,
-        );
+        throw error;
     }
     return { exactOffer };
 }
 
-async function cleanupStudioProductsUi(page) {
+async function cleanupStudioProductsUiOnce(page) {
     await page.waitForLoadState('domcontentloaded', { timeout: 20_000 });
-    const productsButton = page.getByRole('button', {
-        name: /^(Products|Sản phẩm),/i,
-    }).first();
-    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+    const productsButton = page.locator(
+        'ytcp-button#products-description-button:visible',
+    ).first();
+    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit:visible').first();
     await Promise.race([
         editButton.waitFor({ state: 'visible', timeout: 20_000 }),
         productsButton.waitFor({ state: 'visible', timeout: 20_000 }),
     ]);
     if (!await editButton.isVisible().catch(() => false)) {
-        await productsButton.evaluate(element => element.click());
+        await clickStudioControl(productsButton);
     }
     await editButton.waitFor({ state: 'visible', timeout: 10_000 });
-    await editButton.evaluate(element => element.click());
+    await clickStudioControl(editButton);
 
     const search = page.locator('input#search-input.search-input');
     await search.waitFor({ state: 'visible', timeout: 10_000 });
     const selected = page.locator(
         'ytshopping-product-picker-selected-product ytshopping-product',
     );
+    await page.waitForTimeout(800);
+    if (await selected.count() === 0) {
+        const close = page.locator(
+            'ytcp-icon-button[aria-label="Close"], '
+            + 'ytcp-icon-button[aria-label="Đóng"], '
+            + 'button[aria-label="Close"], '
+            + 'button[aria-label="Đóng"]',
+        ).last();
+        if (await close.isVisible({ timeout: 500 }).catch(() => false)) {
+            await close.click({ force: true });
+        } else {
+            await page.keyboard.press('Escape').catch(() => { });
+        }
+        log('Studio UI confirmed that the product list is already empty.');
+        return;
+    }
     while (await selected.count() > 0) {
         await selected.first().hover();
         await page.locator('ytcp-icon-button.delete-product-button').first()
@@ -2490,32 +2518,67 @@ async function cleanupStudioProductsUi(page) {
     await done.waitFor({ state: 'visible', timeout: 10_000 });
     await done.click({ force: true });
 
-    const save = page.locator('ytcp-button#save button').first();
+    const save = page.locator('ytcp-button#save:visible button:visible').first();
     await page.waitForFunction(() => {
-        const button = document.querySelector('ytcp-button#save button');
+        const buttons = [...document.querySelectorAll('ytcp-button#save button')];
+        const button = buttons.find(item => item.offsetParent !== null);
         return button && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
     }, null, { timeout: 10_000 });
     await save.click({ force: true });
     await waitForSaveToFinish(page, save);
 }
 
+async function cleanupStudioProductsUi(page, retryCount = 0) {
+    try {
+        await cleanupStudioProductsUiOnce(page);
+    } catch (error) {
+        if (retryCount >= 1 || isTargetClosedError(error)) throw error;
+        log(`Studio cleanup UI was not ready; reloading once: ${shortErrorMessage(error)}`);
+        await page.reload({ waitUntil: 'domcontentloaded', timeout: 20_000 });
+        return cleanupStudioProductsUi(page, retryCount + 1);
+    }
+}
+
+async function cleanupStudioProductsApi(api, videoId, maxAttempts = 2) {
+    let lastError = null;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        try {
+            await api.updateProducts(videoId, []);
+            return;
+        } catch (error) {
+            lastError = error;
+            if (attempt >= maxAttempts || !api.hasWriteSession()) break;
+            const delay = 300 * attempt;
+            log(`API cleanup attempt ${attempt} failed; retrying after ${delay}ms: ${shortErrorMessage(error)}`);
+            await pageSafeDelay(api.page, delay);
+        }
+    }
+    throw lastError;
+}
+
+async function pageSafeDelay(page, delayMs) {
+    if (page && !page.isClosed()) {
+        await page.waitForTimeout(delayMs).catch(() => { });
+    } else {
+        await new Promise(resolve => setTimeout(resolve, delayMs));
+    }
+}
+
 async function discoverShoppingItemId(page, productUrl) {
     const productsButton = page.locator(
-        'button:has(div.ytcpButtonShapeImpl__button-text-content)',
-    ).filter({
-        hasText: /(Sáº£n pháº©m|Products|tagged product|sáº£n pháº©m Ä‘Ã£ gáº¯n)/i,
-    }).first();
-    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit');
+        'ytcp-button#products-description-button:visible',
+    ).first();
+    const editButton = page.locator('ytcp-icon-button#shopping-toolbar-edit:visible').first();
 
     let search = page.locator('input#search-input.search-input');
     if (!await search.isVisible({ timeout: 300 }).catch(() => false)
         && !await editButton.isVisible({ timeout: 1000 }).catch(() => false)) {
         await productsButton.waitFor({ state: 'visible', timeout: 10_000 });
-        await productsButton.click({ force: true });
+        await clickStudioControl(productsButton);
     }
     if (!await search.isVisible({ timeout: 300 }).catch(() => false)) {
         await editButton.waitFor({ state: 'visible', timeout: 8_000 });
-        await editButton.click({ force: true });
+        await clickStudioControl(editButton);
     }
 
     search = page.locator('input#search-input.search-input');
@@ -2577,26 +2640,61 @@ async function executeStudioApiJob(
     }
     const videoId = match[1];
     const api = await warmStudioApiSession(worker, page);
+    const listingIdentityUrl = await resolveProductOriginUrl(productUrl, null);
+    const listingIdentity = extractMarketplaceListingIdentity(listingIdentityUrl);
+    if (listingIdentity) {
+        log(`Resolved ${listingIdentity.marketplace} listing identity: ${listingIdentity.offerId}`);
+    }
     let productAdded = false;
+    let uiBootstrapStarted = false;
     let primaryError = null;
 
     try {
         const addStarted = Date.now();
-        api.invalidateWriteSession();
-        log('Creating a fresh Studio write token with one automatic save.');
-        const { exactOffer } = await bootstrapStudioWriteSession(
-            page,
-            videoId,
-            productUrl,
-            api,
-        );
-        productAdded = true;
+        let exactOffer = null;
+        let usedCachedWriteSession = api.hasWriteSession();
+
+        if (usedCachedWriteSession) {
+            log('Reusing the existing Studio write session.');
+            try {
+                exactOffer = await resolveExactMarketplaceOffer(
+                    api,
+                    videoId,
+                    productUrl,
+                    listingIdentityUrl,
+                );
+                const cachedItemId = exactOffer?.itemId
+                    || (await api.searchProduct(videoId, productUrl)).shoppingItemId;
+                await api.updateProducts(videoId, [cachedItemId]);
+                productAdded = true;
+                log(`Cached-session API add took ${Date.now() - addStarted}ms`);
+            } catch (error) {
+                log(`Cached Studio write session was rejected; refreshing once: ${shortErrorMessage(error)}`);
+                api.invalidateWriteSession();
+                usedCachedWriteSession = false;
+            }
+        }
+
+        if (!usedCachedWriteSession) {
+            log('Creating a fresh Studio write token with one automatic save.');
+            uiBootstrapStarted = true;
+            ({ exactOffer } = await bootstrapStudioWriteSession(
+                page,
+                videoId,
+                productUrl,
+                api,
+                0,
+                listingIdentityUrl,
+            ));
+            productAdded = true;
+        }
+
         let shoppingItemId = exactOffer?.itemId?.rawMerchantOfferId
             || api.getWriteShoppingItemId();
-        if (exactOffer?.itemId) {
+        if (!usedCachedWriteSession && exactOffer?.itemId) {
             const exactUpdateStarted = Date.now();
             await api.updateProducts(videoId, [exactOffer.itemId]);
-            log(`API exact-offer update took ${Date.now() - exactUpdateStarted}ms`);
+            log(`API exact-offer ${exactOffer.itemId.rawMerchantOfferId || '(unknown)'} update took ${Date.now() - exactUpdateStarted}ms`);
         }
         if (!shoppingItemId) {
             const discovered = await api.searchProduct(videoId, productUrl);
@@ -2616,8 +2714,18 @@ async function executeStudioApiJob(
                 retryDelayMs: 500,
             },
         );
-        const expectedIdentity = extractMarketplaceListingIdentity(productUrl);
-        const actualIdentity = extractMarketplaceListingIdentity(data.affiliateUrl);
+        const expectedIdentity = listingIdentity;
+        let actualIdentity = extractMarketplaceListingIdentity(data.affiliateUrl);
+        if (expectedIdentity && !actualIdentity) {
+            const resolvedAffiliateUrl = await resolveProductOriginUrl(
+                data.affiliateUrl,
+                null,
+            );
+            actualIdentity = extractMarketplaceListingIdentity(resolvedAffiliateUrl);
+            if (actualIdentity) {
+                log(`Resolved affiliate listing identity: ${actualIdentity.offerId}`);
+            }
+        }
         if (expectedIdentity && (
             actualIdentity?.productId !== expectedIdentity.productId
             || actualIdentity?.offerId !== expectedIdentity.offerId
@@ -2642,18 +2750,18 @@ async function executeStudioApiJob(
         primaryError = error;
         throw error;
     } finally {
-        if (productAdded || api.hasWriteSession()) {
+        if (uiBootstrapStarted || productAdded || api.hasWriteSession()) {
             const removeStarted = Date.now();
             try {
-                await cleanupStudioProductsUi(page);
-                log(`Studio cleanup took ${Date.now() - removeStarted}ms`);
+                await cleanupStudioProductsApi(api, videoId);
+                log(`API cleanup took ${Date.now() - removeStarted}ms`);
             } catch (error) {
-                log(`Studio cleanup failed: ${shortErrorMessage(error)}; trying API fallback.`);
+                log(`API cleanup failed: ${shortErrorMessage(error)}; trying Studio UI fallback.`);
                 try {
-                    await api.updateProducts(videoId, []);
-                    log(`API cleanup fallback took ${Date.now() - removeStarted}ms`);
+                    await cleanupStudioProductsUi(page);
+                    log(`Studio cleanup fallback took ${Date.now() - removeStarted}ms`);
                 } catch (fallbackError) {
-                    log(`API cleanup fallback failed: ${shortErrorMessage(fallbackError)}`);
+                    log(`Studio cleanup fallback failed: ${shortErrorMessage(fallbackError)}`);
                     if (primaryError) {
                         primaryError.cleanupError = shortErrorMessage(fallbackError);
                         primaryError.cleanupSucceeded = false;
@@ -2661,8 +2769,6 @@ async function executeStudioApiJob(
                         throw fallbackError;
                     }
                 }
-            } finally {
-                api.invalidateWriteSession();
             }
         }
     }
@@ -2780,66 +2886,57 @@ async function openBrowsers(urls) {
 
         await new Promise(r => setTimeout(r, 500));
 
-        const sessionsDir = path.resolve(__dirname, '..', SESSIONS_DIR);
+        const sessionsDir = path.isAbsolute(SESSIONS_DIR)
+            ? SESSIONS_DIR
+            : path.resolve(process.cwd(), SESSIONS_DIR);
         const defaultDataDir = path.join(sessionsDir, 'default', 'browser-data');
+        const primaryDataDir = path.join(sessionsDir, 'worker-0', 'browser-data');
         let startPort = 19222;
 
         // Dirs to skip when cloning (cache = large & unnecessary)
         const SKIP_DIRS = ['Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'GrShaderCache',
             'ShaderCache', 'Service Worker', 'ScriptCache', 'component_crx_cache', 'Sessions'];
-        let sharedApiOwner = null;
 
-        for (let i = 0; i < urls.length; i++) {
-            const url = urls[i];
-            if (USE_STUDIO_INTERNAL_API && sharedApiOwner) {
-                try {
-                    const browser = await connectWorkerBrowser(sharedApiOwner);
-                    const context = browser.contexts()[0];
-                    const page = await context.newPage();
-                    await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 30_000 });
-                    const worker = {
-                        process: null,
-                        port: sharedApiOwner.port,
-                        url,
-                        sessionDir: sharedApiOwner.sessionDir,
-                        busy: false,
-                        restarting: false,
-                        cdpLocked: null,
-                        cdpBrowser: browser,
-                        healthMisses: 0,
-                        lastRefreshAt: Date.now(),
-                        lastRecoveredAt: 0,
-                        sharedApiOwner,
-                    };
-                    activeWorkers.push(worker);
-                    log(`API tab ${i} opened in shared Chrome for URL: ${url}`);
-                    const started = Date.now();
-                    await warmStudioApiSession(worker, page);
-                    log(`API session ${i} warmed in ${Date.now() - started}ms`);
-                } catch (error) {
-                    log(`Failed to open shared API tab ${i}: ${shortErrorMessage(error)}`);
+        // During sign-in only the primary browser is needed. Once authenticated,
+        // that closed profile is cloned into one visible Chrome per video URL.
+        const browserUrls = USE_STUDIO_INTERNAL_API && primaryOnlyMode ? urls.slice(0, 1) : urls;
+        const hasProfile = dir => fs.existsSync(path.join(dir, 'Local State'));
+        const sourceDataDir = hasProfile(primaryDataDir)
+            ? primaryDataDir
+            : (hasProfile(defaultDataDir) ? defaultDataDir : null);
+
+        // Prepare missing destinations before launching any Chrome. Existing
+        // worker profiles are reused as-is so Start does not overwrite their
+        // cookies or copy the primary profile again on every launch.
+        if (sourceDataDir) {
+            for (let i = 0; i < browserUrls.length; i++) {
+                const browserDataDir = path.join(sessionsDir, `worker-${i}`, 'browser-data');
+                if (path.resolve(browserDataDir) === path.resolve(sourceDataDir)) continue;
+                if (hasProfile(browserDataDir)) {
+                    log(`♻️ Reusing existing session worker-${i}`);
+                    continue;
                 }
-                continue;
+                try {
+                    if (fs.existsSync(browserDataDir)) {
+                        fs.rmSync(browserDataDir, { recursive: true, force: true });
+                    }
+                    fs.cpSync(sourceDataDir, browserDataDir, {
+                        recursive: true,
+                        filter: src => !SKIP_DIRS.includes(path.basename(src)),
+                    });
+                    prepareProfileForLaunch(browserDataDir);
+                    log(`📋 Copied primary session → worker-${i}`);
+                } catch (error) {
+                    log(`⚠️ Failed to copy primary session to worker-${i}: ${error.message}`);
+                }
             }
+        }
 
+        for (let i = 0; i < browserUrls.length; i++) {
+            const url = browserUrls[i];
             const port = startPort + i;
             const sessionDir = path.join(sessionsDir, `worker-${i}`);
             const browserDataDir = path.join(sessionDir, 'browser-data');
-
-            // Auto-clone from default profile if this worker has no session data
-            if (!fs.existsSync(path.join(browserDataDir, 'Local State')) && fs.existsSync(path.join(defaultDataDir, 'Local State'))) {
-                try {
-                    if (fs.existsSync(browserDataDir)) fs.rmSync(browserDataDir, { recursive: true, force: true });
-                    fs.cpSync(defaultDataDir, browserDataDir, {
-                        recursive: true,
-                        filter: (src) => !SKIP_DIRS.includes(path.basename(src)),
-                    });
-                    prepareProfileForLaunch(browserDataDir);
-                    log(`📋 Auto-clone session → worker-${i}`);
-                } catch (e) {
-                    log(`⚠️ Lỗi auto-clone worker-${i}: ${e.message}`);
-                }
-            }
 
             // Prepare session directory
             if (!fs.existsSync(sessionDir)) {
@@ -2862,7 +2959,6 @@ async function openBrowsers(urls) {
                     lastRecoveredAt: 0,
                 };
                 activeWorkers.push(worker);
-                if (USE_STUDIO_INTERNAL_API && !sharedApiOwner) sharedApiOwner = worker;
                 log(`Browser ${i} opened on port ${port} for URL: ${url}`);
                 if (USE_STUDIO_INTERNAL_API) {
                     try {
@@ -3146,6 +3242,14 @@ setInterval(async () => {
 
             if (!USE_STUDIO_INTERNAL_API) {
                 await closeExtraPages(context, targetPage);
+            } else if (!worker.studioApi?.session) {
+                try {
+                    await warmStudioApiSession(worker, targetPage);
+                    log(`API session ready on port ${worker.port}`);
+                } catch {
+                    // The primary browser may still be waiting for the
+                    // user to finish signing in. The next health pass retries.
+                }
             }
 
             if (Date.now() - (worker.lastRefreshAt || 0) > PAGE_IDLE_REFRESH_MS) {
@@ -3181,7 +3285,7 @@ process.on('SIGINT', async () => {
 
 async function restartBrowsers() {
     if (currentUrls.length > 0) {
-        log(`Đang restart browsers (mode: ${headlessMode ? 'headless' : 'headed'})...`);
+        log(`Đang restart ${primaryOnlyMode ? 'browser gốc' : 'tất cả browsers'}...`);
         await openBrowsers(currentUrls);
 
         // Re-register with server
@@ -3306,16 +3410,6 @@ function getControlPanelHTML() {
             border-radius: 20px;
             font-size: 11px;
             font-weight: 600;
-        }
-        .mode-badge.headless {
-            background: rgba(234, 179, 8, 0.15);
-            color: #eab308;
-            border: 1px solid rgba(234, 179, 8, 0.3);
-        }
-        .mode-badge.headed {
-            background: rgba(34, 197, 94, 0.15);
-            color: #22c55e;
-            border: 1px solid rgba(34, 197, 94, 0.3);
         }
         .btn {
             padding: 10px 24px;
@@ -3501,22 +3595,6 @@ function getControlPanelHTML() {
             </div>
         </div>
 
-        <!-- Browser Mode -->
-        <div class="card">
-            <div class="card-title">Chế độ Browser</div>
-            <div class="toggle-section">
-                <div class="toggle-info">
-                    <h3>Hiển thị Browser <span class="mode-badge" id="modeBadge">...</span></h3>
-                    <p>Khi tắt, browser chạy ngầm (headless). Khi bật, browser hiển thị cửa sổ.</p>
-                </div>
-                <div class="actions">
-                    <button class="btn btn-primary" id="toggleBtn" onclick="toggleHeadless()">
-                        🔄 Đang tải...
-                    </button>
-                </div>
-            </div>
-        </div>
-
         <!-- Extra Actions -->
         <div class="card">
             <div class="card-title">Hành động</div>
@@ -3579,24 +3657,6 @@ function getControlPanelHTML() {
                 }
                 document.getElementById('apiVideosCard').style.display = data.apiMode ? '' : 'none';
 
-                // Mode badge
-                const badge = document.getElementById('modeBadge');
-                if (data.headless) {
-                    badge.textContent = 'TẮT';
-                    badge.className = 'mode-badge headless';
-                } else {
-                    badge.textContent = 'BẬT';
-                    badge.className = 'mode-badge headed';
-                }
-
-                // Toggle button
-                const btn = document.getElementById('toggleBtn');
-                if (data.headless) {
-                    btn.innerHTML = '👁️ Bật hiển thị';
-                } else {
-                    btn.innerHTML = '🙈 Tắt hiển thị';
-                }
-
                 // Browser list
                 const list = document.getElementById('browserList');
                 if (data.browsers.length === 0) {
@@ -3625,21 +3685,6 @@ function getControlPanelHTML() {
             } catch (e) {
                 console.error('Fetch status error:', e);
             }
-        }
-
-        async function toggleHeadless() {
-            const btn = document.getElementById('toggleBtn');
-            btn.disabled = true;
-            btn.innerHTML = '<span class="spinner"></span> Đang chuyển...';
-            try {
-                const res = await fetch('/api/toggle-headless', { method: 'POST' });
-                const data = await res.json();
-                showToast(data.headless ? '🙈 Đã chuyển sang headless' : '👁️ Đã bật hiển thị browser');
-                await fetchStatus();
-            } catch (e) {
-                showToast('Lỗi: ' + e.message, 'error');
-            }
-            btn.disabled = false;
         }
 
         async function restartBrowsers() {
@@ -3698,9 +3743,9 @@ function startControlPanel() {
             res.end(JSON.stringify({
                 hostname: os.hostname(),
                 serverUrl: SERVER_URL,
-                headless: headlessMode,
+                primaryOnlyMode,
                 connectionEnabled,
-                wsConnected: ws && ws.readyState === WebSocket.OPEN,
+                wsConnected: Boolean(ws && ws.readyState === WebSocket.OPEN),
                 apiMode: USE_STUDIO_INTERNAL_API,
                 localUrls: currentUrls,
                 browsers: activeWorkers.map(w => ({ port: w.port, url: w.url })),
@@ -3747,13 +3792,12 @@ function startControlPanel() {
                 res.writeHead(400, { 'Content-Type': 'application/json' });
                 res.end(JSON.stringify({ error: error.message }));
             }
-        } else if (url.pathname === '/api/toggle-headless' && req.method === 'POST') {
-            headlessMode = !headlessMode;
-            log(`Chuyển sang mode: ${headlessMode ? 'HEADLESS' : 'HEADED'}`);
-            // Restart browsers with new mode
+        } else if (url.pathname === '/api/toggle-primary-only' && req.method === 'POST') {
+            primaryOnlyMode = !primaryOnlyMode;
+            log(primaryOnlyMode ? 'Chuyển sang browser gốc để đăng nhập' : 'Đang mở tất cả browser hiển thị');
             await restartBrowsers().catch(e => log(`Lỗi restart: ${e.message}`));
             res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ headless: headlessMode, message: 'OK' }));
+            res.end(JSON.stringify({ primaryOnlyMode, message: 'OK' }));
         } else if (url.pathname === '/api/restart-browsers' && req.method === 'POST') {
             await restartBrowsers().catch(e => log(`Lỗi restart: ${e.message}`));
             res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -3855,7 +3899,7 @@ async function main() {
     console.log('═══════════════════════════════════════════');
     console.log(`  Server URL: ${SERVER_URL}`);
     console.log(`  Hostname: ${os.hostname()}`);
-    console.log(`  Headless: ${headlessMode ? 'YES (--headless=new)' : 'NO (headed)'}`);
+    console.log('  Browser display: VISIBLE');
     console.log(`  Control Panel: http://localhost:${CONTROL_PANEL_PORT}`);
     console.log('');
 
@@ -3865,7 +3909,9 @@ async function main() {
         log(`API worker đọc ${currentUrls.length} video URL local`);
         if (currentUrls.length > 0) await openBrowsers(currentUrls);
     }
-    connect();
+    // The launcher can disable the relay while the primary browser is waiting
+    // for sign-in. Do not reconnect after browser startup in that case.
+    if (connectionEnabled) connect();
 }
 
 main().catch(console.error);

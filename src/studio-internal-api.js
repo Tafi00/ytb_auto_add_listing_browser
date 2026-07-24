@@ -100,6 +100,53 @@ export function extractShoppingItemId(veSiblingKey) {
     return match[1];
 }
 
+export function extractMarketplaceListingIdentity(productUrl) {
+    try {
+        const url = new URL(productUrl);
+        if (/lazada\./i.test(url.hostname)) {
+            const match = decodeURIComponent(url.pathname)
+                .match(/-i(\d+)-s(\d+)\.html/i);
+            if (match) {
+                return {
+                    marketplace: 'lazada',
+                    productId: match[1],
+                    offerId: match[2],
+                };
+            }
+        }
+        if (/shopee\.vn$/i.test(url.hostname)) {
+            const pathname = decodeURIComponent(url.pathname);
+            const productPath = pathname.match(/\/product\/(\d+)\/(\d+)/i);
+            const seoPath = pathname.match(/-i\.(\d+)\.(\d+)(?:[/?#]|$)/i);
+            const openPath = pathname.match(/\/opaanlp\/(\d+)\/(\d+)(?:[/?#]|$)/i);
+            const shopId = productPath?.[1] || seoPath?.[1]
+                || openPath?.[1] || url.searchParams.get('shopid') || '';
+            const itemId = productPath?.[2] || seoPath?.[2] || openPath?.[2]
+                || url.searchParams.get('itemid') || '';
+            if (/^\d+$/.test(itemId)) {
+                return {
+                    marketplace: 'shopee',
+                    productId: String(shopId),
+                    offerId: String(itemId),
+                };
+            }
+        }
+    } catch {}
+    return null;
+}
+
+export function findExactOfferIndex(offers, productUrl) {
+    const identity = extractMarketplaceListingIdentity(productUrl);
+    if (!identity) return -1;
+    return (offers || []).findIndex(offer => {
+        const rawOfferId = String(offer?.itemId?.rawMerchantOfferId || '');
+        if (rawOfferId === identity.offerId) return true;
+        const targetIdentity = extractMarketplaceListingIdentity(offer?.targetUrl || '');
+        return targetIdentity?.productId === identity.productId
+            && targetIdentity?.offerId === identity.offerId;
+    });
+}
+
 export function buildProductSelectionBody({
     context,
     delegationContext,
@@ -146,6 +193,7 @@ export function buildProductSearchBody({ context, delegationContext, videoId, pr
             },
             searchQuery: {
                 rawQuery: productUrl,
+                firstPartyQueryConfig: {},
                 thirdPartyQueryConfig: {},
                 productSourceRestrict: 'PRODUCT_SOURCE_ALL',
             },
@@ -289,6 +337,7 @@ export class StudioInternalApi {
         this.session = null;
         this.writeSession = null;
         this.waiters = new Set();
+        this.writeWaiters = new Set();
         this.onRequest = request => void this.captureRequest(request);
     }
 
@@ -300,6 +349,7 @@ export class StudioInternalApi {
     stop() {
         this.page.off('request', this.onRequest);
         this.waiters.clear();
+        this.writeWaiters.clear();
     }
 
     async captureRequest(request) {
@@ -314,15 +364,28 @@ export class StudioInternalApi {
         } catch {
             return;
         }
-        if (!body?.context) return;
-
         let headers;
         try {
             headers = selectStudioHeaders(await request.allHeaders());
         } catch {
-            return;
+            headers = {};
         }
-        if (!headers.authorization) return;
+
+        const isWriteRequest = request.url().includes('/video_manager/metadata_update');
+        const writeHeaders = headers.authorization ? headers : this.session?.headers;
+        if (isWriteRequest && writeHeaders) {
+            this.writeSession = {
+                capturedAt: Date.now(),
+                body: structuredClone(body),
+                headers: writeHeaders,
+            };
+            if (this.writeSession.body?.attestationResponseData) {
+                for (const resolve of this.writeWaiters) resolve(this.writeSession);
+                this.writeWaiters.clear();
+            }
+        }
+
+        if (!body?.context || !headers.authorization) return;
 
         this.session = {
             capturedAt: Date.now(),
@@ -330,13 +393,6 @@ export class StudioInternalApi {
             delegationContext: body.delegationContext,
             headers,
         };
-        if (request.url().includes('/video_manager/metadata_update')) {
-            this.writeSession = {
-                capturedAt: Date.now(),
-                body: structuredClone(body),
-                headers,
-            };
-        }
         for (const resolve of this.waiters) resolve(this.session);
         this.waiters.clear();
     }
@@ -371,17 +427,45 @@ export class StudioInternalApi {
         );
     }
 
+    async waitForWriteSession(timeoutMs = 10_000) {
+        if (this.hasWriteSession()) return this.writeSession;
+        return new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                this.writeWaiters.delete(done);
+                reject(new StudioApiError(
+                    'Không lấy được xác thực ghi từ YouTube Studio sau khi lưu.',
+                    {
+                        code: 'WRITE_SESSION_NOT_READY',
+                        stage: 'authentication',
+                        retryable: true,
+                    },
+                ));
+            }, timeoutMs);
+            const done = session => {
+                clearTimeout(timer);
+                resolve(session);
+            };
+            this.writeWaiters.add(done);
+        });
+    }
+
     getWriteShoppingItemId() {
         const items = this.writeSession?.body?.productsSelection?.shoppingItemIds || [];
         for (const item of items) {
-            const value = typeof item === 'object' ? item?.productClusterMid : item;
+            const value = typeof item === 'object'
+                ? item?.rawMerchantOfferId || item?.productClusterMid
+                : item;
             if (/^\d+$/.test(String(value || ''))) return String(value);
+            try {
+                return findProductClusterMid(item);
+            } catch {}
         }
         return null;
     }
 
     invalidateWriteSession() {
         this.writeSession = null;
+        this.writeWaiters.clear();
     }
 
     async updateProducts(videoId, shoppingItemIds) {

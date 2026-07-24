@@ -1,7 +1,7 @@
 const ERROR_MESSAGES = {
   AUTH_REQUIRED: 'Phiên đăng nhập YouTube Studio đã hết hạn. Hãy mở API Tool và đăng nhập lại.',
   AUTH_SESSION_NOT_READY: 'API Tool chưa lấy được phiên Studio. Hãy mở chế độ đăng nhập rồi tải lại YouTube Studio.',
-  PRODUCT_NOT_FOUND: 'Không tìm thấy sản phẩm này trên YouTube Shopping. Hãy kiểm tra URL hoặc thử sản phẩm khác.',
+  PRODUCT_NOT_FOUND: 'Sản phẩm này không gắn giỏ được.',
   PRODUCT_SEARCH_FAILED: 'YouTube Shopping chưa tìm được sản phẩm. Vui lòng thử lại.',
   PRODUCT_ADD_FAILED: 'YouTube Studio không gắn được sản phẩm vào video. Vui lòng thử lại.',
   AFFILIATE_NOT_READY: 'Đã gắn sản phẩm nhưng link affiliate công khai chưa cập nhật kịp. Vui lòng thử lại sau.',

@@ -4,6 +4,10 @@ import test from 'node:test';
 import { formatApiError, readJsonResponse } from '../web/src/response.js';
 
 test('formats structured worker errors for users', () => {
+    assert.equal(
+        formatApiError({ code: 'PRODUCT_NOT_FOUND', error: 'raw' }),
+        'Sản phẩm này không gắn giỏ được.',
+    );
     assert.match(
         formatApiError({ code: 'AUTH_REQUIRED', error: 'raw' }),
         /đăng nhập lại/,
