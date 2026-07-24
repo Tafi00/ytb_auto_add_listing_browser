@@ -1219,7 +1219,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
         } catch {
             log('Product not found within 15s, reloading page...');
             await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
-            throw new Error('Sản phẩm này không gắn giỏ được.');
+            throw new Error('Sản phẩm này không gắn giỏ được');
         }
     }
 
@@ -1232,7 +1232,7 @@ async function addProduct(page, productUrl, _retryCount = 0) {
     if (bannerText !== null) {
         log(`Banner message: "${bannerText}", product cannot be added. Reloading...`);
         await page.reload({ waitUntil: 'commit', timeout: 15000 }).catch(() => { });
-        throw new Error('Sản phẩm này không gắn giỏ được.');
+        throw new Error('Sản phẩm này không gắn giỏ được');
     }
 
     // ---- Check if product has multiple options (variants) ----
@@ -2286,7 +2286,7 @@ async function resolveExactMarketplaceOffer(
     const searchItems = searchPayload?.shoppingProducts?.items || [];
     if (searchItems.length === 0) {
         throw createWorkerError(
-            'Sản phẩm này không gắn giỏ được.',
+            'Sản phẩm này không gắn giỏ được',
             'PRODUCT_NOT_FOUND',
             'product-selection',
             false,
@@ -2303,7 +2303,7 @@ async function resolveExactMarketplaceOffer(
     );
     if (!offerGroupItem) {
         throw createWorkerError(
-            'Sản phẩm này không gắn giỏ được.',
+            'Sản phẩm này không gắn giỏ được',
             'PRODUCT_NOT_FOUND',
             'product-selection',
             false,
@@ -2318,7 +2318,7 @@ async function resolveExactMarketplaceOffer(
     const exactIndex = findExactOfferIndex(offers, listingIdentityUrl);
     if (exactIndex < 0) {
         throw createWorkerError(
-            'Sản phẩm này không gắn giỏ được.',
+            'Sản phẩm này không gắn giỏ được',
             'PRODUCT_NOT_FOUND',
             'product-selection',
             false,
