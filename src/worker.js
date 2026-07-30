@@ -29,9 +29,11 @@ const BROWSER_HEALTH_INTERVAL_MS = parseInt(process.env.BROWSER_HEALTH_INTERVAL_
 const PAGE_IDLE_REFRESH_MS = parseInt(process.env.PAGE_IDLE_REFRESH_MS || `${30 * 60 * 1000}`);
 const CHROME_ERROR_URL_PREFIX = 'chrome-error://';
 const ENABLE_BROWSER_PUBLIC_FALLBACK = process.env.ENABLE_BROWSER_PUBLIC_FALLBACK === '1';
-const USE_DIRECT_SHOPEE_AFFILIATE = process.env.USE_DIRECT_SHOPEE_AFFILIATE !== '0';
-const USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK = process.env.USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK !== '0';
-const USE_DIRECT_LAZADA_AFFILIATE = process.env.USE_DIRECT_LAZADA_AFFILIATE !== '0';
+// Browser-only build: links must come from the product attached in YouTube Studio.
+// Direct URL construction is opt-in so it cannot silently bypass the browser workflow.
+const USE_DIRECT_SHOPEE_AFFILIATE = process.env.USE_DIRECT_SHOPEE_AFFILIATE === '1';
+const USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK = process.env.USE_PROVIDED_LAZADA_AFFILIATE_FALLBACK === '1';
+const USE_DIRECT_LAZADA_AFFILIATE = process.env.USE_DIRECT_LAZADA_AFFILIATE === '1';
 const USE_STUDIO_INTERNAL_API = process.env.USE_STUDIO_INTERNAL_API === '1';
 const USE_LOCAL_STUDIO_API_URLS =
     USE_STUDIO_INTERNAL_API && process.env.STUDIO_API_USE_LOCAL_URLS !== '0';

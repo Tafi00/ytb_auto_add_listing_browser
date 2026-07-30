@@ -1,7 +1,6 @@
 import { useState, useEffect, useRef } from 'react';
 import { FiGlobe, FiZap, FiEdit3, FiFilm, FiAlertTriangle, FiList, FiFileText, FiPlus, FiX, FiTrash2, FiWifi, FiWifiOff } from 'react-icons/fi';
 import { api } from '../App';
-import { formatApiError, readJsonResponse } from '../response';
 
 const BrowserIcon = () => (
   <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" width="20" height="20">
@@ -112,8 +111,8 @@ function Dashboard({ user, onLogout }) {
           method: 'POST',
           body: JSON.stringify({ productUrl: link, clientId: 'admin-test', bypassRateLimit: true }),
         });
-        const data = await readJsonResponse(res);
-        if (!res.ok || data.error) throw new Error(formatApiError(data, 'Request failed'));
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Request failed');
         return data;
       }));
 
@@ -278,13 +277,7 @@ function Dashboard({ user, onLogout }) {
               <div className="profile-meta">
                 {workerInfo.map((w, i) => (
                   <span key={i} style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>
-                    Worker {i + 1}: {
-                      w.workerType === 'studio-api'
-                        ? 'YouTube Studio API'
-                        : w.workerType === 'android'
-                          ? 'Android / LDPlayer'
-                          : 'Web / Chrome'
-                    }
+                    Worker {i + 1}: {w.workerType === 'android' ? 'Android / LDPlayer' : 'Web / Chrome'}
                     {' · '}{w.urls?.length || 0} video
                     {w.devices?.length ? ` · ${w.devices.join(', ')}` : ''}
                     {' · '}{w.busy ? 'Busy' : 'Ready'}
@@ -296,7 +289,7 @@ function Dashboard({ user, onLogout }) {
             {!workerConnected && (
               <div className="profile-meta" style={{ marginTop: '8px' }}>
                 <span style={{ color: '#f59e0b', fontSize: '12px' }}>
-                  Chạy Studio API worker: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>npm run api-tool</code>
+                  Chạy Android worker: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>npm run android-worker</code>
                 </span>
               </div>
             )}
