@@ -277,11 +277,7 @@ function Dashboard({ user, onLogout }) {
               <div className="profile-meta">
                 {workerInfo.map((w, i) => (
                   <span key={i} style={{ display: 'block', fontSize: '12px', color: '#94a3b8', marginTop: '4px' }}>
-                    Worker {i + 1}: Browser / Chrome
-                    {' · '}{w.urls?.length || 0} video
-                    {w.devices?.length ? ` · ${w.devices.join(', ')}` : ''}
-                    {' · '}{w.busy ? 'Busy' : 'Ready'}
-                    {' · '}Kết nối lúc {new Date(w.connectedAt).toLocaleTimeString()}
+                    Worker {i + 1}: {w.urls?.length || 0} tabs · Kết nối lúc {new Date(w.connectedAt).toLocaleTimeString()}
                   </span>
                 ))}
               </div>
@@ -289,7 +285,7 @@ function Dashboard({ user, onLogout }) {
             {!workerConnected && (
               <div className="profile-meta" style={{ marginTop: '8px' }}>
                 <span style={{ color: '#f59e0b', fontSize: '12px' }}>
-                  Mở <strong style={{ color: '#fbbf24' }}>YT Browser Worker.exe</strong> trên máy Windows, đăng nhập YouTube Studio rồi khởi động worker.
+                  💡 Chạy worker trên máy Windows: <code style={{ background: 'rgba(255,255,255,0.1)', padding: '2px 6px', borderRadius: '4px' }}>npm run worker</code>
                 </span>
               </div>
             )}

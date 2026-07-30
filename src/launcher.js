@@ -44,36 +44,6 @@ function cleanLockFiles(dir) {
     }
 }
 
-function cleanSessionRestoreState(userDataDir) {
-    const defaultDir = path.join(userDataDir, 'Default');
-    if (!fs.existsSync(defaultDir)) return;
-
-    for (const name of ['Sessions', 'Current Session', 'Current Tabs', 'Last Session', 'Last Tabs']) {
-        try { fs.rmSync(path.join(defaultDir, name), { recursive: true, force: true }); } catch { }
-    }
-
-    const preferencesPath = path.join(defaultDir, 'Preferences');
-    try {
-        if (!fs.existsSync(preferencesPath)) return;
-        const preferences = JSON.parse(fs.readFileSync(preferencesPath, 'utf8').replace(/^\uFEFF/, ''));
-        preferences.profile = preferences.profile || {};
-        preferences.profile.exit_type = 'Normal';
-        preferences.profile.exited_cleanly = true;
-
-        if (preferences.session?.restore_on_startup === 1) {
-            delete preferences.session.restore_on_startup;
-            delete preferences.session.startup_urls;
-        }
-
-        fs.writeFileSync(preferencesPath, JSON.stringify(preferences));
-    } catch { }
-}
-
-function prepareProfileForLaunch(userDataDir) {
-    cleanLockFiles(userDataDir);
-    cleanSessionRestoreState(userDataDir);
-}
-
 function killTree(pid) {
     try {
         execSync(`taskkill /F /T /PID ${pid}`, { stdio: 'ignore' });
@@ -132,15 +102,12 @@ ipcMain.handle('open-default-browser', async () => {
     if (!chrome) return { ok: false, error: 'Không tìm thấy Chrome!' };
 
     fs.mkdirSync(DEFAULT_DATA_DIR, { recursive: true });
-    prepareProfileForLaunch(DEFAULT_DATA_DIR);
+    cleanLockFiles(DEFAULT_DATA_DIR);
 
     defaultChromeProc = spawn(chrome, [
         `--user-data-dir=${DEFAULT_DATA_DIR}`,
         '--disable-features=TranslateUI', '--disable-infobars',
         '--disable-component-update', '--disable-extensions',
-        '--no-first-run', '--no-default-browser-check',
-        '--disable-session-crashed-bubble', '--disable-restore-session-state',
-        '--noerrdialogs',
         '--window-size=1300,900', 'https://studio.youtube.com',
     ], { detached: false, stdio: 'ignore' });
 
@@ -188,7 +155,7 @@ ipcMain.handle('clone-and-start', async () => {
 
     // Clone full browser-data but skip cache dirs (giữ nguyên session Google)
     const SKIP_DIRS = ['Cache', 'Code Cache', 'GPUCache', 'DawnCache', 'GrShaderCache',
-        'ShaderCache', 'Service Worker', 'ScriptCache', 'component_crx_cache', 'Sessions'];
+        'ShaderCache', 'Service Worker', 'ScriptCache', 'component_crx_cache'];
 
     let cloned = 0;
     let skipped = 0;
@@ -196,7 +163,6 @@ ipcMain.handle('clone-and-start', async () => {
         const target = path.join(SESSIONS_DIR, `worker-${i}`, 'browser-data');
         const hasData = fs.existsSync(path.join(target, 'Local State'));
         if (hasData) {
-            prepareProfileForLaunch(target);
             skipped++;
             continue;
         }
@@ -209,7 +175,7 @@ ipcMain.handle('clone-and-start', async () => {
                     return !SKIP_DIRS.includes(name);
                 },
             });
-            prepareProfileForLaunch(target);
+            cleanLockFiles(target);
             cloned++;
             addLog(`📋 Clone → worker-${i}`);
         } catch (e) {
@@ -324,7 +290,7 @@ app.whenReady().then(() => {
     mainWindow = new BrowserWindow({
         width: 520, height: 740, resizable: true,
         webPreferences: { nodeIntegration: true, contextIsolation: false },
-        title: 'YT Browser Worker',
+        title: 'YT Worker Launcher',
         backgroundColor: '#0c0c18',
         autoHideMenuBar: true,
     });

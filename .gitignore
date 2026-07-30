@@ -1,5 +1,4 @@
 node_modules/
-.DS_Store
 sessions/
 web/dist/
 web/node_modules/
@@ -8,9 +7,3 @@ config/
 data/
 dist/
 *.exe
-android-worker.json
-studio-api.json
-data/android-jobs/
-data/android-artifacts/
-__pycache__/
-*.py[cod]
