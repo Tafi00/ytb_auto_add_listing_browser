@@ -223,10 +223,13 @@ ipcMain.handle('clone-and-start', async () => {
     // Start worker.js - use Electron's built-in Node.js runtime
     // ELECTRON_RUN_AS_NODE=1 makes the Electron binary act as plain Node.js
     const workerScript = path.join(APP_DIR, 'src', 'worker.js');
-    const envFile = path.join(ROOT_DIR, '.env');
+    const externalEnvFile = path.join(ROOT_DIR, '.env');
+    const bundledEnvFile = path.resolve(APP_DIR, '..', '..', '.env');
+    const envFile = fs.existsSync(externalEnvFile) ? externalEnvFile : bundledEnvFile;
     const workerEnv = { ...process.env };
 
-    // Load .env first
+    // Portable builds keep a bundled fallback inside the extracted app. A sibling
+    // .env remains supported so an operator can override the relay later.
     if (fs.existsSync(envFile)) {
         const lines = fs.readFileSync(envFile, 'utf8').split('\n');
         for (const line of lines) {
