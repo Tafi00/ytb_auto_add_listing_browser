@@ -27,6 +27,10 @@ import { addHistory, getHistory, getTotalLinks, clearAllHistory } from './histor
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
 
+// Dokploy exposes the app through one reverse-proxy hop. Trust it so
+// express-rate-limit sees the real client IP from X-Forwarded-For.
+app.set('trust proxy', 1);
+
 const sessionManager = new SessionManager({ sessionsDir: CONFIG.sessionsDir });
 
 // Auto-create default profile if not exists
