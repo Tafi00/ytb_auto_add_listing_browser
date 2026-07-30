@@ -1,0 +1,15 @@
+appId: com.ytauto.studioapi
+productName: YouTube Studio API Worker
+artifactName: YouTube-Studio-API-Worker-${version}.${ext}
+asar: false
+extraMetadata:
+  main: src/studio-api-launcher.js
+win:
+  target: portable
+files:
+  - src/studio-api-launcher.js
+  - src/studio-api-launcher.html
+  - src/studio-internal-api.js
+  - src/worker.js
+  - scripts/start-studio-api-worker.mjs
+  - package.json

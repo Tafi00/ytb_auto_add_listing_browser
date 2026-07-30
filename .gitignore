@@ -1,4 +1,5 @@
 node_modules/
+.DS_Store
 sessions/
 web/dist/
 web/node_modules/
@@ -6,4 +7,13 @@ web/node_modules/
 config/
 data/
 dist/
+bundled/
+.build/
 *.exe
+android-worker.json
+studio-api.json
+vmos-secrets.json
+data/android-jobs/
+data/android-artifacts/
+__pycache__/
+*.py[cod]

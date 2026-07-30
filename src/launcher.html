@@ -1,605 +1,146 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="vi">
-
 <head>
-    <meta charset="UTF-8">
-    <title>YT Worker Launcher</title>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box
-        }
-
-        body {
-            font-family: 'Inter', sans-serif;
-            background: #0c0c18;
-            color: #e0e0e0;
-            min-height: 100vh;
-            overflow-x: hidden
-        }
-
-        .app {
-            max-width: 520px;
-            margin: 0 auto;
-            padding: 20px 16px 30px
-        }
-
-        .header {
-            text-align: center;
-            margin-bottom: 24px;
-            padding-top: 6px
-        }
-
-        .header h1 {
-            font-size: 20px;
-            font-weight: 800;
-            background: linear-gradient(135deg, #818cf8, #c084fc);
-            -webkit-background-clip: text;
-            -webkit-text-fill-color: transparent
-        }
-
-        .header .sub {
-            font-size: 11px;
-            color: #555;
-            margin-top: 4px;
-            letter-spacing: .5px
-        }
-
-        .step {
-            background: #13132a;
-            border: 1px solid #1e1e3a;
-            border-radius: 14px;
-            padding: 16px 18px;
-            margin-bottom: 12px;
-            position: relative;
-            transition: border-color .3s
-        }
-
-        .step:hover {
-            border-color: #2d2d5a
-        }
-
-        .step-badge {
-            display: inline-flex;
-            align-items: center;
-            justify-content: center;
-            width: 22px;
-            height: 22px;
-            border-radius: 50%;
-            font-size: 11px;
-            font-weight: 700;
-            margin-right: 8px;
-            flex-shrink: 0
-        }
-
-        .step-badge.b1 {
-            background: rgba(99, 102, 241, .15);
-            color: #818cf8
-        }
-
-        .step-badge.b2 {
-            background: rgba(168, 85, 247, .15);
-            color: #c084fc
-        }
-
-        .step-badge.b3 {
-            background: rgba(34, 197, 94, .15);
-            color: #22c55e
-        }
-
-        .step-badge.b4 {
-            background: rgba(251, 146, 60, .15);
-            color: #fb923c
-        }
-
-        .step-head {
-            display: flex;
-            align-items: center;
-            margin-bottom: 6px
-        }
-
-        .step-title {
-            font-size: 14px;
-            font-weight: 600
-        }
-
-        .step-desc {
-            font-size: 11px;
-            color: #666;
-            margin-bottom: 12px;
-            line-height: 1.5
-        }
-
-        .dot {
-            display: inline-block;
-            width: 7px;
-            height: 7px;
-            border-radius: 50%;
-            margin-right: 6px;
-            flex-shrink: 0
-        }
-
-        .dot.on {
-            background: #22c55e;
-            box-shadow: 0 0 6px rgba(34, 197, 94, .5)
-        }
-
-        .dot.off {
-            background: #555
-        }
-
-        .status-line {
-            font-size: 11px;
-            color: #777;
-            display: flex;
-            align-items: center;
-            margin-bottom: 10px
-        }
-
-        .actions {
-            display: flex;
-            gap: 8px;
-            flex-wrap: wrap
-        }
-
-        .btn {
-            padding: 8px 18px;
-            border: none;
-            border-radius: 9px;
-            font-family: 'Inter', sans-serif;
-            font-size: 12px;
-            font-weight: 600;
-            cursor: pointer;
-            transition: all .15s;
-            display: inline-flex;
-            align-items: center;
-            gap: 6px;
-            white-space: nowrap
-        }
-
-        .btn:active {
-            transform: scale(.96)
-        }
-
-        .btn:disabled {
-            opacity: .4;
-            cursor: not-allowed;
-            transform: none
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, #6366f1, #8b5cf6);
-            color: #fff;
-            box-shadow: 0 3px 12px rgba(99, 102, 241, .25)
-        }
-
-        .btn-primary:hover:not(:disabled) {
-            box-shadow: 0 3px 18px rgba(99, 102, 241, .45)
-        }
-
-        .btn-success {
-            background: linear-gradient(135deg, #059669, #10b981);
-            color: #fff;
-            box-shadow: 0 3px 12px rgba(16, 185, 129, .25)
-        }
-
-        .btn-success:hover:not(:disabled) {
-            box-shadow: 0 3px 18px rgba(16, 185, 129, .45)
-        }
-
-        .btn-ghost {
-            background: #1e1e3a;
-            color: #aaa
-        }
-
-        .btn-ghost:hover:not(:disabled) {
-            background: #2a2a4a;
-            color: #ddd
-        }
-
-        .btn-danger {
-            background: linear-gradient(135deg, #dc2626, #ef4444);
-            color: #fff
-        }
-
-        .btn-warn {
-            background: linear-gradient(135deg, #d97706, #f59e0b);
-            color: #fff;
-            box-shadow: 0 3px 12px rgba(245, 158, 11, .25)
-        }
-
-        .btn-warn:hover:not(:disabled) {
-            box-shadow: 0 3px 18px rgba(245, 158, 11, .45)
-        }
-
-        .btn-toggle {
-            min-width: 140px;
-            justify-content: center
-        }
-
-        .log-card {
-            background: #13132a;
-            border: 1px solid #1e1e3a;
-            border-radius: 14px;
-            padding: 14px 16px
-        }
-
-        .log-title {
-            font-size: 11px;
-            font-weight: 600;
-            color: #555;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-            margin-bottom: 10px
-        }
-
-        .log-box {
-            background: #08081a;
-            border: 1px solid #151530;
-            border-radius: 8px;
-            padding: 10px;
-            max-height: 200px;
-            overflow-y: auto;
-            font-family: 'Consolas', 'Monaco', monospace;
-            font-size: 10.5px;
-            line-height: 1.8
-        }
-
-        .log-line .t {
-            color: #444;
-            margin-right: 6px
-        }
-
-        .log-line .m {
-            color: #999
-        }
-
-        .empty {
-            color: #444;
-            text-align: center;
-            padding: 16px;
-            font-size: 11px
-        }
-
-        .worker-info {
-            display: flex;
-            gap: 10px;
-            flex-wrap: wrap;
-            margin-bottom: 10px
-        }
-
-        .wi {
-            background: #0a0a1e;
-            border-radius: 8px;
-            padding: 8px 12px;
-            text-align: center;
-            flex: 1;
-            min-width: 80px
-        }
-
-        .wi-val {
-            font-size: 18px;
-            font-weight: 700;
-            color: #fff
-        }
-
-        .wi-val.g {
-            color: #22c55e
-        }
-
-        .wi-val.r {
-            color: #ef4444
-        }
-
-        .wi-val.b {
-            color: #818cf8
-        }
-
-        .wi-val.y {
-            color: #eab308
-        }
-
-        .wi-label {
-            font-size: 9px;
-            color: #555;
-            text-transform: uppercase;
-            letter-spacing: .5px;
-            margin-top: 2px
-        }
-
-        .spinner {
-            display: inline-block;
-            width: 12px;
-            height: 12px;
-            border: 2px solid rgba(255, 255, 255, .2);
-            border-top-color: #fff;
-            border-radius: 50%;
-            animation: spin .5s linear infinite
-        }
-
-        @keyframes spin {
-            to {
-                transform: rotate(360deg)
-            }
-        }
-
-        .toast {
-            position: fixed;
-            bottom: 16px;
-            left: 50%;
-            transform: translateX(-50%) translateY(80px);
-            opacity: 0;
-            padding: 10px 20px;
-            border-radius: 10px;
-            font-size: 12px;
-            font-weight: 500;
-            z-index: 99;
-            transition: all .3s;
-            pointer-events: none
-        }
-
-        .toast.show {
-            transform: translateX(-50%) translateY(0);
-            opacity: 1
-        }
-
-        .toast.ok {
-            background: rgba(34, 197, 94, .12);
-            border: 1px solid rgba(34, 197, 94, .3);
-            color: #22c55e
-        }
-
-        .toast.err {
-            background: rgba(239, 68, 68, .12);
-            border: 1px solid rgba(239, 68, 68, .3);
-            color: #ef4444
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>YT Browser Worker</title>
+  <style>
+    :root { --bg:#070b16; --panel:#0e1628; --line:#1e2a44; --muted:#7f8ca8; --text:#eef3ff; --blue:#5b8cff; --cyan:#23d4ff; --green:#3ed598; --red:#ff6b7d; --yellow:#ffcb66; }
+    *{box-sizing:border-box} body{margin:0;min-height:100vh;background:radial-gradient(circle at 15% -10%,#172b58 0,transparent 38%),var(--bg);color:var(--text);font-family:Inter,Segoe UI,sans-serif}
+    .shell{max-width:1100px;margin:auto;padding:26px}.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:22px}.brand{display:flex;align-items:center;gap:13px}.logo{width:46px;height:46px;border-radius:14px;background:linear-gradient(145deg,var(--blue),#7958ff);display:grid;place-items:center;font-size:23px;box-shadow:0 12px 35px #426cff45}.title h1{font-size:20px;margin:0}.title p{margin:5px 0 0;color:var(--muted);font-size:12px}.live{display:flex;align-items:center;gap:8px;padding:9px 13px;border:1px solid var(--line);border-radius:99px;background:#0a1020;color:var(--muted);font-size:12px}.dot{width:8px;height:8px;border-radius:50%;background:#48526a}.dot.on{background:var(--green);box-shadow:0 0 12px var(--green)}
+    .grid{display:grid;grid-template-columns:1.25fr .75fr;gap:16px}.card{background:linear-gradient(160deg,#111b31,#0b1222);border:1px solid var(--line);border-radius:18px;padding:18px;box-shadow:0 18px 45px #0004}.card h2{font-size:13px;margin:0 0 14px;color:#dce6ff;letter-spacing:.2px}.relay{display:flex;align-items:center;gap:12px;background:#08101f;border:1px solid #1a2945;border-radius:13px;padding:13px}.relay-icon{width:38px;height:38px;border-radius:11px;background:#172a50;color:var(--cyan);display:grid;place-items:center}.relay-main{min-width:0;flex:1}.relay-url{font-size:13px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.relay-sub{font-size:10px;color:var(--muted);margin-top:5px}.badge{padding:5px 9px;border-radius:99px;background:#17372f;color:var(--green);font-size:10px;font-weight:700}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-top:14px}.stat{padding:13px;border-radius:13px;background:#0a1222;border:1px solid #17233b}.num{font-size:23px;font-weight:800}.num.green{color:var(--green)}.num.blue{color:var(--cyan)}.lab{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.8px;margin-top:4px}
+    .device-list{display:flex;flex-direction:column;gap:9px;min-height:117px}.device{display:grid;grid-template-columns:42px 1fr auto;align-items:center;gap:11px;padding:11px;background:#091121;border:1px solid #182540;border-radius:13px}.phone{width:34px;height:42px;border:2px solid #3a4f78;border-radius:8px;position:relative}.phone:after{content:'';position:absolute;bottom:3px;width:9px;height:2px;border-radius:2px;background:#3a4f78;left:10px}.dev-name{font-size:12px;font-weight:700}.dev-meta{font-size:10px;color:var(--muted);margin-top:4px}.state{font-size:10px;font-weight:700;color:var(--green)}.state.bad{color:var(--red)}.state.wait{color:var(--yellow)}
+    .verified-list{display:flex;flex-direction:column;gap:7px;margin-top:10px}.verified-row{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:8px 10px;border-radius:10px;background:#08101f;border:1px solid #172640;font:10px Consolas,monospace}.verified-id{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#b8c7e4}.verified-ok{color:var(--green);font:700 9px Inter,Segoe UI,sans-serif}.verified-bad{color:var(--red)}
+    .controls{display:flex;gap:9px;margin-top:15px}.btn{border:0;border-radius:11px;padding:10px 15px;font-size:11px;font-weight:750;cursor:pointer;color:white;transition:.15s}.btn:hover{transform:translateY(-1px)}.btn:disabled{opacity:.4;cursor:not-allowed;transform:none}.primary{background:linear-gradient(135deg,#3975ff,#7558ff);box-shadow:0 8px 22px #3d68ff38}.danger{background:#42202c;color:#ff93a0}.ghost{background:#18233a;color:#b9c5df}.wide{flex:1}
+    .videos{grid-column:1/-1}.video-head{display:flex;align-items:center;justify-content:space-between;gap:12px}.video-count{font-size:10px;color:var(--cyan);background:#102a3a;border:1px solid #19465d;border-radius:99px;padding:5px 9px}.video-editor{width:100%;min-height:112px;resize:vertical;border:1px solid #1b2a46;border-radius:13px;background:#07101f;color:#cbd7ee;padding:12px 14px;font:11px/1.7 Consolas,monospace;outline:none}.video-editor:focus{border-color:#4e79dc;box-shadow:0 0 0 3px #3566cc22}.video-actions{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:10px}.video-note{font-size:10px;color:var(--muted)}
+    .browser-panel{display:none}.flow{display:grid;grid-template-columns:repeat(3,1fr);gap:9px;margin-bottom:15px}.step{padding:11px;background:#091120;border:1px solid #1b2943;border-radius:12px}.step b{font-size:10px}.step p{font-size:9px;line-height:1.5;color:var(--muted);margin:6px 0 0}.step-n{display:inline-grid;place-items:center;width:20px;height:20px;border-radius:7px;background:#1b2c56;color:var(--cyan);margin-right:6px}
+    .top-actions{display:flex;align-items:center;gap:9px}.config-btn{padding:9px 13px;border:1px solid var(--line);border-radius:99px;background:#111a2c;color:#c9d5eb;font-size:11px;font-weight:700;cursor:pointer}.config-btn:hover{border-color:#4667ad}.settings-dialog{width:min(760px,calc(100vw - 32px));max-height:calc(100vh - 38px);overflow:auto;border:1px solid #2a3a5b;border-radius:18px;background:linear-gradient(160deg,#111b31,#0b1222);color:var(--text);padding:0;box-shadow:0 28px 90px #000b}.settings-dialog::backdrop{background:#02050bc9;backdrop-filter:blur(4px)}.dialog-inner{padding:20px}.dialog-head{display:flex;align-items:center;justify-content:space-between;margin-bottom:18px}.dialog-head h2{font-size:14px;margin:0}.close-btn{width:32px;height:32px;border:0;border-radius:9px;background:#1a263d;color:#c5d0e6;cursor:pointer}.form-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:11px}.field{display:flex;flex-direction:column;gap:6px}.field.wide{grid-column:1/-1}.field label{font-size:9px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}.input{width:100%;border:1px solid #1b2a46;border-radius:10px;background:#07101f;color:#dce6ff;padding:10px 11px;font:11px Inter,Segoe UI,sans-serif;outline:none}.input:focus{border-color:#4e79dc}.check{display:flex;align-items:center;gap:8px;font-size:11px;color:#cbd7ee}.check input{accent-color:#5b8cff}.manual-only{display:none}
+    .logs{grid-column:1/-1}.log-head{display:flex;justify-content:space-between;align-items:center}.log-box{height:244px;overflow:auto;border-radius:13px;background:#050a13;border:1px solid #152138;padding:12px;font:11px/1.75 Consolas,monospace}.line{display:grid;grid-template-columns:62px 1fr;gap:8px}.time{color:#465575}.msg{color:#aab7d0;word-break:break-word}.line.err .msg{color:#ff8795}.empty{height:100%;display:grid;place-items:center;color:#465575;font:12px Inter,Segoe UI,sans-serif}.hint{margin-top:11px;color:var(--muted);font-size:10px;line-height:1.6}.spinner{width:12px;height:12px;border:2px solid #ffffff44;border-top-color:white;border-radius:50%;display:inline-block;animation:spin .7s linear infinite}@keyframes spin{to{transform:rotate(360deg)}}
+    .toast{position:fixed;right:25px;bottom:25px;padding:11px 15px;border-radius:11px;background:#16362f;border:1px solid #2e7b64;color:#8df1cb;font-size:11px;opacity:0;transform:translateY(15px);transition:.2s;pointer-events:none}.toast.show{opacity:1;transform:none}.toast.err{background:#401e28;border-color:#7f3547;color:#ff9baa}@media(max-width:850px){.grid{grid-template-columns:1fr}.shell{padding:16px}.logs{grid-column:auto}.form-grid{grid-template-columns:1fr}.field.wide{grid-column:auto}.flow{grid-template-columns:1fr}.top{align-items:flex-start}.top-actions{flex-direction:column-reverse;align-items:flex-end}}
+  </style>
 </head>
-
 <body>
-    <div class="app">
-        <div class="header">
-            <h1>⚡ YT Worker Launcher</h1>
-            <div class="sub" id="hostInfo">Loading...</div>
+  <main class="shell">
+    <header class="top">
+      <div class="brand"><div class="logo">▶</div><div class="title"><h1 id="mainTitle">YT Browser Worker</h1><p id="host">Đang tải trạng thái...</p></div></div>
+      <div class="top-actions"><button class="config-btn" onclick="openSettings()">⚙ Cấu hình</button><div class="live"><span class="dot" id="workerDot"></span><span id="workerText">Worker đã dừng</span></div></div>
+    </header>
+    <section class="grid">
+      <div class="card" id="relayCard">
+        <h2>KẾT NỐI RELAY</h2>
+        <div class="relay"><div class="relay-icon">⌁</div><div class="relay-main"><div class="relay-url" id="relayUrl">—</div><div class="relay-sub">WebSocket endpoint nhận và trả job affiliate</div></div><span class="badge" id="relayBadge">READY</span></div>
+        <div class="stats"><div class="stat"><div class="num blue" id="onlineCount">0</div><div class="lab" id="onlineLabel">Video đã lưu</div></div><div class="stat"><div class="num green" id="configuredCount">0</div><div class="lab" id="configuredLabel">Browser worker</div></div><div class="stat"><div class="num" id="workerPid">—</div><div class="lab">Worker PID</div></div></div>
+        <div class="controls"><button class="btn primary wide" id="startBtn" onclick="startWorker()">▶ Bắt đầu</button><button class="btn danger" id="stopBtn" onclick="stopWorker()" style="display:none">■ Dừng</button></div>
+        <div class="hint" id="mainHint">Chrome dùng profile YouTube Studio đã lưu để nhận và xử lý request.</div>
+      </div>
+      <div class="card videos browser-panel" id="browserPanel">
+        <div class="video-head"><h2>BROWSER / CHROME WORKER</h2><span class="video-count" id="browserVideoCount">0 video</span></div>
+        <div class="flow">
+          <div class="step"><b><span class="step-n">1</span>Bấm Bắt đầu</b><p>Chrome mở bằng profile đã lưu như phiên bản trước.</p></div>
+          <div class="step"><b><span class="step-n">2</span>Mỗi video một cửa sổ</b><p>Tool giữ cố định từng video YouTube Studio.</p></div>
+          <div class="step"><b><span class="step-n">3</span>Tự xử lý</b><p>Gắn sản phẩm, lấy affiliate rồi dọn sản phẩm.</p></div>
         </div>
-
-        <!-- Step 1: Default Browser -->
-        <div class="step">
-            <div class="step-head"><span class="step-badge b1">1</span><span class="step-title">Browser Mặc Định</span>
-            </div>
-            <div class="step-desc">Mở Chrome để đăng nhập YouTube Studio. Dữ liệu sẽ được dùng để clone cho workers.
-            </div>
-            <div class="status-line"><span class="dot off" id="dotDefault"></span><span id="statusDefault">Chưa
-                    mở</span></div>
-            <div class="actions">
-                <button class="btn btn-primary" id="btnOpenDefault" onclick="openDefault()">🌐 Mở Browser</button>
-                <button class="btn btn-ghost" id="btnCloseDefault" onclick="closeDefault()" disabled>✕ Đóng</button>
-            </div>
-        </div>
-
-        <!-- Step 2: Clone & Workers -->
-        <div class="step">
-            <div class="step-head"><span class="step-badge b2">2</span><span class="step-title">Clone & Khởi Động
-                    Workers</span></div>
-            <div class="step-desc">Clone dữ liệu browser → workers, sau đó kết nối server và nhận jobs.</div>
-            <div class="status-line"><span class="dot off" id="dotWorker"></span><span id="statusWorker">Chưa
-                    chạy</span></div>
-            <div class="worker-info" id="workerInfo" style="display:none">
-                <div class="wi">
-                    <div class="wi-val b" id="wiBrowsers">0</div>
-                    <div class="wi-label">Browsers</div>
-                </div>
-                <div class="wi">
-                    <div class="wi-val g" id="wiSuccess">0</div>
-                    <div class="wi-label">Thành công</div>
-                </div>
-                <div class="wi">
-                    <div class="wi-val r" id="wiFailed">0</div>
-                    <div class="wi-label">Thất bại</div>
-                </div>
-            </div>
-            <div class="actions">
-                <button class="btn btn-success" id="btnClone" onclick="cloneAndStart()">🚀 Clone & Khởi Động</button>
-                <button class="btn btn-danger" id="btnStop" onclick="stopWorker()" style="display:none">⏹ Dừng</button>
-            </div>
-        </div>
-
-        <!-- Step 3: Toggle Headless -->
-        <div class="step">
-            <div class="step-head"><span class="step-badge b3">3</span><span class="step-title">Hiển Thị Browser</span>
-            </div>
-            <div class="step-desc">Bật/tắt hiển thị cửa sổ Chrome của workers.</div>
-            <div class="status-line"><span class="dot off" id="dotHeadless"></span><span id="statusHeadless">—</span>
-            </div>
-            <div class="actions">
-                <button class="btn btn-primary btn-toggle" id="btnToggle" onclick="toggleHeadless()" disabled>👁️ Đang
-                    tải...</button>
-            </div>
-        </div>
-
-        <!-- Step 4: Server Connection -->
-        <div class="step">
-            <div class="step-head"><span class="step-badge b4">4</span><span class="step-title">Kết Nối Server</span>
-            </div>
-            <div class="step-desc">Bật/tắt kết nối WebSocket với server để nhận và gửi jobs.</div>
-            <div class="status-line"><span class="dot off" id="dotConn"></span><span id="statusConn">—</span></div>
-            <div class="actions">
-                <button class="btn btn-warn btn-toggle" id="btnConn" onclick="toggleConnection()" disabled>🔗 Đang
-                    tải...</button>
-            </div>
-        </div>
-
-        <!-- Logs -->
-        <div class="log-card">
-            <div class="log-title">📋 Logs</div>
-            <div class="log-box" id="logBox">
-                <div class="empty">Chưa có log</div>
-            </div>
-        </div>
+        <textarea class="video-editor" id="browserVideoUrls" spellcheck="false" placeholder="https://studio.youtube.com/video/VIDEO_ID/edit"></textarea>
+        <div class="video-actions"><span class="video-note">Mỗi dòng một video, giống Browser tool trước đây.</span><button class="btn primary" onclick="saveBrowserVideos()">Lưu video</button></div>
+      </div>
+      <div class="card" id="mobileDeviceCard" style="display:none">
+        <h2>THIẾT BỊ LDPLAYER</h2>
+        <div class="device-list" id="deviceList"><div class="empty">Đang quét ADB...</div></div>
+        <div class="controls"><button class="btn primary wide" id="verifyAccountBtn" onclick="verifyAccounts()">✓ Xác thực tài khoản</button></div>
+        <div class="controls"><button class="btn ghost wide" onclick="refreshDevices()">↻ Quét lại</button><button class="btn ghost" onclick="openLDPlayer()">＋ Mở LDPlayer</button></div>
+      </div>
+      <div class="card videos" id="mobileCollectionCard" style="display:none">
+        <div class="video-head"><h2>POOL 5 YOUTUBE SHOPPING COLLECTION</h2><span class="video-count" id="collectionCount">0/5 collection</span></div>
+        <textarea class="video-editor" id="collectionUrls" spellcheck="false" readonly></textarea>
+        <div class="video-actions"><span class="video-note">Pool cố định gồm 5 collection đã tạo cho tài khoản này; mỗi collection xử lý một request song song.</span></div>
+      </div>
+      <div class="card logs">
+        <div class="log-head"><h2>NHẬT KÝ HOẠT ĐỘNG</h2><span class="relay-sub" id="adbPath">ADB: —</span></div>
+        <div class="log-box" id="logBox"><div class="empty">Chưa có hoạt động</div></div>
+      </div>
+    </section>
+  </main>
+  <dialog class="settings-dialog" id="settingsDialog">
+    <div class="dialog-inner">
+      <div class="dialog-head"><h2>Cấu hình tool</h2><button class="close-btn" onclick="closeSettings()">✕</button></div>
+      <div class="video-head" style="margin-bottom:14px"><span class="video-note">Cấu hình các video YouTube Studio dùng cho Chrome worker.</span><span class="video-count" id="vmosState">BROWSER</span></div>
+      <div class="form-grid">
+        <div class="field"><label>Chế độ chính</label><select class="input" id="primaryMode" onchange="togglePrimaryMode()"><option value="browser">Browser / Chrome</option></select></div>
+        <label class="check mobile-setting"><input id="vmosEnabled" type="checkbox"> Mobile dùng VMOS Cloud</label>
+        <div class="field mobile-setting"><label>Cách kết nối</label><select class="input" id="vmosAuthMode" onchange="toggleVmosMode()"><option value="api">VMOS OpenAPI (tự gia hạn)</option><option value="manual">Lệnh kết nối 24 giờ</option></select></div>
+        <div class="field mobile-setting"><label>Pad Code</label><input class="input" id="vmosPadCode" placeholder="Mã cloud phone"></div>
+        <div class="field api-only mobile-setting"><label>Access Key</label><input class="input" id="vmosAccessKey" type="password" placeholder="Để trống nếu đã lưu"></div>
+        <div class="field api-only mobile-setting"><label>Secret Key</label><input class="input" id="vmosSecretKey" type="password" placeholder="Để trống nếu đã lưu"></div>
+        <div class="field wide api-only mobile-setting"><label>Chứng chỉ HTTPS riêng (chỉ dùng khi VPS yêu cầu)</label><input class="input" id="vmosCaBundle" placeholder="Đường dẫn file .pem hoặc .crt"></div>
+        <div class="field mobile-setting"><label>Cổng ADB trên máy này</label><input class="input" id="vmosLocalPort" type="number" value="60733"></div>
+        <div class="field wide manual-only mobile-setting"><label>Lệnh SSH do VMOS cung cấp</label><input class="input" id="vmosSshCommand" placeholder="ssh user@host -p ... -L ..."></div>
+        <div class="field wide manual-only mobile-setting"><label>Connection key</label><input class="input" id="vmosSshKey" type="password" placeholder="Để trống nếu đã lưu"></div>
+        <label class="check mobile-setting"><input id="chromeFallbackEnabled" type="checkbox"> Tự chuyển sang Chrome nếu Mobile lỗi</label>
+        <div class="field wide"><label>Video YouTube cho Browser/Chrome (mỗi dòng một link)</label><textarea class="input" id="chromeVideoUrls" rows="4" placeholder="https://studio.youtube.com/video/.../edit"></textarea></div>
+      </div>
+      <div class="controls"><button class="btn ghost" onclick="closeSettings()">Hủy</button><button class="btn primary wide" onclick="saveAndApplySettings()">Lưu &amp; áp dụng</button></div>
+      <div class="hint">Thông tin VMOS được mã hóa bằng tài khoản Windows hiện tại.</div>
     </div>
-
-    <div class="toast" id="toast"></div>
-
-    <script>
-        const { ipcRenderer } = require('electron');
-        let logs = [];
-
-        // ===== Toast =====
-        function toast(msg, type = 'ok') {
-            const t = document.getElementById('toast');
-            t.textContent = msg; t.className = 'toast ' + type + ' show';
-            setTimeout(() => t.classList.remove('show'), 2500);
-        }
-
-        // ===== Log =====
-        ipcRenderer.on('log', (_, entry) => {
-            logs.push(entry);
-            if (logs.length > 150) logs.shift();
-            renderLogs();
-        });
-
-        function renderLogs() {
-            const box = document.getElementById('logBox');
-            if (logs.length === 0) { box.innerHTML = '<div class="empty">Chưa có log</div>'; return; }
-            box.innerHTML = logs.slice(-60).map(l =>
-                `<div class="log-line"><span class="t">${l.time}</span><span class="m">${esc(l.message)}</span></div>`
-            ).join('');
-            box.scrollTop = box.scrollHeight;
-        }
-        function esc(s) { return s.replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
-
-        // ===== Status polling =====
-        ipcRenderer.on('status-changed', refreshAll);
-
-        async function refreshAll() {
-            const s = await ipcRenderer.invoke('get-status');
-            document.getElementById('hostInfo').textContent = s.hostname;
-
-            // Default browser
-            const dotD = document.getElementById('dotDefault');
-            const statusD = document.getElementById('statusDefault');
-            dotD.className = 'dot ' + (s.defaultRunning ? 'on' : 'off');
-            statusD.textContent = s.defaultRunning ? 'Đang mở' : (s.hasData ? 'Đã đóng (có dữ liệu ✓)' : 'Chưa mở');
-            document.getElementById('btnOpenDefault').disabled = s.defaultRunning;
-            document.getElementById('btnCloseDefault').disabled = !s.defaultRunning;
-
-            // Worker
-            const dotW = document.getElementById('dotWorker');
-            const statusW = document.getElementById('statusWorker');
-            dotW.className = 'dot ' + (s.workerRunning ? 'on' : 'off');
-            document.getElementById('btnClone').style.display = s.workerRunning ? 'none' : '';
-            document.getElementById('btnStop').style.display = s.workerRunning ? '' : 'none';
-
-            if (s.workerRunning) {
-                statusW.textContent = 'Đang chạy';
-                // Fetch worker API for details
-                const api = await ipcRenderer.invoke('get-worker-api');
-                if (api) {
-                    document.getElementById('workerInfo').style.display = 'flex';
-                    document.getElementById('wiBrowsers').textContent = api.browsers?.length || 0;
-                    document.getElementById('wiSuccess').textContent = api.jobStats?.success || 0;
-                    document.getElementById('wiFailed').textContent = api.jobStats?.failed || 0;
-
-                    // Headless toggle
-                    document.getElementById('btnToggle').disabled = false;
-                    const dotH = document.getElementById('dotHeadless');
-                    const statusH = document.getElementById('statusHeadless');
-                    if (api.headless) {
-                        dotH.className = 'dot off';
-                        statusH.textContent = 'Ẩn (Headless)';
-                        document.getElementById('btnToggle').innerHTML = '👁️ Bật hiển thị';
-                    } else {
-                        dotH.className = 'dot on';
-                        statusH.textContent = 'Đang hiện';
-                        document.getElementById('btnToggle').innerHTML = '🙈 Tắt hiển thị';
-                    }
-
-                    // Connection toggle
-                    document.getElementById('btnConn').disabled = false;
-                    const dotC = document.getElementById('dotConn');
-                    const statusC = document.getElementById('statusConn');
-                    if (api.connectionEnabled) {
-                        dotC.className = 'dot on';
-                        statusC.textContent = api.wsConnected ? 'Đã kết nối ✓' : 'Đang kết nối...';
-                        document.getElementById('btnConn').innerHTML = '🔌 Ngắt kết nối';
-                    } else {
-                        dotC.className = 'dot off';
-                        statusC.textContent = 'Đã ngắt';
-                        document.getElementById('btnConn').innerHTML = '🔗 Kết nối lại';
-                    }
-                }
-            } else {
-                statusW.textContent = 'Chưa chạy';
-                document.getElementById('workerInfo').style.display = 'none';
-                document.getElementById('btnToggle').disabled = true;
-                document.getElementById('btnToggle').innerHTML = '👁️ Hiện Browser';
-                document.getElementById('dotHeadless').className = 'dot off';
-                document.getElementById('statusHeadless').textContent = '—';
-                document.getElementById('btnConn').disabled = true;
-                document.getElementById('btnConn').innerHTML = '🔗 Kết nối';
-                document.getElementById('dotConn').className = 'dot off';
-                document.getElementById('statusConn').textContent = '—';
-            }
-        }
-
-        // ===== Actions =====
-        async function openDefault() {
-            const btn = document.getElementById('btnOpenDefault');
-            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang mở...';
-            const r = await ipcRenderer.invoke('open-default-browser');
-            if (r.ok) { toast('Đã mở browser mặc định'); }
-            else { toast(r.error, 'err'); }
-            btn.innerHTML = '🌐 Mở Browser';
-            refreshAll();
-        }
-
-        async function closeDefault() {
-            await ipcRenderer.invoke('close-default-browser');
-            toast('Đã đóng browser');
-            refreshAll();
-        }
-
-        async function cloneAndStart() {
-            const btn = document.getElementById('btnClone');
-            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang clone...';
-            const r = await ipcRenderer.invoke('clone-and-start');
-            if (r.ok) { toast('🚀 Worker đã khởi động!'); }
-            else { toast(r.error, 'err'); }
-            btn.disabled = false; btn.innerHTML = '🚀 Clone & Khởi Động';
-            refreshAll();
-        }
-
-        async function stopWorker() {
-            await ipcRenderer.invoke('stop-worker');
-            toast('Đã dừng worker');
-            refreshAll();
-        }
-
-        async function toggleHeadless() {
-            const btn = document.getElementById('btnToggle');
-            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang chuyển...';
-            const r = await ipcRenderer.invoke('toggle-headless');
-            if (r.ok) { toast(r.headless ? '🙈 Đã ẩn browser' : '👁️ Đã hiện browser'); }
-            else { toast(r.error, 'err'); }
-            refreshAll();
-        }
-
-        async function toggleConnection() {
-            const btn = document.getElementById('btnConn');
-            btn.disabled = true; btn.innerHTML = '<span class="spinner"></span> Đang chuyển...';
-            const r = await ipcRenderer.invoke('toggle-connection');
-            if (r.ok) { toast(r.connectionEnabled ? '🔗 Đã kết nối lại server' : '🔌 Đã ngắt kết nối'); }
-            else { toast(r.error, 'err'); }
-            refreshAll();
-        }
-
-        // Init
-        refreshAll();
-        setInterval(refreshAll, 3000);
-    </script>
+  </dialog>
+  <div class="toast" id="toast"></div>
+  <script>
+    const { ipcRenderer } = require('electron');
+    let logs = [];
+    let actionBusy = false;
+    let vmosConfigLoaded = false;
+    const esc = value => String(value ?? '').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    function notify(message, type='ok'){const el=document.getElementById('toast');el.textContent=message;el.className=`toast ${type==='err'?'err':''} show`;setTimeout(()=>el.classList.remove('show'),2600)}
+    function renderLogs(){const box=document.getElementById('logBox');if(!logs.length){box.innerHTML='<div class="empty">Chưa có hoạt động</div>';return}box.innerHTML=logs.slice(-120).map(l=>`<div class="line ${l.level==='error'?'err':''}"><span class="time">${esc(l.time)}</span><span class="msg">${esc(l.message)}</span></div>`).join('');box.scrollTop=box.scrollHeight}
+    function renderDevices(devices){const box=document.getElementById('deviceList');if(!devices.length){box.innerHTML='<div class="empty">Không tìm thấy LDPlayer qua ADB</div>';return}box.innerHTML=devices.map(d=>{const checks=d.verifications||[];const verified=checks.length>0&&checks.every(x=>x.ok)&&checks.length===(d.collectionUrls||[]).length;const failed=checks.some(x=>!x.ok);const stateClass=d.state!=='device'||!d.assigned||failed?'bad':verified?'':'wait';const stateText=d.state!=='device'?d.state.toUpperCase():!d.assigned?'CHƯA GÁN':verified?'ĐÃ XÁC THỰC':failed?'LỖI PHIÊN':'CHƯA XÁC THỰC';return `<div class="device"><div class="phone"></div><div><div class="dev-name">${esc(d.model)}</div><div class="dev-meta">${esc(d.serial)} · ${(d.collectionUrls||[]).length} collection${verified?` · API OK`:''}</div></div><div class="state ${stateClass}">${esc(stateText)}</div></div>`}).join('')}
+    ipcRenderer.on('log',(_,entry)=>{logs.push(entry);renderLogs()});ipcRenderer.on('status-changed',refresh);
+    async function refresh(){
+      const s=await ipcRenderer.invoke('android-status');
+      const browserMode=s.primaryMode==='browser';
+      document.getElementById('host').textContent=`${s.hostname} · ${browserMode?'Chrome automation':'Mobile API'}`;
+      document.getElementById('mainTitle').textContent=browserMode?'YT Browser Worker':'YT Collection API Worker';
+      document.getElementById('relayUrl').textContent=s.relayUrl;
+      document.getElementById('workerDot').className=`dot ${s.workerRunning?'on':''}`;
+      document.getElementById('workerText').textContent=s.workerRunning?`${browserMode?'Browser':'Mobile API'} đang chạy`:'Đã dừng';
+      document.getElementById('onlineCount').textContent=browserMode?(s.browserVideoUrls?.length||0):s.devices.filter(d=>d.state==='device').length;
+      document.getElementById('configuredCount').textContent=browserMode?(s.browserFallbackRunning?1:0):s.devices.filter(d=>d.state==='device'&&d.assigned).length;
+      document.getElementById('onlineLabel').textContent=browserMode?'Video đã lưu':'Android online';
+      document.getElementById('configuredLabel').textContent=browserMode?'Browser worker':'Đã cấu hình';
+      document.getElementById('workerPid').textContent=s.workerPid||'—';
+      document.getElementById('adbPath').textContent=browserMode?'Chrome: Windows':`ADB: ${s.adbPath||'không tìm thấy'}`;
+      document.getElementById('relayBadge').textContent=s.workerRunning?'CONNECTED':'READY';
+      document.getElementById('startBtn').style.display=s.workerRunning?'none':'';
+      document.getElementById('stopBtn').style.display=s.workerRunning?'':'none';
+      document.getElementById('mainHint').textContent=browserMode?'Nếu cần đăng nhập, Chrome sẽ mở ra như Browser tool trước đây.':'Mobile API dùng session YouTube Studio đã lưu để xử lý chính xác offer ID.';
+      document.getElementById('browserPanel').style.display=browserMode?'block':'none';
+      document.getElementById('mobileDeviceCard').style.display=browserMode?'none':'';
+      document.getElementById('mobileCollectionCard').style.display=browserMode?'none':'';
+      const browserEditor=document.getElementById('browserVideoUrls');
+      if(document.activeElement!==browserEditor)browserEditor.value=(s.browserVideoUrls||[]).join('\n');
+      document.getElementById('browserVideoCount').textContent=`${s.browserVideoUrls?.length||0} video`;
+      const verifyBtn=document.getElementById('verifyAccountBtn');
+      verifyBtn.disabled=!!s.sessionVerification?.running;
+      verifyBtn.innerHTML=s.sessionVerification?.running?'<span class="spinner"></span> Đang kiểm tra API...':'✓ Xác thực tài khoản';
+      document.getElementById('collectionCount').textContent=`${s.collectionUrls?.length||0}/5 collection`;
+      document.getElementById('collectionUrls').value=(s.collectionUrls||[]).join('\n');
+      renderDevices(s.devices);
+      if(!logs.length&&s.logs?.length){logs=s.logs;renderLogs()}
+    }
+    async function startWorker(){if(actionBusy)return;actionBusy=true;const btn=document.getElementById('startBtn');btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Đang khởi động...';const r=await ipcRenderer.invoke('android-start-worker');actionBusy=false;btn.disabled=false;btn.textContent='▶ Bắt đầu';notify(r.ok?'Worker đã khởi động':r.error,r.ok?'ok':'err');await refresh()}
+    async function stopWorker(){const r=await ipcRenderer.invoke('android-stop-worker');notify(r.ok?'Đã dừng worker':r.error,r.ok?'ok':'err');await refresh()}
+    async function refreshDevices(){const r=await ipcRenderer.invoke('android-refresh-devices');renderDevices(r.devices);notify(r.error||`Tìm thấy ${r.devices.length} thiết bị`,r.error?'err':'ok');await refresh()}
+    async function openLDPlayer(){const r=await ipcRenderer.invoke('android-open-ldplayer');notify(r.ok?'Đã mở LDPlayer':r.error,r.ok?'ok':'err')}
+    async function verifyAccounts(){if(actionBusy)return;actionBusy=true;const btn=document.getElementById('verifyAccountBtn');btn.disabled=true;btn.innerHTML='<span class="spinner"></span> Đang xác thực...';const r=await ipcRenderer.invoke('android-verify-studio-session');actionBusy=false;btn.disabled=false;btn.textContent='✓ Xác thực tài khoản';const okCount=(r.results||[]).filter(x=>x.ok).length;notify(r.ok?`Xác thực thành công ${okCount} collection · ${r.seconds}s`:r.error||'Có collection xác thực thất bại',r.ok?'ok':'err');await refresh()}
+    function toggleVmosMode(){const manual=document.getElementById('vmosAuthMode').value==='manual';document.querySelectorAll('.manual-only').forEach(el=>el.style.display=manual?'flex':'none');document.querySelectorAll('.api-only').forEach(el=>el.style.display=manual?'none':'flex')}
+    function togglePrimaryMode(){const mobile=document.getElementById('primaryMode').value==='mobile';document.querySelectorAll('.mobile-setting').forEach(el=>el.style.display=mobile?'':'none');if(mobile)toggleVmosMode()}
+    async function loadVmosConfig(){const c=await ipcRenderer.invoke('vmos-get-config');document.getElementById('primaryMode').value=c.primaryMode;document.getElementById('vmosEnabled').checked=c.enabled;document.getElementById('vmosAuthMode').value=c.authMode;document.getElementById('vmosPadCode').value=c.padCode;document.getElementById('vmosCaBundle').value=c.caBundle||'';document.getElementById('vmosLocalPort').value=c.localPort;document.getElementById('vmosSshCommand').value=c.sshCommand;document.getElementById('chromeFallbackEnabled').checked=c.chromeFallbackEnabled;document.getElementById('chromeVideoUrls').value=(c.chromeVideoUrls||[]).join('\n');document.getElementById('vmosAccessKey').placeholder=c.accessKeySaved?'Đã lưu — để trống để giữ nguyên':'Access Key';document.getElementById('vmosSecretKey').placeholder=c.secretKeySaved?'Đã lưu — để trống để giữ nguyên':'Secret Key';document.getElementById('vmosSshKey').placeholder=c.sshKeySaved?'Đã lưu — để trống để giữ nguyên':'Connection key';document.getElementById('vmosState').textContent=c.primaryMode==='browser'?'BROWSER':c.enabled?'MOBILE · VMOS':'MOBILE · LOCAL';togglePrimaryMode();vmosConfigLoaded=true}
+    function collectVmosConfig(){return{primaryMode:document.getElementById('primaryMode').value,enabled:document.getElementById('vmosEnabled').checked,authMode:document.getElementById('vmosAuthMode').value,padCode:document.getElementById('vmosPadCode').value,accessKey:document.getElementById('vmosAccessKey').value,secretKey:document.getElementById('vmosSecretKey').value,caBundle:document.getElementById('vmosCaBundle').value,sshCommand:document.getElementById('vmosSshCommand').value,sshKey:document.getElementById('vmosSshKey').value,localPort:Number(document.getElementById('vmosLocalPort').value),expireMinutes:10080,chromeFallbackEnabled:document.getElementById('chromeFallbackEnabled').checked,chromeVideoUrls:document.getElementById('chromeVideoUrls').value.split(/\r?\n/).map(x=>x.trim()).filter(Boolean)}}
+    async function saveVmosConfig(){const r=await ipcRenderer.invoke('vmos-save-config',collectVmosConfig());notify(r.ok?'Đã lưu cấu hình VMOS và Chrome dự phòng':r.error,r.ok?'ok':'err');if(r.ok)await loadVmosConfig();return r}
+    async function openSettings(){await loadVmosConfig();document.getElementById('settingsDialog').showModal()}
+    function closeSettings(){document.getElementById('settingsDialog').close()}
+    async function saveAndApplySettings(){const status=await ipcRenderer.invoke('android-status');const saved=await saveVmosConfig();if(!saved.ok)return;closeSettings();if(status.workerRunning){await ipcRenderer.invoke('android-stop-worker');const started=await ipcRenderer.invoke('android-start-worker');notify(started.ok?'Đã áp dụng cấu hình và khởi động lại worker':started.error,started.ok?'ok':'err')}await refresh()}
+    async function saveBrowserVideos(){const status=await ipcRenderer.invoke('android-status');const r=await ipcRenderer.invoke('browser-save-videos',document.getElementById('browserVideoUrls').value);if(!r.ok){notify(r.error,'err');return}if(status.workerRunning){await ipcRenderer.invoke('android-stop-worker');const started=await ipcRenderer.invoke('android-start-worker');notify(started.ok?`Đã lưu ${r.count} video và khởi động lại Browser`:started.error,started.ok?'ok':'err')}else{notify(`Đã lưu ${r.count} video`)}await loadVmosConfig();await refresh()}
+    loadVmosConfig();refresh();setInterval(refresh,3000);
+  </script>
 </body>
-
 </html>

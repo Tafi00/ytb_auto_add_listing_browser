@@ -1,0 +1,4 @@
+uiautomator2>=3.4,<4
+websockets>=12,<16
+paramiko>=3.5,<6
+certifi>=2025.1

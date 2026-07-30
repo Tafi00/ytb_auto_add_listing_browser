@@ -23,6 +23,7 @@ import { WebSocketServer } from 'ws';
 import { SessionManager } from './session-manager.js';
 import { CONFIG } from './config.js';
 import { addHistory, getHistory, getTotalLinks, clearAllHistory } from './history-db.js';
+import { normalizeRelayJobError } from './relay-response.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const app = express();
@@ -125,6 +126,15 @@ app.get('/api/verify', auth, (req, res) => {
 
 // Connected workers (Windows machines)
 const connectedWorkers = new Map(); // id -> { ws, info, busy }
+// Shopping jobs include public-shelf propagation and a verified cleanup pass.
+const WORKER_JOB_TIMEOUT_MS = parseInt(process.env.WORKER_JOB_TIMEOUT_MS || '420000', 10);
+// Requests for one collection are intentionally serialized. Keep queued HTTP
+// requests alive long enough for earlier jobs to publish and clean up; response
+// heartbeats below prevent reverse proxies from treating the wait as idle.
+const QUEUE_WAIT_TIMEOUT_MS = parseInt(process.env.QUEUE_WAIT_TIMEOUT_MS || '420000', 10);
+const PREFER_LOCAL_WORKERS =
+  process.env.PREFER_LOCAL_WORKERS !== '0'
+  && process.env.PREFER_ANDROID_WORKERS !== '0';
 
 // Simple sequential queue per tab
 class JobQueue {
@@ -135,16 +145,28 @@ class JobQueue {
   get pending() {
     return (this.running ? 1 : 0) + this.queue.length;
   }
-  push(fn) {
+  push(fn, options = {}) {
+    const waitTimeoutMs = options.waitTimeoutMs || 0;
     return new Promise((resolve, reject) => {
-      this.queue.push({ fn, resolve, reject });
+      const item = { fn, resolve, reject, timer: null };
+      if (waitTimeoutMs > 0) {
+        item.timer = setTimeout(() => {
+          const idx = this.queue.indexOf(item);
+          if (idx >= 0) {
+            this.queue.splice(idx, 1);
+            reject(new Error('Tool đang bận, vui lòng thử lại sau.'));
+          }
+        }, waitTimeoutMs);
+      }
+      this.queue.push(item);
       this._next();
     });
   }
   async _next() {
     if (this.running || this.queue.length === 0) return;
     this.running = true;
-    const { fn, resolve, reject } = this.queue.shift();
+    const { fn, resolve, reject, timer } = this.queue.shift();
+    if (timer) clearTimeout(timer);
     try { resolve(await fn()); }
     catch (e) { reject(e); }
     finally { this.running = false; this._next(); }
@@ -163,15 +185,28 @@ function getQueueForTab(targetUrl) {
 }
 
 // Get an available worker
+function workerPriority(workerType) {
+  return workerType === 'android-api' ? 3
+    : workerType === 'studio-api' ? 2
+      : workerType === 'android' ? 1 : 0;
+}
+
 function getAvailableWorker(targetUrl) {
+  const workers = [...connectedWorkers.values()]
+    .filter(worker => worker?.ws?.readyState === 1)
+    .sort((a, b) => {
+      if (!PREFER_LOCAL_WORKERS) return 0;
+      return workerPriority(b.info?.workerType) - workerPriority(a.info?.workerType);
+    });
+
   // Try to find a worker that handles this specific URL (exact match)
-  for (const [id, worker] of connectedWorkers) {
+  for (const worker of workers) {
     if (worker.info?.urls?.includes(targetUrl)) return worker;
   }
   // Try partial match (same base URL without query params)
   const targetBase = targetUrl ? targetUrl.split('?')[0] : null;
   if (targetBase) {
-    for (const [id, worker] of connectedWorkers) {
+    for (const worker of workers) {
       if (worker.info?.urls?.some(u => u.split('?')[0] === targetBase)) return worker;
     }
   }
@@ -179,16 +214,76 @@ function getAvailableWorker(targetUrl) {
   return null;
 }
 
+function getChromeFallbackWorker(excludeWorker) {
+  return [...connectedWorkers.values()]
+    .filter(worker => worker !== excludeWorker
+      && worker?.ws?.readyState === 1
+      && ['studio-api', 'browser'].includes(worker.info?.workerType)
+      && (worker.info?.urls || []).length > 0)
+    .sort((a, b) => workerPriority(b.info?.workerType) - workerPriority(a.info?.workerType))[0] || null;
+}
+
 // Check if any worker is connected
 const isWorkerConnected = () => connectedWorkers.size > 0;
 
+function getWorkerReadyUrls(configUrls) {
+  return configUrls.filter(url => !!getAvailableWorker(url));
+}
+
+function getLocalWorkerUrls() {
+  const workers = [...connectedWorkers.values()].filter(worker =>
+    worker?.ws?.readyState === 1
+    && worker.info?.capabilities?.includes('local-video-pool'));
+  const highestPriority = Math.max(-1, ...workers.map(worker => workerPriority(worker.info?.workerType)));
+  const urls = workers
+    .filter(worker => workerPriority(worker.info?.workerType) === highestPriority)
+    .flatMap(worker => worker.info?.urls || []);
+  return [...new Set(urls)];
+}
+
 // Send a job to worker and wait for result
-function sendJobToWorker(worker, jobId, targetUrl, productUrl) {
+class WorkerJobError extends Error {
+  constructor(message, {
+    code = 'WORKER_ERROR',
+    stage = 'worker',
+    retryable = false,
+    browserFallbackAllowed = false,
+    cleanupSucceeded,
+    cleanupError,
+  } = {}) {
+    super(message);
+    this.name = 'WorkerJobError';
+    this.code = code;
+    this.stage = stage;
+    this.retryable = retryable;
+    this.browserFallbackAllowed = browserFallbackAllowed;
+    this.cleanupSucceeded = cleanupSucceeded;
+    this.cleanupError = cleanupError;
+  }
+}
+
+function sendJobToWorker(worker, jobId, targetUrl, productUrl, affiliateFallbackUrl = null) {
   return new Promise((resolve, reject) => {
+    if (!worker?.ws || worker.ws.readyState !== 1) {
+      reject(new WorkerJobError('API worker chưa kết nối relay.', {
+        code: 'WORKER_DISCONNECTED',
+        stage: 'relay',
+        retryable: true,
+      }));
+      return;
+    }
+
     const timeout = setTimeout(() => {
       delete worker.pendingJobs[jobId];
-      reject(new Error('Worker timeout (120s)'));
-    }, 120000);
+      reject(new WorkerJobError(
+        `API worker xử lý quá ${Math.round(WORKER_JOB_TIMEOUT_MS / 1000)} giây.`,
+        {
+          code: 'WORKER_TIMEOUT',
+          stage: 'worker',
+          retryable: true,
+        },
+      ));
+    }, WORKER_JOB_TIMEOUT_MS);
 
     worker.pendingJobs[jobId] = { resolve, reject, timeout };
 
@@ -197,6 +292,7 @@ function sendJobToWorker(worker, jobId, targetUrl, productUrl) {
       jobId,
       targetUrl,
       productUrl,
+      affiliateFallbackUrl,
     }));
   });
 }
@@ -235,6 +331,7 @@ app.put('/api/job-config', auth, async (req, res) => {
   const urlPattern = /https?:\/\/[^\s]+/g;
   const urls = url.match(urlPattern) || [];
   for (const [id, worker] of connectedWorkers) {
+    if (worker.info?.capabilities?.includes('local-video-pool')) continue;
     try {
       worker.ws.send(JSON.stringify({ type: 'config-update', urls }));
     } catch { }
@@ -252,6 +349,9 @@ app.get('/api/worker-status', auth, async (_, res) => {
       connectedAt: worker.connectedAt,
       urls: worker.info?.urls || [],
       busy: worker.busy || false,
+      workerType: worker.info?.workerType || 'browser',
+      devices: worker.info?.devices || [],
+      capabilities: worker.info?.capabilities || [],
     });
   }
   res.json({ connected: connectedWorkers.size > 0, workers });
@@ -294,8 +394,8 @@ setInterval(() => {
 // ==================== Redirect Resolver ====================
 
 // Các domain rút gọn cần resolve
-const SHORT_URL_HOSTS = ['s.lazada.vn', 'c.lazada.vn', 's.shopee.vn', 'shp.ee', 'vn.shp.ee'];
-const LAZADA_SHORT_HOSTS = ['s.lazada.vn', 'c.lazada.vn'];
+const SHORT_URL_HOSTS = ['s.lazada.vn', 'c.lazada.vn', 'lzd.co', 's.shopee.vn', 'shp.ee', 'vn.shp.ee'];
+const LAZADA_SHORT_HOSTS = ['s.lazada.vn', 'c.lazada.vn', 'lzd.co'];
 
 function isShortUrl(url) {
   try {
@@ -320,6 +420,53 @@ function cleanLazadaUrl(url) {
   } catch {
     return url;
   }
+}
+
+function normalizeShopeeProductUrl(url) {
+  try {
+    const parsed = new URL(url);
+    const pathMatch = parsed.pathname.match(
+      /\/(?:product|opaanlp)\/(\d+)\/(\d+)(?:\/|$)/i,
+    );
+    const slugMatch = parsed.pathname.match(/-i\.(\d+)\.(\d+)(?:\/|$)/i);
+    const match = pathMatch || slugMatch;
+    if (match) {
+      return `https://shopee.vn/product/${match[1]}/${match[2]}`;
+    }
+  } catch {
+    // The caller will retain and validate the original resolved URL.
+  }
+  return url;
+}
+
+function isLikelyLazadaAffiliateUrl(url) {
+  if (!url) return false;
+
+  try {
+    const parsed = new URL(url);
+    const host = parsed.hostname.toLowerCase();
+    const query = parsed.search.toLowerCase();
+    const full = url.toLowerCase();
+
+    if (host === 'c.lazada.vn' || host.endsWith('.c.lazada.vn') || host === 'lzd.co' || host.endsWith('.lzd.co')) return true;
+    if (/(laz_trackid|mkttid|exlaz|sub_aff_id|sub_id|aff_id|trafficfrom|lzd_click_id)/i.test(query)) return true;
+    if (/\/\/s\.lazada\.vn\/l\./i.test(full)) return true;
+  } catch {
+    return /(c\.lazada\.vn|lzd\.co|laz_trackid|mkttid|exlaz|sub_aff_id|aff_id)/i.test(String(url));
+  }
+
+  return false;
+}
+
+function getLazadaAffiliateFallbackUrl(inputUrl, resolvedUrl) {
+  const lower = `${inputUrl || ''} ${resolvedUrl || ''}`.toLowerCase();
+  if (!lower.includes('lazada') && !lower.includes('lzd.co')) return null;
+
+  if (isLikelyLazadaAffiliateUrl(inputUrl) || isLikelyLazadaAffiliateUrl(resolvedUrl)) {
+    return inputUrl;
+  }
+
+  return null;
 }
 
 async function resolveRedirects(startUrl, maxHops = 10) {
@@ -357,7 +504,7 @@ async function resolveRedirects(startUrl, maxHops = 10) {
 function isValidProductUrl(url) {
   try {
     const parsed = new URL(url);
-    const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'shp.ee', 'lazada.vn', 'www.lazada.vn', 's.lazada.vn', 'c.lazada.vn'];
+    const validHosts = ['shopee.vn', 'www.shopee.vn', 's.shopee.vn', 'shp.ee', 'lazada.vn', 'www.lazada.vn', 's.lazada.vn', 'c.lazada.vn', 'lzd.co'];
     return validHosts.some(h => parsed.hostname === h || parsed.hostname.endsWith('.' + h));
   } catch {
     return false;
@@ -409,13 +556,20 @@ app.post('/api/get-affiliate', async (req, res) => {
         finalProductUrl = cleanLazadaUrl(resolvedProductUrl);
         console.log(`[API] Lazada cleaned URL: ${finalProductUrl}`);
       } else {
-        // Shopee: YouTube Studio nhận link ngắn OK → giữ nguyên link gốc
-        finalProductUrl = sanitizedUrl;
+        // Mobile collection API needs the resolved listing so it can verify
+        // the exact shop/offer IDs instead of matching a short-link title.
+        finalProductUrl = normalizeShopeeProductUrl(resolvedProductUrl);
+        console.log(`[API] Shopee canonical URL: ${finalProductUrl}`);
       }
     } catch (e) {
       console.error(`[API] Failed to resolve short URL: ${e.message}`);
       return res.status(400).json({ error: 'Không thể xử lý link rút gọn. Vui lòng dùng link đầy đủ.' });
     }
+  }
+
+  const affiliateFallbackUrl = getLazadaAffiliateFallbackUrl(sanitizedUrl, resolvedProductUrl);
+  if (affiliateFallbackUrl) {
+    console.log(`[API] Lazada affiliate fallback retained: ${affiliateFallbackUrl}`);
   }
 
   // Rate limit
@@ -430,21 +584,56 @@ app.post('/api/get-affiliate', async (req, res) => {
     clientCooldowns.set(rateLimitKey, Date.now());
   }
 
-  const config = loadJobConfig();
-  if (!config.url) return res.status(400).json({ error: 'No Video URL configured in admin' });
-
   const urlPattern = /https?:\/\/[^\s]+/g;
-  const urls = config.url.match(urlPattern) || [];
-  if (urls.length === 0) return res.status(400).json({ error: 'No Video URL configured in admin' });
+  const localWorkerUrls = getLocalWorkerUrls();
+  const config = loadJobConfig();
+  const serverUrls = config.url ? config.url.match(urlPattern) || [] : [];
+  const urls = localWorkerUrls.length > 0 ? localWorkerUrls : serverUrls;
+  if (urls.length === 0) {
+    return res.status(400).json({
+      error: 'Worker chưa cấu hình collection URL.',
+    });
+  }
 
-  if (!isWorkerConnected()) return res.status(400).json({ error: 'Worker chưa kết nối. Vui lòng chạy worker trên máy Windows.' });
+    if (!isWorkerConnected()) return res.status(400).json({ error: 'Worker chưa kết nối. Vui lòng chạy worker trên máy Windows.' });
+
+    const readyUrls = getWorkerReadyUrls(urls);
+    if (readyUrls.length === 0) {
+      return res.status(503).json({ error: 'Tool chưa sẵn sàng cho collection đã cấu hình. Hãy kiểm tra LDPlayer và phiên đăng nhập YouTube Studio.' });
+    }
+
+  // Keep the reverse-proxy connection active while the worker waits
+  // for YouTube propagation and verified cleanup. Whitespace before JSON is
+  // valid and prevents nginx/proxies from replacing the response with a plain
+  // text "Bad Gateway" page during a healthy long-running job.
+  let responseHeartbeat = null;
+  const stopResponseHeartbeat = () => {
+    if (responseHeartbeat) clearInterval(responseHeartbeat);
+    responseHeartbeat = null;
+  };
+  const finishJson = (payload, status = 200) => {
+    stopResponseHeartbeat();
+    if (res.writableEnded || res.destroyed) return;
+    if (!res.headersSent) {
+      res.status(status).json(payload);
+    } else {
+      res.end(JSON.stringify(payload));
+    }
+  };
+  res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('X-Accel-Buffering', 'no');
+  responseHeartbeat = setInterval(() => {
+    if (!res.writableEnded && !res.destroyed) res.write(' ');
+  }, 10000);
+  res.on('close', stopResponseHeartbeat);
 
   try {
     // Select the tab (URL) that currently has the shortest queue
-    let targetUrl = urls[0];
+    let targetUrl = readyUrls[0];
     let minPending = Infinity;
 
-    for (const url of urls) {
+    for (const url of readyUrls) {
       const q = getQueueForTab(url);
       if (q.pending < minPending) {
         minPending = q.pending;
@@ -465,22 +654,46 @@ app.post('/api/get-affiliate', async (req, res) => {
       console.log(`[API] Job START for product: ${finalProductUrl} on tab: ${targetUrl}`);
 
       const worker = getAvailableWorker(targetUrl);
-      if (!worker) throw new Error('Worker chưa kết nối');
+      if (!worker) throw new Error('Tool chưa sẵn sàng cho collection đã cấu hình.');
 
-      const data = await sendJobToWorker(worker, jobId, targetUrl, finalProductUrl);
+      let data;
+      try {
+        data = await sendJobToWorker(worker, jobId, targetUrl, finalProductUrl, affiliateFallbackUrl);
+      } catch (error) {
+        const mayFallback = error?.browserFallbackAllowed
+          || ['WORKER_DISCONNECTED', 'WORKER_TIMEOUT'].includes(error?.code);
+        const fallbackWorker = mayFallback ? getChromeFallbackWorker(worker) : null;
+        if (!fallbackWorker) throw error;
+        const fallbackUrl = fallbackWorker.info.urls[0];
+        console.warn(`[API] VMOS/mobile worker failed (${error.code || error.message}); retrying with Chrome: ${fallbackUrl}`);
+        data = await sendJobToWorker(
+          fallbackWorker,
+          `${jobId}-chrome`,
+          fallbackUrl,
+          finalProductUrl,
+          affiliateFallbackUrl,
+        );
+        data.metadata = {
+          ...(data.metadata || {}),
+          fallbackUsed: true,
+          fallbackFrom: worker.info?.workerType || 'android-api',
+          primaryError: error.message,
+        };
+      }
       console.log(`[API] Total job time: ${Date.now() - jobStart}ms`);
       console.log(`[API] Affiliate URL for ${finalProductUrl}: ${data.affiliateUrl}`);
 
       // Verify domain match (dùng resolvedProductUrl vì nó có domain thật)
       if (data.affiliateUrl) {
-        const productDomain = resolvedProductUrl.includes('shopee') ? 'shopee' :
-          resolvedProductUrl.includes('lazada') ? 'lazada' : null;
-        if (productDomain && !data.affiliateUrl.toLowerCase().includes(productDomain)) {
-          console.warn(`[API] WARNING: Product domain mismatch! Expected ${productDomain} in affiliate URL but got: ${data.affiliateUrl}`);
+        const resolvedProductUrlLower = resolvedProductUrl.toLowerCase();
+        const productDomains = resolvedProductUrlLower.includes('shopee') || resolvedProductUrlLower.includes('shp.ee') ? ['shopee', 'shp.ee'] :
+          resolvedProductUrlLower.includes('lazada') || resolvedProductUrlLower.includes('lzd.co') ? ['lazada', 'lzd.co'] : null;
+        if (productDomains && !productDomains.some(domain => data.affiliateUrl.toLowerCase().includes(domain))) {
+          console.warn(`[API] WARNING: Product domain mismatch! Expected ${productDomains.join('/')} in affiliate URL but got: ${data.affiliateUrl}`);
         }
       }
 
-      res.json({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
+      finishJson({ affiliateUrl: data.affiliateUrl, metadata: data.metadata });
 
       // Save history to SQLite on success
       if (data.affiliateUrl) {
@@ -497,17 +710,13 @@ app.post('/api/get-affiliate', async (req, res) => {
       }
 
       return data;
-    });
+    }, { waitTimeoutMs: QUEUE_WAIT_TIMEOUT_MS });
   } catch (e) {
-    if (!res.headersSent) {
-      console.error(`[API] get-affiliate error: ${e.message}`);
-      const safeMessage = e.message.includes('không gắn giỏ')
-        ? e.message
-        : `Có lỗi xảy ra, vui lòng thử lại sau. (Chi tiết: ${e.message.substring(0, 150)})`;
-      res.status(500).json({ error: safeMessage });
-    } else {
-      console.error(`[API] get-affiliate background error after response sent: ${e.message}`);
-    }
+    console.error(`[API] get-affiliate error: ${e.message}`);
+    const response = normalizeRelayJobError(e, {
+      knownWorkerError: e instanceof WorkerJobError,
+    });
+    finishJson(response.payload, response.status);
   }
 });
 
@@ -702,8 +911,14 @@ workerWss.on('connection', (ws, req) => {
 
       if (msg.type === 'register') {
         // Worker reports its info (URLs it handles, etc.)
-        worker.info = { urls: msg.urls || [], hostname: msg.hostname || '' };
-        console.log(`[Worker WS] Worker ${workerId} registered: ${msg.urls?.length || 0} URLs, host: ${msg.hostname || 'unknown'}`);
+        worker.info = {
+          urls: msg.urls || [],
+          hostname: msg.hostname || '',
+          workerType: msg.workerType || 'browser',
+          devices: Array.isArray(msg.devices) ? msg.devices : [],
+          capabilities: Array.isArray(msg.capabilities) ? msg.capabilities : [],
+        };
+        console.log(`[Worker WS] Worker ${workerId} registered: ${msg.urls?.length || 0} URLs, host: ${msg.hostname || 'unknown'}, type: ${worker.info.workerType}`);
 
       } else if (msg.type === 'job-result') {
         // Worker completed a job
@@ -718,7 +933,14 @@ workerWss.on('connection', (ws, req) => {
               metadata: msg.metadata || {},
             });
           } else {
-            pending.reject(new Error(msg.error || 'Worker job failed'));
+            pending.reject(new WorkerJobError(msg.error || 'API worker xử lý thất bại.', {
+              code: msg.errorCode || 'WORKER_ERROR',
+              stage: msg.errorStage || 'worker',
+              retryable: Boolean(msg.retryable),
+              browserFallbackAllowed: Boolean(msg.browserFallbackAllowed),
+              cleanupSucceeded: msg.cleanupSucceeded,
+              cleanupError: msg.cleanupError,
+            }));
           }
         }
 
@@ -738,7 +960,11 @@ workerWss.on('connection', (ws, req) => {
     // Reject all pending jobs
     for (const [jobId, pending] of Object.entries(worker.pendingJobs)) {
       clearTimeout(pending.timeout);
-      pending.reject(new Error('Worker disconnected'));
+      pending.reject(new WorkerJobError('API worker bị ngắt kết nối khi đang xử lý.', {
+        code: 'WORKER_DISCONNECTED',
+        stage: 'relay',
+        retryable: true,
+      }));
     }
     connectedWorkers.delete(workerId);
     console.log(`[Worker WS] Worker disconnected: ${workerId} (total: ${connectedWorkers.size})`);
