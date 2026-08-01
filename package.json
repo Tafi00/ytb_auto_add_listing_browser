@@ -1,12 +1,30 @@
 {
-  "name": "yt-worker-launcher",
+  "name": "ytb-auto-add-listing-browser",
   "version": "1.0.31",
-  "description": "YouTube Auto Listing - Worker Launcher",
+  "description": "Browser-only worker for automating YouTube Shopping affiliate product listings.",
+  "private": true,
+  "author": "Tafi00",
+  "license": "UNLICENSED",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Tafi00/ytb_auto_add_listing_browser.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Tafi00/ytb_auto_add_listing_browser/issues"
+  },
+  "homepage": "https://github.com/Tafi00/ytb_auto_add_listing_browser#readme",
+  "keywords": [
+    "youtube-shopping",
+    "affiliate-automation",
+    "browser-automation",
+    "playwright",
+    "worker"
+  ],
   "main": "src/launcher.js",
   "type": "module",
   "scripts": {
     "start": "node src/server.js",
-    "build": "npm install --prefix web && npm run build --prefix web",
+    "build": "npm --prefix web ci && npm --prefix web run build",
     "dev": "concurrently \"npm run server\" \"npm run dev:web\"",
     "server": "node src/server.js",
     "dev:web": "npm run dev:client --prefix web",
@@ -40,8 +58,8 @@
     "electron-builder": "^25.1.8"
   },
   "build": {
-    "appId": "com.ytauto.worker-launcher",
-    "productName": "YT Worker Launcher",
+    "appId": "com.ytauto.browser-worker",
+    "productName": "YouTube Auto Listing - Browser Worker",
     "asar": false,
     "win": {
       "target": "portable"
