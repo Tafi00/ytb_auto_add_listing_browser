@@ -43,7 +43,7 @@ function Public() {
   }, []);
 
   useEffect(() => {
-    if (siteConfig?.pageTitle) document.title = siteConfig.pageTitle;
+    if (siteConfig?.pageTitle) document.title = `${siteConfig.pageTitle} | Link Affiliate Shopee & Lazada`;
     if (siteConfig?.faviconUrl) {
       let link = document.querySelector("link[rel~='icon']");
       if (!link) { link = document.createElement('link'); link.rel = 'icon'; document.head.appendChild(link); }

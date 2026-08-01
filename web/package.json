@@ -1,7 +1,7 @@
 {
-  "name": "ytb-auto-add-listing-browser-dashboard",
+  "name": "youtube-shopping-affiliate-web",
   "version": "1.0.0",
-  "description": "Web dashboard for the YouTube Auto Listing browser worker.",
+  "description": "Website for adding Shopee and Lazada products to YouTube Shopping and generating affiliate links.",
   "private": true,
   "type": "module",
   "scripts": {
